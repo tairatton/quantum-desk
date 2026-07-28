@@ -100,6 +100,7 @@ def resolve_offset(broker: Broker, state: BotState, config_) -> tuple[float, str
 EXIT_LABELS = {
     "fixed_tp3": "one leg to TP3 (2R)",
     "be_33_33_34": "three legs 33/33/34, BE after TP1",
+    "capital_tier": "fixed TP3 below threshold; 33/33/34 + BE at/above threshold",
     "auto": "split when the size allows (NOT RECOMMENDED)",
 }
 #: `exit_mode` value that corresponds to each technique the lab can select.
@@ -107,7 +108,7 @@ TECHNIQUE_TO_MODE = {"fixed_tp3": "fixed_tp3",
                      "be_after_tp1_33_33_34": "be_33_33_34"}
 
 
-def exit_mode_line(config_) -> str:
+def exit_mode_line(config_, initial_balance: float | None = None) -> str:
     """The exit in force, checked against what the study selected for each TF.
 
     The point of naming the exit was to stop the account balance choosing it. The
@@ -115,7 +116,13 @@ def exit_mode_line(config_) -> str:
     regenerated with fresh data can select a different technique, and nothing
     would otherwise tell the operator that live and backtest had parted company.
     """
-    label = EXIT_LABELS.get(config_.exit_mode, config_.exit_mode)
+    active_mode = config_.resolved_exit_mode(initial_balance)
+    active_label = EXIT_LABELS.get(active_mode, active_mode)
+    if config_.exit_mode == "capital_tier":
+        label = (f"capital_tier ${config_.split_exit_min_balance:,.0f} -> "
+                 f"{active_mode} ({active_label})")
+    else:
+        label = f"{active_mode} — {active_label}"
     try:
         from xau import backtest_reporting as br
 
@@ -125,22 +132,21 @@ def exit_mode_line(config_) -> str:
             if not path.exists():
                 continue
             picked = br.select_technique(br.load_report(path))
-            if TECHNIQUE_TO_MODE.get(picked, picked) != config_.exit_mode:
+            if TECHNIQUE_TO_MODE.get(picked, picked) != active_mode:
                 mismatched.append(f"{timeframe} wants {picked}")
         if mismatched:
-            return f"{config_.exit_mode} — {label}    <-- CHECK: {', '.join(mismatched)}"
-        return f"{config_.exit_mode} — {label}    matches the study"
+            return f"{label}    <-- CHECK: {', '.join(mismatched)}"
+        return f"{label}    matches the study"
     except Exception as error:                    # noqa: BLE001 - reporting only
-        return f"{config_.exit_mode} — {label}    (could not check: {error})"
+        return f"{label}    (could not check: {error})"
 
 
 def sizing_line(broker: Broker, config_, balance: float) -> str:
     """What a typical trade will really be sized at, per traded timeframe.
 
-    The lot step only rounds down, so on a small account the position can carry
-    materially less risk than the settings ask for — 0.40% of 10,000 wants 0.0191
-    lots of gold and can only send 0.01, which is 0.21%. That gap is worth seeing
-    before it turns up as a suspiciously good expectancy in the journal.
+    Broker lot steps can put actual risk above or below the requested percentage.
+    The preview uses the same rounding cap and capital-tier weights as execution,
+    so a split tier that cannot produce three legal legs is visible here.
     """
     from .sizing import SizingError, size_plan
 
@@ -152,15 +158,20 @@ def sizing_line(broker: Broker, config_, balance: float) -> str:
             continue
         try:
             s = size_plan(broker.spec, balance, config_.risk_percent, stop,
-                          config_.leg_weights,
+                          config_.leg_weights_for(balance),
                           rounding=config_.lot_rounding,
                           max_overshoot=config_.max_risk_overshoot)
         except SizingError:
             parts.append(f"{timeframe} REFUSED (stop {stop:.2f})")
             continue
+        if (config_.resolved_exit_mode(balance) == "be_33_33_34"
+                and s.single_leg):
+            parts.append(f"{timeframe} REFUSED (needs 3 legs; stop {stop:.2f})")
+            continue
         actual_pct = s.risk_cash / balance * 100 if balance else 0.0
         lots = "+".join(f"{leg:g}" for leg in s.legs)
-        flag = "" if s.risk_shortfall >= 0.85 else f"!{s.risk_shortfall:.0%}"
+        flag = ("" if s.risk_shortfall >= 0.85
+                else f" ({s.risk_shortfall:.0%} sized)")
         parts.append(f"{timeframe} {lots}lot={actual_pct:.2f}%{flag}")
     asked = f"asked {config_.risk_percent:.2f}%"
     return f"{asked}   " + "   ".join(parts)
@@ -194,7 +205,7 @@ def _proposed_risk_percent(broker: Broker, config_, intent, balance: float) -> f
         return None
     try:
         sizing = size_plan(broker.spec, balance, config_.risk_percent, intent.risk,
-                           config_.leg_weights, rounding=config_.lot_rounding,
+                           config_.leg_weights_for(balance), rounding=config_.lot_rounding,
                            max_overshoot=config_.max_risk_overshoot)
     except SizingError:
         return None
@@ -207,7 +218,7 @@ def _largest_leg(broker: Broker, config_, intent, balance: float) -> float:
 
     try:
         return max(size_plan(broker.spec, balance, config_.risk_percent,
-                             intent.risk, config_.leg_weights,
+                             intent.risk, config_.leg_weights_for(balance),
                              rounding=config_.lot_rounding,
                              max_overshoot=config_.max_risk_overshoot).legs)
     except SizingError:
@@ -266,6 +277,196 @@ def print_management_alerts(state: BotState, positions, orders) -> None:
         if order["ticket"] not in managed_orders:
             print(f"[ALERT] UNTRACKED_PENDING | {describe_order(order)}")
 
+
+def active_setup_count(state: BotState, positions, orders) -> int:
+    """Managed trade ideas, not broker tickets.
+
+    A three-target exit is one setup represented by three MT5 positions. Counting
+    tickets made a single split trade exceed a two-trade cap. Unknown tickets are
+    still counted individually so an orphan can never create room for new risk.
+    """
+    live_position_tickets = {position.ticket for position in positions}
+    live_order_tickets = {order["ticket"] for order in orders}
+    managed_positions: set[int] = set()
+    managed_orders: set[int] = set()
+    managed_setups = 0
+    for trade in state.open_trades():
+        trade_positions = set(trade.position_tickets)
+        trade_orders = set(trade.pending_tickets)
+        managed_positions.update(trade_positions)
+        managed_orders.update(trade_orders)
+        if (trade_positions & live_position_tickets
+                or trade_orders & live_order_tickets
+                or trade_positions or trade_orders):
+            managed_setups += 1
+    untracked = len(live_position_tickets - managed_positions)
+    untracked += len(live_order_tickets - managed_orders)
+    return managed_setups + untracked
+
+
+def needs_split_management(state: BotState) -> bool:
+    """Whether a live three-leg trade is still waiting for its BE transition."""
+    return any(
+        trade.exit_mode == "be_33_33_34"
+        and not trade.breakeven_done
+        and len(trade.position_tickets) >= 2
+        for trade in state.open_trades()
+    )
+
+
+def _trade_for_ticket(state: BotState, ticket: int, *, pending: bool = False):
+    field = "pending_tickets" if pending else "position_tickets"
+    return next(
+        (trade for trade in state.open_trades()
+         if ticket in getattr(trade, field)),
+        None,
+    )
+
+
+def _target_name(trade, target: float) -> str:
+    if not trade or not trade.risk:
+        return "TP?"
+    reward_r = (target - trade.entry) * trade.direction / trade.risk
+    choices = ((1.0, "TP1"), (1.5, "TP2"), (2.0, "TP3"))
+    return min(choices, key=lambda item: abs(item[0] - reward_r))[1]
+
+
+def position_health(position, state: BotState, quote: dict) -> str:
+    """Explain what owns a position and how far price is from its exits."""
+    trade = _trade_for_ticket(state, position.ticket)
+    side = "BUY" if position.direction == 1 else "SELL"
+    if trade is None:
+        return (f"ticket={position.ticket} side={side} status=UNTRACKED "
+                f"sl={position.stop} tp={position.take_profit}")
+
+    exit_price = quote["bid"] if position.direction == 1 else quote["ask"]
+    risk = trade.risk or abs(trade.entry - trade.stop)
+    now_r = ((exit_price - trade.entry) * trade.direction / risk
+             if risk else 0.0)
+    to_sl_r = ((exit_price - position.stop) * trade.direction / risk
+               if risk and position.stop else float("-inf"))
+    to_tp_r = ((position.take_profit - exit_price) * trade.direction / risk
+               if risk and position.take_profit else float("inf"))
+    flags = []
+    if not position.stop:
+        flags.append("MISSING_SL")
+    if not position.take_profit:
+        flags.append("MISSING_TP")
+    if position.stop:
+        # Broker price precision rounds the planned stop (4047.9359 -> 4047.94
+        # on two-digit gold). Treat sub-basis-point differences as formatting,
+        # not a widened-risk alert.
+        price_tolerance = max(risk * 1e-3, 1e-9)
+        widened = (position.stop < trade.stop - price_tolerance
+                   if trade.direction == 1
+                   else position.stop > trade.stop + price_tolerance)
+        if widened:
+            flags.append("SL_WIDER_THAN_PLAN")
+        if abs(position.stop - trade.entry) <= max(risk * 1e-6, 1e-9):
+            flags.append("SL_AT_BE")
+    status = ",".join(flags) if flags else "PROTECTED"
+    role = _target_name(trade, position.take_profit)
+    return (
+        f"ticket={position.ticket} plan={trade.plan_id} tf={trade.timeframe} "
+        f"mode={trade.exit_mode or 'legacy'} role={role} side={side} "
+        f"price={exit_price:.2f} now={now_r:+.2f}R "
+        f"to_sl={to_sl_r:+.2f}R to_tp={to_tp_r:+.2f}R "
+        f"sl={position.stop} tp={position.take_profit} status={status}"
+    )
+
+
+def pending_health(order: dict, state: BotState, now) -> str:
+    """Explain the setup and remaining lifetime of a pending order."""
+    trade = _trade_for_ticket(state, order["ticket"], pending=True)
+    expiry = order.get("expires_at")
+    if expiry is None:
+        expiry_text = "GTC"
+    else:
+        seconds = (expiry - now).total_seconds()
+        expiry_text = ("EXPIRED" if seconds <= 0
+                       else f"{_countdown(seconds)} remaining")
+    if trade is None:
+        return f"ticket={order['ticket']} status=UNTRACKED expiry={expiry_text}"
+    return (
+        f"ticket={order['ticket']} plan={trade.plan_id} tf={trade.timeframe} "
+        f"mode={trade.exit_mode or 'legacy'} role={_target_name(trade, order.get('take_profit', 0))} "
+        f"entry={order.get('price', 0)} sl={order.get('stop', 0)} "
+        f"tp={order.get('take_profit', 0)} expiry={expiry_text} status=WORKING"
+    )
+
+
+def entry_capacity(config_, state: BotState, positions, orders, spec,
+                   risk_basis: float, requests: int,
+                   entry_gate=None) -> tuple[bool, str]:
+    """Capacity for another nominal-risk setup; signal checks still run later."""
+    open_risk = open_risk_percent(spec, positions, risk_basis)
+    active = active_setup_count(state, positions, orders)
+    blockers = []
+    if entry_gate is not None and not entry_gate:
+        blockers.append(entry_gate.reason)
+    if state.halted_forever:
+        blockers.append(f"halted: {state.halted_reason}")
+    if state.is_paused_today:
+        blockers.append("paused for this server day")
+    if state.consecutive_losses >= config_.max_consecutive_losses:
+        blockers.append(f"loss streak {state.consecutive_losses}")
+    if KILL_SWITCH.exists():
+        blockers.append("kill switch active")
+    if active >= config_.max_concurrent_trades:
+        blockers.append(f"setup slots {active}/{config_.max_concurrent_trades}")
+    room = config_.max_open_risk_percent - open_risk
+    risk_is_conditional = room + 1e-9 < config_.risk_percent
+    if requests >= config_.max_requests_per_day * 0.9:
+        blockers.append(f"requests {requests}/{config_.max_requests_per_day}")
+
+    allowed_side = "BUY/SELL"
+    if positions and not config_.allow_opposing_positions:
+        directions = {position.direction for position in positions}
+        if len(directions) == 1:
+            allowed_side = "BUY only" if 1 in directions else "SELL only"
+        else:
+            allowed_side = "none (mixed exposure)"
+    if blockers:
+        return False, "NO | " + "; ".join(blockers)
+    if risk_is_conditional:
+        return False, (
+            f"CONDITIONAL | risk room {room:.2f}% < nominal "
+            f"{config_.risk_percent:.2f}% | a rounded setup may fit only if actual "
+            f"risk <= {room:.2f}% | allowed side {allowed_side}"
+        )
+    return True, (
+        f"YES | capacity only | setups {active}/{config_.max_concurrent_trades} "
+        f"| risk {open_risk:.2f}/{config_.max_open_risk_percent:.2f}% "
+        f"| allowed side {allowed_side}"
+    )
+
+
+def sleep_and_manage_split(broker: Broker, state: BotState, config_,
+                           seconds: float) -> None:
+    """Wait for the next signal scan while checking split exits separately.
+
+    This does not load bars or evaluate signals. It only asks MT5 which managed
+    positions remain, allowing `apply_breakeven` to react after TP1 instead of
+    waiting as long as a full M15/M30 bar.
+    """
+    remaining = max(seconds, 0.0)
+    while remaining > 0:
+        fast = needs_split_management(state)
+        budget_near_limit = (
+            state.day_requests + broker.requests
+            >= config_.max_requests_per_day * 0.9
+        )
+        interval = (min(config_.split_management_poll_seconds, remaining)
+                    if fast and not budget_near_limit else remaining)
+        time.sleep(interval)
+        remaining -= interval
+        if remaining <= 0 or not fast or budget_near_limit:
+            continue
+        trader.apply_breakeven(broker, state)
+        state.day_requests += broker.take_requests()
+        state.save(STATE_PATH)
+
+
 PANEL_WIDTH = 100
 
 
@@ -275,16 +476,27 @@ def _panel_border(char: str = "-") -> None:
 
 def _panel_row(label: str, value: str = "", value_style: str = _Ansi.WHITE) -> None:
     raw_label = f" {label:<15}" if label else " "
-    raw_value = f" {value}"
-    content = (raw_label + raw_value)[:PANEL_WIDTH - 2].ljust(PANEL_WIDTH - 2)
-    visible_label = content[:len(raw_label)]
-    visible_value = content[len(raw_label):]
-    print(
-        paint("|", _Ansi.CYAN)
-        + paint(visible_label, _Ansi.BOLD, _Ansi.BLUE)
-        + paint(visible_value, value_style)
-        + paint("|", _Ansi.CYAN)
-    )
+    value_width = PANEL_WIDTH - 2 - len(raw_label) - 1
+    words = str(value).split()
+    lines: list[str] = []
+    current = ""
+    for word in words:
+        candidate = f"{current} {word}".strip()
+        if current and len(candidate) > value_width:
+            lines.append(current)
+            current = word
+        else:
+            current = candidate
+    lines.append(current)
+    for index, line in enumerate(lines):
+        visible_label = raw_label if index == 0 else " " * len(raw_label)
+        visible_value = f" {line}".ljust(PANEL_WIDTH - 2 - len(visible_label))
+        print(
+            paint("|", _Ansi.CYAN)
+            + paint(visible_label, _Ansi.BOLD, _Ansi.BLUE)
+            + paint(visible_value, value_style)
+            + paint("|", _Ansi.CYAN)
+        )
 
 
 def _panel_section(title: str) -> None:
@@ -320,8 +532,29 @@ def _countdown(seconds: float) -> str:
     hours, minutes = divmod(minutes, 60)
     return f"{hours:02d}:{minutes:02d}:{secs:02d}"
 
+
+def account_binding_status(state: BotState, account: dict) -> tuple[bool, str]:
+    """Explain whether the loaded state can safely manage this MT5 account."""
+    login, server = int(account.get("login") or 0), str(account.get("server") or "")
+    if state.account_login is None:
+        balance = float(account.get("balance") or 0.0)
+        if state.initial_balance > 0 and balance > 0:
+            difference = abs(balance - state.initial_balance) / state.initial_balance
+            if difference > 0.25:
+                return False, (
+                    f"MISMATCH | legacy state {state.initial_balance:,.2f} vs "
+                    f"MT5 {balance:,.2f} | archive state.json")
+        return True, "UNBOUND | will bind to this login on the first LIVE pass"
+    if state.account_login != login or state.account_server != server:
+        return False, (
+            f"MISMATCH | state {state.account_login}@{state.account_server} vs "
+            f"MT5 {login}@{server}")
+    return True, f"BOUND | {state.account_login}@{state.account_server}"
+
+
 def print_status(broker: Broker, state: BotState, config_) -> None:
     account = broker.account()
+    account_matches, binding = account_binding_status(state, account)
     positions = broker.positions()
     orders = broker.pending_orders()
     risk_basis = state.initial_balance or account["balance"]
@@ -331,7 +564,8 @@ def print_status(broker: Broker, state: BotState, config_) -> None:
     offset, source = resolve_offset(broker, state, config_)
     calendar = news.load(config_)
     age = calendar.age_hours
-    now = broker.tick()["server_time"]
+    quote = broker.tick()
+    now = quote["server_time"]
     upcoming = news.next_event(config_, now, offset, calendar)
     closure = market_hours.next_closure(config_, now)
     shut = market_hours.is_closed(config_, now)
@@ -346,6 +580,7 @@ def print_status(broker: Broker, state: BotState, config_) -> None:
 
     _panel_section("Account")
     _panel_row("Account", f"{account['login']} @ {account['server']} ({account['currency']})")
+    _panel_row("State", binding, _Ansi.GREEN if account_matches else _Ansi.RED)
     _panel_row("Balance", f"{account['balance']:,.2f}    Equity  {account['equity']:,.2f}    "
                f"Free margin  {account['margin_free']:,.2f}")
     _panel_row("Symbol", f"{broker.spec.name}    Digits {broker.spec.digits}    "
@@ -354,7 +589,7 @@ def print_status(broker: Broker, state: BotState, config_) -> None:
     _panel_section("Strategy and risk")
     _panel_row("Strategy", f"{config_.symbol}  {' + '.join(config_.timeframes)}    "
                f"Risk/trade {config_.risk_percent:.2f}%    Cap {config_.max_open_risk_percent:.2f}%")
-    _panel_row("Exit", exit_mode_line(config_))
+    _panel_row("Exit", exit_mode_line(config_, risk_basis))
     _panel_row("Sizing", sizing_line(broker, config_, risk_basis))
     _panel_row("Open risk", f"{risk:.2f}% of {risk_basis:,.2f} risk basis")
     _panel_row("Safety", f"Kill switch {'ACTIVE' if KILL_SWITCH.exists() else 'OFF'}    "
@@ -407,13 +642,25 @@ def print_status(broker: Broker, state: BotState, config_) -> None:
     floating = sum(position.profit for position in positions)
     _panel_row("Summary", f"Positions {len(positions)}    Pending {len(orders)}    "
                f"Floating P/L {floating:+,.2f}")
+    _, capacity = entry_capacity(
+        config_, state, positions, orders, broker.spec, risk_basis,
+        state.day_requests + broker.requests, entry_window)
+    if not account_matches:
+        capacity = f"NO | {binding}"
+    _panel_row("Can open more", capacity,
+               _Ansi.GREEN if capacity.startswith("YES") else _Ansi.YELLOW)
     if not positions:
         _panel_row("Positions", "None")
     for position in positions:
+        trade = _trade_for_ticket(state, position.ticket)
         _panel_row(f"Position #{position.ticket}",
                    f"{'BUY' if position.direction == 1 else 'SELL'} {position.volume:g} @ "
                    f"{position.price_open} | SL {position.stop} | TP {position.take_profit} | "
                    f"P/L {position.profit:+.2f}")
+        if trade:
+            _panel_row("Managed by",
+                       f"{trade.plan_id} | {trade.exit_mode or 'legacy'} | "
+                       f"{_target_name(trade, position.take_profit)}")
     if not orders:
         _panel_row("Pending", "None")
     for order in orders:
@@ -433,11 +680,25 @@ def print_status(broker: Broker, state: BotState, config_) -> None:
         _panel_row("HALTED", state.halted_reason, _Ansi.RED)
     _panel_border("=")
     print_management_alerts(state, positions, orders)
+    for position in positions:
+        print(f"[POSITION_HEALTH] {position_health(position, state, quote)}")
+    for order in orders:
+        print(f"[PENDING_HEALTH] {pending_health(order, state, now)}")
+    print(f"[ENTRY_CAPACITY] {capacity}")
     print()
 
 def pass_once(broker: Broker, state: BotState, config_) -> None:
     quote = broker.tick()
     account = broker.account()
+
+    try:
+        newly_bound = state.bind_account(account)
+    except ValueError as error:
+        print(status_line("ACCOUNT_MISMATCH", str(error), "error"))
+        raise SystemExit(f"blocked: {error}") from error
+    if newly_bound:
+        state.save(STATE_PATH)
+        print(f"[ACCOUNT_BOUND] state -> {state.account_login}@{state.account_server}")
 
     if not state.initial_balance:
         state.initial_balance = config_.initial_balance or account["balance"]
@@ -503,6 +764,7 @@ def pass_once(broker: Broker, state: BotState, config_) -> None:
             continue
 
         positions = broker.positions()
+        orders = broker.pending_orders()
         # Price this specific trade before asking whether it fits: the lot step
         # makes the real figure differ from `risk_percent`, and the exposure cap
         # should be judged against what will actually be sent.
@@ -513,15 +775,17 @@ def pass_once(broker: Broker, state: BotState, config_) -> None:
             guardrails.can_open(
                 config_, state,
                 open_risk_percent(broker.spec, positions, risk_basis),
-                len(positions), len(broker.pending_orders()),
+                len(positions), len(orders),
                 state.day_requests + broker.requests,
-                proposed_risk=proposed),
+                proposed_risk=proposed,
+                active_setups=active_setup_count(state, positions, orders)),
             guardrails.no_opposing_position(config_, positions, intent.direction),
             guardrails.risk_per_idea(config_, broker.spec, positions, intent.direction,
                                      risk_basis),
             guardrails.margin_available(
                 account, broker.margin_for(intent.direction, _largest_leg(
-                    broker, config_, intent, risk_basis)), len(config_.leg_weights)),
+                    broker, config_, intent, risk_basis)),
+                len(config_.leg_weights_for(risk_basis))),
         )
         blocked = next((check for check in checks if not check), None)
         if blocked is not None:
@@ -564,11 +828,13 @@ def loop(broker: Broker, state: BotState, config_) -> None:
                       f"symbol={config_.symbol} timeframes={'+'.join(config_.timeframes)} | "
                       "Ctrl+C to stop",
                       "live" if mode == "LIVE" else "warn"))
+    reconnect_failures = 0
     while True:
         try:
             # Sleeping to the next bar close instead of polling keeps the day's
             # terminal requests far below the limit an EA is allowed.
-            server_time = broker.tick()["server_time"]
+            quote = broker.tick()
+            server_time = quote["server_time"]
             wait = _seconds_to_next_close(server_time, config_.timeframes)
             sleep_seconds = wait + config_.entry_grace_seconds
             next_check = server_time + timedelta(seconds=sleep_seconds)
@@ -592,15 +858,60 @@ def loop(broker: Broker, state: BotState, config_) -> None:
             print(status_line("HEARTBEAT", heartbeat, exposure_level), flush=True)
             for position in positions:
                 print(f"[POSITION] {trader.describe(position)}")
+                print(f"[POSITION_HEALTH] {position_health(position, state, quote)}")
             for order in orders:
                 print(f"[PENDING] {describe_order(order)}")
+                print(f"[PENDING_HEALTH] {pending_health(order, state, server_time)}")
+            risk_basis = state.initial_balance or config_.initial_balance
+            if risk_basis:
+                _, capacity = entry_capacity(
+                    config_, state, positions, orders, broker.spec, risk_basis,
+                    state.day_requests + broker.requests)
+                print(f"[ENTRY_CAPACITY] {capacity}")
+            else:
+                print("[ENTRY_CAPACITY] NO | initial balance not anchored yet")
             print_management_alerts(state, positions, orders)
-            time.sleep(sleep_seconds)
+            sleep_and_manage_split(broker, state, config_, sleep_seconds)
             pass_once(broker, state, config_)
+            reconnect_failures = 0
         except MT5Error as error:
-            # A closed market or a dropped terminal link must not kill the run.
-            print(status_line("WARN", str(error), "warn"))
-            time.sleep(max(config_.poll_seconds, 60))
+            # Broker-side SL/TP and pending orders survive this process losing
+            # connectivity. What stops is observation, BE moves, timeouts and new
+            # entries. Reinitialize MT5 with bounded backoff, then reconcile state
+            # before normal scanning resumes; never resend an existing order.
+            delay = min(
+                config_.reconnect_initial_seconds * (2 ** min(reconnect_failures, 10)),
+                config_.reconnect_max_seconds,
+            )
+            print(status_line(
+                "CONNECTION_LOST",
+                f"{error} | broker-side SL/TP remain active | reconnect in {delay}s",
+                "error"))
+            journal.write(JOURNAL_PATH, "connection_lost",
+                          reason=str(error), retry_seconds=delay)
+            time.sleep(delay)
+            try:
+                broker.reconnect()
+            except MT5Error as reconnect_error:
+                reconnect_failures += 1
+                print(status_line(
+                    "RECONNECT_WAIT",
+                    f"{reconnect_error} | next retry will use bounded backoff",
+                    "warn"))
+                continue
+            reconnect_failures = 0
+            print(status_line(
+                "CONNECTION_RESTORED",
+                "MT5 reconnected | reconciling positions and pending orders",
+                "ok"))
+            journal.write(JOURNAL_PATH, "connection_restored")
+            try:
+                pass_once(broker, state, config_)
+            except MT5Error as sync_error:
+                print(status_line(
+                    "RECONCILE_WAIT",
+                    f"reconnected but first sync is incomplete: {sync_error}",
+                    "warn"))
         except KeyboardInterrupt:
             print("\n" + status_line(
                 "STOP", "interrupted; open positions keep their broker-side SL/TP", "warn"))

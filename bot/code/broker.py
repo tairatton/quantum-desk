@@ -74,6 +74,11 @@ class Broker:
 
     # -- session ----------------------------------------------------------
     def __enter__(self) -> "Broker":
+        self._connect()
+        return self
+
+    def _connect(self) -> None:
+        """Initialize MT5 and rebuild broker-specific symbol metadata."""
         if not mt5_source.MT5_IMPORTED:
             raise MT5Error("MetaTrader5 package missing.  Fix: pip install MetaTrader5")
         mt5 = mt5_source.mt5
@@ -94,7 +99,21 @@ class Broker:
                            "  Tools > Options > Expert Advisors > Allow algorithmic trading")
         self._mt = mt5
         self._spec = self._read_spec()
-        return self
+        self._tick_stamp = None
+        self._tick_first_seen = None
+
+    def reconnect(self) -> None:
+        """Reinitialize the terminal after a network/terminal interruption.
+
+        Existing SL/TP and pending orders live at the broker. Reconnecting only
+        restores observation and client-side management; it never resends an
+        order by itself.
+        """
+        if self._mt is not None:
+            self._mt.shutdown()
+        self._mt = None
+        self._spec = None
+        self._connect()
 
     def __exit__(self, *_exc) -> None:
         if self._mt is not None:

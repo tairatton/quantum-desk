@@ -1,15 +1,9 @@
-"""Turning a plan into orders, and looking after them until they are closed.
+"""Turn a plan into orders and manage it until it is closed.
 
-The exit policy is BE + 33/33/34, which is what won every gold split in the
-technique lab:
-
-  * three legs at TP1 (1R), TP2 (1.5R) and TP3 (2R), weighted 33/33/34
-  * once TP1 is banked, the stop on what is left moves to entry
-  * anything still open 120 bars after the fill is closed at market
-
-Each leg is a separate position carrying its own take-profit. Partial closes on
-one position would work too, but separate legs let the broker enforce every exit
-even if this process dies.
+The production setting pins ``fixed_tp3``: one position, full exit at TP3 (2R),
+plus the same 120-bar timeout measured by the study. The optional
+``be_33_33_34`` mode uses three broker-side legs and moves the survivors to
+break-even after TP1; it is not selected by the current live configuration.
 """
 from __future__ import annotations
 
@@ -38,14 +32,14 @@ def _leg_targets(intent: Intent, leg_count: int, fallback_index: int) -> list[fl
     return list(intent.targets[:leg_count])
 
 
-def _check_exit_mode(settings: Settings, sizing, intent: Intent) -> str | None:
+def _check_exit_mode(exit_mode: str, sizing, intent: Intent) -> str | None:
     """Reason to refuse the trade because it cannot honour `exit_mode`, or None.
 
     `be_33_33_34` on a balance too small to split would quietly become a single
     leg — the exact silent swap `exit_mode` exists to prevent. Refusing is the
     honest answer: the operator asked for an exit the account cannot place.
     """
-    if settings.exit_mode == "be_33_33_34" and sizing.single_leg:
+    if exit_mode == "be_33_33_34" and sizing.single_leg:
         return (f"exit_mode=be_33_33_34 needs three legs but the balance only "
                 f"sizes {sizing.legs}; raise the balance or set exit_mode=fixed_tp3")
     return None
@@ -54,9 +48,16 @@ def _check_exit_mode(settings: Settings, sizing, intent: Intent) -> str | None:
 def open_trade(broker: Broker, settings: Settings, state: BotState, intent: Intent,
                balance: float) -> ManagedTrade | None:
     """Size the plan and place its legs. Returns None when nothing was sent."""
+    # Never let current balance/equity flip the capital tier. `initial_balance`
+    # is durable state captured on the first run; using it here as well as in the
+    # caller makes the invariant survive refactors and direct calls.
+    risk_basis = ((state.initial_balance or balance)
+                  if settings.exit_mode == "capital_tier" else balance)
+    exit_mode = settings.resolved_exit_mode(risk_basis)
+    leg_weights = settings.leg_weights_for(risk_basis)
     try:
-        sizing = size_plan(broker.spec, balance, settings.risk_percent,
-                           intent.risk, settings.leg_weights,
+        sizing = size_plan(broker.spec, risk_basis, settings.risk_percent,
+                           intent.risk, leg_weights,
                            rounding=settings.lot_rounding,
                            max_overshoot=settings.max_risk_overshoot)
     except SizingError as error:
@@ -80,19 +81,26 @@ def open_trade(broker: Broker, settings: Settings, state: BotState, intent: Inte
               f"actual={sizing.risk_cash:.2f} "
               f"({sizing.risk_shortfall:.0%} of target) lots={sizing.legs}")
 
-    refusal = _check_exit_mode(settings, sizing, intent)
+    refusal = _check_exit_mode(exit_mode, sizing, intent)
     if refusal is not None:
         journal.write(JOURNAL_PATH, "exit_mode_rejected", plan_id=intent.plan_id,
-                      reason=refusal, exit_mode=settings.exit_mode)
+                      reason=refusal, exit_mode=exit_mode)
         print(f"[SIZING_REJECTED] plan={intent.plan_id} reason={refusal!r}")
         return None
 
+    # Resolve legacy `auto` into the policy that was actually executable so
+    # state, journal and MT5 comments never claim a split that was not sent.
+    actual_exit_mode = (
+        "fixed_tp3" if exit_mode == "auto" and sizing.single_leg
+        else "be_33_33_34" if exit_mode == "auto"
+        else exit_mode
+    )
     targets = _leg_targets(intent, len(sizing.legs), settings.single_leg_fallback_target)
     trade = ManagedTrade(
         plan_id=intent.plan_id, timeframe=intent.timeframe, direction=intent.direction,
         entry=intent.entry, stop=intent.stop, risk=intent.risk,
         risk_cash=round(sizing.risk_cash, 2), targets=targets, legs=list(sizing.legs),
-        dry_run=broker.dry_run,
+        dry_run=broker.dry_run, exit_mode=actual_exit_mode,
     )
 
     expiry = None
@@ -121,7 +129,10 @@ def open_trade(broker: Broker, settings: Settings, state: BotState, intent: Inte
             # trade log claim an exit the bot was not taking.
             tp_number = (settings.single_leg_fallback_target + 1
                          if sizing.single_leg else index)
-            comment = f"{intent.timeframe} TP{tp_number} {'|'.join(settings.tags)}"
+            mode_tag = "fixedtp3" if actual_exit_mode == "fixed_tp3" else "be33"
+            tags = tuple(tag for tag in settings.tags
+                         if tag not in {"fixedtp3", "be33"}) + (mode_tag,)
+            comment = f"{intent.timeframe} TP{tp_number} {'|'.join(tags)}"
             if intent.action == "market":
                 broker.market_entry(intent.direction, volume, intent.stop, target, comment)
             else:
@@ -160,7 +171,8 @@ def open_trade(broker: Broker, settings: Settings, state: BotState, intent: Inte
                   entry=intent.entry, stop=intent.stop, risk=intent.risk,
                   targets=targets, legs=list(sizing.legs), legs_placed=placed,
                   risk_cash=trade.risk_cash,
-                  single_leg=sizing.single_leg, dry_run=broker.dry_run)
+                  single_leg=sizing.single_leg, exit_mode=actual_exit_mode,
+                  dry_run=broker.dry_run)
     if trade.position_tickets:
         print(f"[POSITION_OPENED] plan={intent.plan_id} side={intent.side} "
               f"positions={trade.position_tickets} volumes={list(sizing.legs)} "

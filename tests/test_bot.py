@@ -409,6 +409,47 @@ class StateTests(unittest.TestCase):
         self.assertEqual(len(state.seen_plan_ids), 10)
         self.assertEqual(state.seen_plan_ids[-1], "plan-499")
 
+    def test_state_binds_to_one_broker_account(self):
+        state = BotState(initial_balance=50_000)
+        account = {"login": 123, "server": "FTMO-Demo", "balance": 50_100}
+        self.assertTrue(state.bind_account(account))
+        self.assertFalse(state.bind_account(account))
+        with self.assertRaisesRegex(ValueError, "state belongs to"):
+            state.bind_account({"login": 456, "server": "FTMO-Demo", "balance": 50_000})
+
+    def test_legacy_state_refuses_a_materially_different_balance(self):
+        state = BotState(initial_balance=10_000)
+        with self.assertRaisesRegex(ValueError, "archive state.json"):
+            state.bind_account(
+                {"login": 456, "server": "FTMO-Demo", "balance": 50_000})
+
+    def test_atomic_save_leaves_no_temporary_file(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "state.json"
+            BotState(initial_balance=50_000).save(path)
+            self.assertTrue(path.exists())
+            self.assertFalse(path.with_name("state.json.tmp").exists())
+            self.assertEqual(BotState.load(path).initial_balance, 50_000)
+
+    def test_invalid_production_settings_fail_loudly(self):
+        from dataclasses import replace
+
+        with self.assertRaisesRegex(ValueError, "max_open_risk_percent"):
+            replace(Settings(), risk_percent=1.0, max_open_risk_percent=0.5)
+        with self.assertRaisesRegex(ValueError, "reconnect_max_seconds"):
+            replace(Settings(), reconnect_initial_seconds=60, reconnect_max_seconds=10)
+
+    def test_status_exposes_account_state_mismatch(self):
+        from bot.code.run import account_binding_status
+
+        state = BotState(initial_balance=10_000)
+        matches, message = account_binding_status(
+            state, {"login": 456, "server": "FTMO-Demo", "balance": 50_000})
+        self.assertFalse(matches)
+        self.assertIn("MISMATCH", message)
+
 
 class ClockTests(unittest.TestCase):
     """The server-to-UTC offset cannot be measured while the market is closed."""

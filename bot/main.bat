@@ -7,7 +7,11 @@ title Quantum Desk - Live Trading
 
 rem Run from the project root so Python can import bot and xau.
 cd /d "%~dp0.."
-python -m bot.main %*
+if exist ".venv\Scripts\python.exe" (
+  ".venv\Scripts\python.exe" -m bot.main %*
+) else (
+  python -m bot.main %*
+)
 
 set "BOT_EXIT_CODE=%ERRORLEVEL%"
 echo.

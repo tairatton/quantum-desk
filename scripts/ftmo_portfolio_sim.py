@@ -34,6 +34,7 @@ if str(ROOT) not in sys.path:
 from xau import backtest_reporting, config  # noqa: E402
 
 NSIM, MAXDAYS = 20_000, 400
+TECHNIQUE_OVERRIDE: str | None = None
 DAILY_LIMIT, MAX_LIMIT = 5.0, 10.0          # FTMO 2-Step, percent of initial balance
 STEP_TARGETS = (10.0, 5.0)
 
@@ -92,7 +93,7 @@ def load_stream(key: str, scenario: str) -> tuple[np.ndarray, float, float]:
     symbol, timeframe, cost = STREAMS[key]
     report = backtest_reporting.load_report(
         backtest_reporting.report_path(symbol, timeframe))
-    technique = backtest_reporting.select_technique(report)
+    technique = TECHNIQUE_OVERRIDE or backtest_reporting.select_technique(report)
     curve = report["holdout_all_curves_r"]
     equity = np.asarray(curve["equity"][technique], dtype=float)
     trade_r = np.diff(np.concatenate([[0.0], equity]))
@@ -161,7 +162,9 @@ def simulate(keys: list[str], scenario: str, risk_pct: float, corr: float, seed:
     }
 
 
-def report_books(risks=(0.25, 0.40, 0.50), corr: float = 0.3) -> None:
+def report_books(risks=(0.25, 0.40, 0.50), corr: float = 0.3,
+                 book_names: list[str] | None = None) -> None:
+    selected_books = book_names or list(BOOKS)
     for scenario, label in SCENARIOS:
         print(f"\n{'=' * 118}\n{label}   [FTMO 2-Step: {STEP_TARGETS[0]:.0f}% then "
               f"{STEP_TARGETS[1]:.0f}%, daily {DAILY_LIMIT:.0f}%, max {MAX_LIMIT:.0f}%, "
@@ -169,7 +172,8 @@ def report_books(risks=(0.25, 0.40, 0.50), corr: float = 0.3) -> None:
         print(f"{'book':24s} {'risk':>5s} {'trd/d':>6s} {'expR':>7s} {'R/day':>7s} "
               f"{'step1':>7s} {'breach':>7s} {'2-step':>7s} {'days step1':>12s} "
               f"{'days total':>12s} {'worst day':>10s}")
-        for name, keys in BOOKS.items():
+        for name in selected_books:
+            keys = BOOKS[name]
             for risk in risks:
                 m = simulate(keys, scenario, risk, corr)
                 print(f"{name:24s} {risk:5.2f} {m['trades_per_day']:6.1f} "
@@ -192,7 +196,7 @@ def report_by_year(targets=(("XAUUSD", "H1"), ("XAUUSD", "M30"),
     for symbol, timeframe in targets:
         report = backtest_reporting.load_report(
             backtest_reporting.report_path(symbol, timeframe))
-        technique = backtest_reporting.select_technique(report)
+        technique = TECHNIQUE_OVERRIDE or backtest_reporting.select_technique(report)
         payoff_of = lab.payoff_for(technique)
         frame = pd.read_csv(config.MARKET_DATA_DIR / symbol / f"{timeframe}.csv",
                             parse_dates=["time"])
@@ -211,8 +215,7 @@ def report_by_year(targets=(("XAUUSD", "H1"), ("XAUUSD", "M30"),
         grouped["win_rate"] = (trades.assign(w=trades.r > 0)
                                .groupby("year")["w"].mean() * 100)
         grouped.columns = ["trades", "expectancy_r", "net_r", "win_rate"]
-        print(f"\n=== {symbol} {timeframe} {TECH} (extra cost {cost}R) — "
-              f"{len(trades)} trades ===")
+        print(f"\n=== {symbol} {timeframe} {technique} — {len(trades)} trades ===")
         print(grouped.round(3).to_string())
 
 
@@ -424,6 +427,8 @@ def plot_all(corr: float) -> None:
 
 
 def main() -> None:
+    global NSIM, TECHNIQUE_OVERRIDE
+
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--by-year", action="store_true",
                         help="print per-year expectancy instead of the book simulation")
@@ -431,13 +436,35 @@ def main() -> None:
                         help=f"render the chart pack into {PLOT_DIR.name}/")
     parser.add_argument("--corr", type=float, default=0.3,
                         help="cross-stream correlation for the portfolio draw")
+    parser.add_argument("--book", choices=tuple(BOOKS),
+                        help="simulate one book instead of every comparison")
+    parser.add_argument("--risk", type=float,
+                        help="simulate one risk percentage instead of 0.25/0.40/0.50")
+    parser.add_argument("--nsim", type=int, default=NSIM,
+                        help=f"Monte Carlo paths (default {NSIM:,})")
+    parser.add_argument(
+        "--technique",
+        choices=("selected", "fixed_tp3", "be_after_tp1_33_33_34"),
+        default="selected",
+        help="exit policy; use be_after_tp1_33_33_34 for the >=$30K bot tier",
+    )
     args = parser.parse_args()
+    if args.nsim < 100:
+        parser.error("--nsim must be at least 100")
+    if args.risk is not None and args.risk <= 0:
+        parser.error("--risk must be positive")
+    NSIM = args.nsim
+    TECHNIQUE_OVERRIDE = None if args.technique == "selected" else args.technique
     if args.plot:
         plot_all(args.corr)
     elif args.by_year:
         report_by_year()
     else:
-        report_books(corr=args.corr)
+        report_books(
+            risks=(args.risk,) if args.risk is not None else (0.25, 0.40, 0.50),
+            corr=args.corr,
+            book_names=[args.book] if args.book else None,
+        )
 
 
 if __name__ == "__main__":

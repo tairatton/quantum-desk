@@ -82,7 +82,8 @@ def account_health(settings: Settings, state: BotState, equity: float,
 
 def can_open(settings: Settings, state: BotState, open_risk: float,
              open_count: int, pending_count: int, requests_today: int = 0,
-             proposed_risk: float | None = None) -> Verdict:
+             proposed_risk: float | None = None,
+             active_setups: int | None = None) -> Verdict:
     """Exposure checks for one more entry.
 
     `proposed_risk` is what the next trade will really carry as a percentage,
@@ -93,7 +94,11 @@ def can_open(settings: Settings, state: BotState, open_risk: float,
     """
     if KILL_SWITCH.exists():
         return Verdict(False, f"kill switch present: {KILL_SWITCH.name}")
-    if open_count + pending_count >= settings.max_concurrent_trades:
+    exposure_count = (open_count + pending_count
+                      if active_setups is None else active_setups)
+    if exposure_count >= settings.max_concurrent_trades:
+        if active_setups is not None:
+            return Verdict(False, f"already managing {active_setups} active setup(s)")
         return Verdict(False, f"already holding {open_count} positions and "
                               f"{pending_count} pending orders")
     needs = settings.risk_percent if proposed_risk is None else proposed_risk

@@ -1,7 +1,7 @@
 """Every tunable the bot has, in one place.
 
-The defaults are the plan from `docs/FTMO_SYMBOL_AND_TIMELINE.md`: gold only,
-M15 + M30, 0.40% risk per trade, BE + 33/33/34 exits. Override any field with an
+The defaults are the production plan: gold only, M15 + M30, 0.40% risk per
+trade, and a capital-tier exit at 30,000. Override any field with an
 environment variable named `BOT_<FIELD>` or with `bot/code/settings.local.json`.
 """
 from __future__ import annotations
@@ -113,6 +113,13 @@ class Settings:
     # The terminal is allowed roughly 2,000 server requests a day, so the loop
     # sleeps until the next bar close instead of polling continuously.
     poll_seconds: int = 60               # fallback heartbeat only
+    # A split trade needs client-side management after TP1; broker-side TP/SL
+    # cannot express "move the other stops when this target fills". Checking
+    # every three minutes cuts the old 15/30-minute delay without exhausting the
+    # terminal's approximate 2,000-request daily allowance.
+    split_management_poll_seconds: int = 180
+    reconnect_initial_seconds: int = 10
+    reconnect_max_seconds: int = 60
     max_requests_per_day: int = 2000
     # Skip an immediate entry when the live price has already run this far past
     # the backtest's fill price, in fractions of the plan's own risk.
@@ -148,23 +155,74 @@ class Settings:
     #   fixed_tp3       one leg, closed at TP3 (2R). What the study selected.
     #   be_33_33_34     three legs 33/33/34, stop to entry once TP1 banks.
     #                   Refuses the trade when the balance cannot split.
+    #   capital_tier    fixed_tp3 below `split_exit_min_balance`, otherwise
+    #                   be_33_33_34. The caller must pass the initial balance,
+    #                   never current equity, so the policy cannot flip mid-run.
     #   auto            the old behaviour: split when possible. Not recommended.
-    exit_mode: str = "fixed_tp3"
+    exit_mode: str = "capital_tier"
+    split_exit_min_balance: float = 30_000.0
 
     # --- bookkeeping -------------------------------------------------------
     initial_balance: float = 0.0         # 0 = capture the balance on first run
-    tags: tuple[str, ...] = field(default_factory=lambda: ("quantum", "be33"))
+    tags: tuple[str, ...] = field(default_factory=lambda: ("quantum",))
+
+    def __post_init__(self) -> None:
+        errors = []
+        if not self.symbol.strip():
+            errors.append("symbol must not be empty")
+        if not self.timeframes:
+            errors.append("timeframes must not be empty")
+        if self.risk_percent <= 0:
+            errors.append("risk_percent must be > 0")
+        if self.max_open_risk_percent < self.risk_percent:
+            errors.append("max_open_risk_percent must be >= risk_percent")
+        if self.max_risk_per_idea_percent < self.risk_percent:
+            errors.append("max_risk_per_idea_percent must be >= risk_percent")
+        if not 0 < self.internal_daily_stop_percent <= self.daily_loss_percent:
+            errors.append("internal_daily_stop_percent must be > 0 and <= daily_loss_percent")
+        if self.daily_loss_percent <= 0 or self.max_loss_percent <= 0:
+            errors.append("daily_loss_percent and max_loss_percent must be > 0")
+        if self.max_concurrent_trades < 1:
+            errors.append("max_concurrent_trades must be >= 1")
+        if self.max_consecutive_losses < 1:
+            errors.append("max_consecutive_losses must be >= 1")
+        if self.profit_target_percent <= 0 or self.min_trading_days < 1:
+            errors.append("profit target and minimum trading days must be positive")
+        if self.exit_mode not in {"fixed_tp3", "be_33_33_34", "capital_tier", "auto"}:
+            errors.append(f"unsupported exit_mode: {self.exit_mode}")
+        if self.split_exit_min_balance <= 0:
+            errors.append("split_exit_min_balance must be > 0")
+        if self.lot_rounding not in {"down", "nearest"}:
+            errors.append(f"unsupported lot_rounding: {self.lot_rounding}")
+        if self.reconnect_initial_seconds <= 0:
+            errors.append("reconnect_initial_seconds must be > 0")
+        if self.reconnect_max_seconds < self.reconnect_initial_seconds:
+            errors.append("reconnect_max_seconds must be >= reconnect_initial_seconds")
+        if self.max_requests_per_day < 1:
+            errors.append("max_requests_per_day must be >= 1")
+        if self.news_minutes_before < 0 or self.news_minutes_after < 0:
+            errors.append("news windows must not be negative")
+        if errors:
+            raise ValueError("invalid bot settings: " + "; ".join(errors))
+
+    def resolved_exit_mode(self, initial_balance: float | None = None) -> str:
+        """Concrete exit policy selected from the account's anchored capital."""
+        if self.exit_mode != "capital_tier":
+            return self.exit_mode
+        capital = self.initial_balance if initial_balance is None else initial_balance
+        return ("be_33_33_34" if capital >= self.split_exit_min_balance
+                else "fixed_tp3")
+
+    def leg_weights_for(self, initial_balance: float | None = None) -> tuple[float, ...]:
+        """Leg weights for the concrete policy active on this account."""
+        if self.resolved_exit_mode(initial_balance) == "fixed_tp3":
+            return (1.0,)
+        return (0.33, 0.33, 0.34)
 
     @property
     def leg_weights(self) -> tuple[float, ...]:
-        """Leg split implied by `exit_mode`.
-
-        `fixed_tp3` is a single leg carrying the whole position, so there is one
-        weight, not three.
-        """
-        if self.exit_mode == "fixed_tp3":
-            return (1.0,)
-        return (0.33, 0.33, 0.34)
+        """Compatibility accessor; runtime code should pass anchored capital."""
+        return self.leg_weights_for()
 
 
 def _coerce(raw: str, current):
@@ -194,7 +252,7 @@ def load() -> Settings:
         env = os.getenv(f"BOT_{spec.name.upper()}")
         if env is not None:
             values[spec.name] = _coerce(env, getattr(defaults, spec.name))
-    for key in ("timeframes", "tags"):
+    for key in ("timeframes", "tags", "news_currencies"):
         if isinstance(values.get(key), list):
             values[key] = tuple(values[key])
     return Settings(**values)

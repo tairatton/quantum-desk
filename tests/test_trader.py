@@ -26,14 +26,28 @@ if str(ROOT) not in sys.path:
 
 from bot.code import guardrails, market_hours, run, trader  # noqa: E402
 from bot.code.broker import SymbolSpec  # noqa: E402
+from bot.code.instance_lock import LiveInstanceLock  # noqa: E402
 from bot.code.settings import Settings  # noqa: E402
 from bot.code.signals import Intent  # noqa: E402
-from bot.code.state import BotState  # noqa: E402
+from bot.code.state import BotState, ManagedTrade  # noqa: E402
 from xau.mt5_source import MT5Error  # noqa: E402
 
 GOLD = SymbolSpec(name="XAUUSDm", digits=3, point=0.001, volume_min=0.01,
                   volume_max=50.0, volume_step=0.01, value_per_point=100.0,
                   stops_level_points=0.0, filling=0)
+
+
+class LiveInstanceLockTests(unittest.TestCase):
+    def test_only_one_process_lock_can_be_held(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / ".live.lock"
+            first = LiveInstanceLock(path)
+            second = LiveInstanceLock(path)
+            self.assertTrue(first.acquire())
+            self.assertFalse(second.acquire())
+            first.release()
+            self.assertTrue(second.acquire())
+            second.release()
 
 
 @dataclass
@@ -170,8 +184,8 @@ class TraderPathsTests(unittest.TestCase):
             setattr(module, name, value)
         # These exercise the three-leg machinery — break-even, per-leg tickets,
         # partial rejection — so they ask for it by name rather than leaning on
-        # whatever the default happens to be. The default is `fixed_tp3`, which
-        # is one leg and would make most of these vacuous.
+        # whatever the default happens to be. These paths require the split
+        # policy explicitly so a future default change cannot make them vacuous.
         self.settings = replace(Settings(), exit_mode="be_33_33_34")
         self.state = BotState(initial_balance=100_000.0)
         self.state.roll_day(date(2026, 6, 1), 100_000.0, 100_000.0)
@@ -367,6 +381,95 @@ class TerminalNotificationTests(unittest.TestCase):
         self.assertIn("UNTRACKED_POSITION", rendered)
         self.assertIn("UNTRACKED_PENDING", rendered)
 
+
+    def test_position_health_names_plan_target_and_exit_distances(self):
+        state = BotState(initial_balance=10_000.0)
+        trade = ManagedTrade(
+            plan_id="M15@health", timeframe="M15", direction=-1,
+            entry=4033.0, stop=4047.9359, risk=14.9359, risk_cash=42.0,
+            targets=[4005.0], legs=[0.03], position_tickets=[701],
+            exit_mode="fixed_tp3",
+        )
+        state.trades[trade.plan_id] = trade
+        position = FakePos(
+            ticket=701, direction=-1, volume=0.03, price_open=4033.0,
+            stop=4047.94, take_profit=4005.0)
+        health = run.position_health(
+            position, state,
+            {"bid": 4029.8, "ask": 4030.0,
+             "server_time": datetime(2026, 7, 28)})
+        self.assertIn("plan=M15@health", health)
+        self.assertIn("mode=fixed_tp3", health)
+        self.assertIn("role=TP3", health)
+        self.assertIn("status=PROTECTED", health)
+        self.assertIn("now=+0.20R", health)
+
+    def test_position_health_flags_missing_protection(self):
+        state = BotState(initial_balance=10_000.0)
+        trade = ManagedTrade(
+            plan_id="M15@naked", timeframe="M15", direction=1,
+            entry=4000.0, stop=3984.0, risk=16.0, risk_cash=40.0,
+            targets=[4032.0], legs=[0.02], position_tickets=[702],
+            exit_mode="fixed_tp3",
+        )
+        state.trades[trade.plan_id] = trade
+        naked = FakePos(ticket=702, stop=0.0, take_profit=0.0)
+        health = run.position_health(
+            naked, state,
+            {"bid": 4001.0, "ask": 4001.2,
+             "server_time": datetime(2026, 7, 28)})
+        self.assertIn("MISSING_SL", health)
+        self.assertIn("MISSING_TP", health)
+
+    def test_entry_capacity_reports_risk_room_and_allowed_side(self):
+        settings = replace(Settings(), exit_mode="fixed_tp3")
+        state = BotState(initial_balance=10_000.0)
+        trade = ManagedTrade(
+            plan_id="M15@capacity", timeframe="M15", direction=-1,
+            entry=4033.0, stop=4047.0, risk=14.0, risk_cash=42.0,
+            targets=[4005.0], legs=[0.03], position_tickets=[703],
+            exit_mode="fixed_tp3",
+        )
+        state.trades[trade.plan_id] = trade
+        position = FakePos(
+            ticket=703, direction=-1, volume=0.03, price_open=4033.0,
+            stop=4047.0, take_profit=4005.0)
+        allowed, message = run.entry_capacity(
+            settings, state, [position], [], GOLD, 10_000.0, requests=100)
+        self.assertFalse(allowed)
+        self.assertIn("risk room", message)
+
+        position.volume = 0.02
+        allowed, message = run.entry_capacity(
+            settings, state, [position], [], GOLD, 10_000.0, requests=100)
+        self.assertTrue(allowed)
+        self.assertIn("SELL only", message)
+
+
+class ReconnectTests(unittest.TestCase):
+    def test_reconnect_shuts_down_old_session_and_rebuilds_connection(self):
+        from bot.code.broker import Broker
+
+        class OldTerminal:
+            stopped = False
+
+            def shutdown(self):
+                self.stopped = True
+
+        broker = Broker("XAUUSD", magic=1, deviation=30, dry_run=True)
+        old = OldTerminal()
+        broker._mt = old
+        rebuilt = []
+        broker._connect = lambda: rebuilt.append(True)
+
+        broker.reconnect()
+
+        self.assertTrue(old.stopped)
+        self.assertIsNone(broker._mt)
+        self.assertIsNone(broker._spec)
+        self.assertEqual(rebuilt, [True])
+
+
 class DailyRulesTests(unittest.TestCase):
     """The day boundary, the loss streak and the daily-loss reference."""
 
@@ -508,6 +611,115 @@ class ExitModeTests(unittest.TestCase):
         self.assertEqual(replace(base, exit_mode="fixed_tp3").leg_weights, (1.0,))
         self.assertEqual(replace(base, exit_mode="be_33_33_34").leg_weights,
                          (0.33, 0.33, 0.34))
+
+    def test_capital_tier_is_fixed_below_30000_and_split_at_30000(self):
+        settings = replace(Settings(), exit_mode="capital_tier",
+                           split_exit_min_balance=30_000.0)
+
+        below_state = BotState(initial_balance=29_999.99)
+        below_state.roll_day(date(2026, 6, 1), 29_999.99, 29_999.99)
+        below = trader.open_trade(
+            FakeBroker(), settings, below_state, intent(), 29_999.99)
+        self.assertEqual(below.exit_mode, "fixed_tp3")
+        self.assertEqual(len(below.legs), 1)
+        self.assertEqual(below.targets, [intent().targets[2]])
+
+        threshold_state = BotState(initial_balance=30_000.0)
+        threshold_state.roll_day(date(2026, 6, 1), 30_000.0, 30_000.0)
+        threshold_broker = FakeBroker()
+        threshold = trader.open_trade(
+            threshold_broker, settings, threshold_state, intent(), 30_000.0)
+        self.assertEqual(threshold.exit_mode, "be_33_33_34")
+        self.assertEqual(len(threshold.legs), 3)
+        self.assertEqual(threshold.targets, list(intent().targets))
+        self.assertTrue(run.needs_split_management(threshold_state))
+
+        # TP1 must be confirmed gone before either survivor moves to entry.
+        self.assertEqual(threshold_broker.stops_moved, [])
+        threshold_broker._positions = threshold_broker._positions[1:]
+        trader.apply_breakeven(threshold_broker, threshold_state)
+        self.assertEqual(len(threshold_broker.stops_moved), 2)
+        self.assertTrue(all(stop == threshold.entry
+                            for _, stop in threshold_broker.stops_moved))
+        self.assertFalse(run.needs_split_management(threshold_state))
+
+    def test_capital_tier_never_flips_when_live_balance_crosses_threshold(self):
+        settings = replace(Settings(), exit_mode="capital_tier",
+                           split_exit_min_balance=30_000.0)
+        state = BotState(initial_balance=29_000.0)
+        state.roll_day(date(2026, 6, 1), 29_000.0, 29_000.0)
+
+        # The caller accidentally supplies current balance after profits. The
+        # trader must still anchor both sizing and policy to durable state.
+        trade = trader.open_trade(FakeBroker(), settings, state, intent(), 31_000.0)
+        self.assertEqual(trade.exit_mode, "fixed_tp3")
+        self.assertEqual(len(trade.legs), 1)
+
+    def test_split_tier_refuses_a_wide_stop_that_cannot_make_three_legs(self):
+        settings = replace(Settings(), exit_mode="capital_tier",
+                           split_exit_min_balance=30_000.0)
+        state = BotState(initial_balance=30_000.0)
+        state.roll_day(date(2026, 6, 1), 30_000.0, 30_000.0)
+        wide = replace(intent(), stop=3950.0, risk=50.0,
+                       targets=(4050.0, 4075.0, 4100.0))
+        broker = FakeBroker()
+
+        self.assertIsNone(trader.open_trade(broker, settings, state, wide, 30_000.0))
+        self.assertEqual(broker.sent, [])
+
+    def test_old_state_infers_and_persists_the_concrete_exit_policy(self):
+        path = Path(self.tmp.name) / "old-state.json"
+        payload = {
+            "initial_balance": 10_000.0,
+            "trades": {
+                "M15@old": {
+                    "plan_id": "M15@old", "timeframe": "M15", "direction": -1,
+                    "entry": 4033.0, "stop": 4047.0, "risk": 14.0,
+                    "risk_cash": 42.0, "targets": [4005.0], "legs": [0.03],
+                }
+            },
+        }
+        path.write_text(__import__("json").dumps(payload), encoding="utf-8")
+
+        restored = BotState.load(path)
+        self.assertEqual(restored.trades["M15@old"].exit_mode, "fixed_tp3")
+        restored.save(path)
+        saved = __import__("json").loads(path.read_text(encoding="utf-8"))
+        self.assertEqual(saved["trades"]["M15@old"]["exit_mode"], "fixed_tp3")
+
+    def test_three_tp_tickets_count_as_one_concurrent_setup(self):
+        settings = replace(Settings(), exit_mode="capital_tier",
+                           split_exit_min_balance=30_000.0)
+        broker = FakeBroker()
+        trade = trader.open_trade(broker, settings, self.state, intent(), 100_000.0)
+
+        self.assertEqual(len(trade.position_tickets), 3)
+        self.assertEqual(run.active_setup_count(
+            self.state, broker.positions(), broker.pending_orders()), 1)
+        self.assertTrue(guardrails.can_open(
+            settings, self.state, open_risk=0.4, open_count=3, pending_count=0,
+            active_setups=1))
+
+        orphan = {"ticket": 999, "type": 2, "price": 4000.0, "volume": 0.01}
+        self.assertEqual(run.active_setup_count(
+            self.state, broker.positions(), [orphan]), 2)
+        self.assertFalse(guardrails.can_open(
+            settings, self.state, open_risk=0.4, open_count=3, pending_count=1,
+            active_setups=2))
+
+    def test_legacy_auto_records_the_policy_it_actually_sent(self):
+        settings = replace(Settings(), exit_mode="auto")
+        small_state = BotState(initial_balance=6_000.0)
+        small_state.roll_day(date(2026, 6, 1), 6_000.0, 6_000.0)
+        one = trader.open_trade(
+            FakeBroker(), settings, small_state, intent(), 6_000.0)
+        self.assertEqual(one.exit_mode, "fixed_tp3")
+
+        large_state = BotState(initial_balance=100_000.0)
+        large_state.roll_day(date(2026, 6, 1), 100_000.0, 100_000.0)
+        three = trader.open_trade(
+            FakeBroker(), settings, large_state, intent(), 100_000.0)
+        self.assertEqual(three.exit_mode, "be_33_33_34")
 
     def test_a_single_leg_trade_never_moves_its_stop_to_entry(self):
         """One leg has no TP1 to bank; a break-even move would exit at entry a

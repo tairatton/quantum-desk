@@ -19,7 +19,9 @@ bot/journal.jsonl
 bot/settings.local.json
 bot/STOP
 bot/code/state*.json*
+bot/code/state*.json.tmp
 bot/code/news_cache.json
 bot/code/journal.jsonl
 bot/code/settings.local.json
 bot/code/STOP
+bot/code/.live.lock

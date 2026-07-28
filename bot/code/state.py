@@ -8,6 +8,7 @@ every change.
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import asdict, dataclass, field, fields
 from datetime import date
 from pathlib import Path
@@ -32,10 +33,19 @@ class ManagedTrade:
     breakeven_done: bool = False
     closed: bool = False
     dry_run: bool = False              # simulated: never scored against real deals
+    # Concrete policy used when this trade was created. Persisting it prevents a
+    # settings edit or balance change from rewriting the management contract of
+    # an already-open position after restart.
+    exit_mode: str = ""
 
 
 @dataclass
 class BotState:
+    # A state file belongs to exactly one broker account. Without this binding,
+    # switching from a demo to a Challenge could carry the old initial balance,
+    # trading days and tickets into the new account.
+    account_login: int | None = None
+    account_server: str = ""
     initial_balance: float = 0.0
     # Last offset measured from a live tick. Kept because it cannot be measured
     # while the market is closed, and the news calendar needs it to line up.
@@ -72,10 +82,18 @@ class BotState:
             return cls()
         raw = json.loads(path.read_text(encoding="utf-8"))
         trade_fields = {spec.name for spec in fields(ManagedTrade)}
-        trades = {
-            key: ManagedTrade(**{name: value for name, value in payload.items()
-                                 if name in trade_fields})
-            for key, payload in raw.pop("trades", {}).items()}
+        trades = {}
+        for key, payload in raw.pop("trades", {}).items():
+            known_payload = {name: value for name, value in payload.items()
+                             if name in trade_fields}
+            if not known_payload.get("exit_mode"):
+                # State written before capital tiers did not name the concrete
+                # policy. The ticket layout is authoritative: fixed TP3 always
+                # had one leg; the measured BE policy had three.
+                known_payload["exit_mode"] = (
+                    "be_33_33_34" if len(known_payload.get("legs", ())) >= 3
+                    else "fixed_tp3")
+            trades[key] = ManagedTrade(**known_payload)
         known = {spec.name for spec in fields(cls)} - {"trades"}
         return cls(**{key: value for key, value in raw.items() if key in known},
                    trades=trades)
@@ -83,7 +101,41 @@ class BotState:
     def save(self, path: Path) -> None:
         payload = asdict(self)
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+        temporary = path.with_name(f"{path.name}.tmp")
+        with temporary.open("w", encoding="utf-8", newline="\n") as handle:
+            json.dump(payload, handle, indent=2, ensure_ascii=False)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+
+    def bind_account(self, account: dict) -> bool:
+        """Bind legacy/fresh state to one login, or fail closed on a mismatch.
+
+        Returns True only when the identity was recorded for the first time.
+        A legacy state with a materially different initial balance is refused:
+        that is the tell-tale case of taking a $10K state into a $50K account.
+        """
+        login = int(account.get("login") or 0)
+        server = str(account.get("server") or "")
+        balance = float(account.get("balance") or 0.0)
+        if login <= 0 or not server:
+            raise ValueError("MT5 account identity is incomplete; refusing LIVE trading")
+        if self.account_login is None:
+            if self.initial_balance > 0 and balance > 0:
+                difference = abs(balance - self.initial_balance) / self.initial_balance
+                if difference > 0.25:
+                    raise ValueError(
+                        f"legacy state is anchored at {self.initial_balance:,.2f}, "
+                        f"but MT5 balance is {balance:,.2f}; archive state.json before "
+                        "using a different account")
+            self.account_login = login
+            self.account_server = server
+            return True
+        if self.account_login != login or self.account_server != server:
+            raise ValueError(
+                f"state belongs to {self.account_login}@{self.account_server}, "
+                f"but MT5 is {login}@{server}; use a separate state.json")
+        return False
 
     # -- day handling -----------------------------------------------------
     def roll_day(self, server_day: date, balance: float,
@@ -114,7 +166,9 @@ class BotState:
 
     @property
     def is_paused_today(self) -> bool:
-        return self.paused_until_day == self.day_key
+        # A brand-new state has both fields empty; empty == empty must not make
+        # the account look paused before the first server day is anchored.
+        return bool(self.day_key) and self.paused_until_day == self.day_key
 
     def pause_today(self) -> None:
         self.paused_until_day = self.day_key
