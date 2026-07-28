@@ -10,11 +10,40 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+import os
 
 import pandas as pd
 
 from xau import config, mt5_source
 from xau.mt5_source import MT5Error
+
+
+def _configured_mt5_login() -> dict[str, object]:
+    """Return explicit MT5 login details from the process environment.
+
+    Credentials are deliberately not read from source code or settings.local.json.
+    Set all three BOT_MT5_LOGIN, BOT_MT5_PASSWORD and BOT_MT5_SERVER variables to
+    make every bot start attach to the intended account; leave all three unset to
+    retain MT5's currently logged-in account behaviour.
+    """
+    raw_login = os.getenv("BOT_MT5_LOGIN", "").strip()
+    password = os.getenv("BOT_MT5_PASSWORD", "")
+    server = os.getenv("BOT_MT5_SERVER", "").strip()
+    provided = (bool(raw_login), bool(password), bool(server))
+    if not any(provided):
+        return {}
+    if not all(provided):
+        raise MT5Error(
+            "MT5 account configuration is incomplete. Set BOT_MT5_LOGIN, "
+            "BOT_MT5_PASSWORD and BOT_MT5_SERVER together."
+        )
+    try:
+        login = int(raw_login)
+    except ValueError as exc:
+        raise MT5Error("BOT_MT5_LOGIN must be a numeric MT5 account number.") from exc
+    if login <= 0:
+        raise MT5Error("BOT_MT5_LOGIN must be a positive MT5 account number.")
+    return {"login": login, "password": password, "server": server}
 
 
 @dataclass(frozen=True)
@@ -86,6 +115,7 @@ class Broker:
         kwargs = {"timeout": config.MT5_INIT_TIMEOUT_MS}
         if terminal is not None:
             kwargs["path"] = str(terminal)
+        kwargs.update(_configured_mt5_login())
         if not mt5.initialize(**kwargs):
             code, desc = mt5.last_error()
             raise MT5Error(f"MT5 initialize() failed: ({code}) {desc}")

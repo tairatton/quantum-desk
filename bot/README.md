@@ -283,6 +283,18 @@ Execution layer ออกแบบให้ใช้กับ MT5 ได้ แ�
 - ต้องตรวจ log, lot, SL/TP, symbol, server clock และ news gate ก่อนใช้ `--live`
 - ต้องเก็บผล forward test บน FTMO demo อย่างน้อย 50 closed trades ก่อนสรุปว่า edge จาก backtest ยังคงอยู่
 
+### ผูกบัญชี MT5 กับบอท
+
+บอทสามารถล็อกอินบัญชีที่กำหนดเองทุกครั้งที่เริ่มได้ผ่าน Windows User Environment Variables โดยไม่เก็บรหัสผ่านใน source หรือไฟล์ตั้งค่า:
+
+```powershell
+[Environment]::SetEnvironmentVariable('BOT_MT5_LOGIN', '<เลขบัญชี>', 'User')
+[Environment]::SetEnvironmentVariable('BOT_MT5_PASSWORD', '<รหัสผ่าน>', 'User')
+[Environment]::SetEnvironmentVariable('BOT_MT5_SERVER', '<ชื่อ server>', 'User')
+```
+
+ปิดแล้วเปิด PowerShell หรือ terminal ใหม่ก่อนรันบอท ค่าทั้งสามต้องมีครบพร้อมกัน; หากไม่ตั้งเลย บอทจะใช้บัญชีที่ล็อกอินอยู่ใน MT5 ตามปกติ. ห้ามบันทึกรหัสผ่านใน `settings.local.json` หรือ commit ลง Git
+
 คำสั่งมาตรฐานสำหรับ production environment:
 
 ```powershell

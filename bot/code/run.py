@@ -687,7 +687,8 @@ def print_status(broker: Broker, state: BotState, config_) -> None:
     print(f"[ENTRY_CAPACITY] {capacity}")
     print()
 
-def pass_once(broker: Broker, state: BotState, config_) -> None:
+def _bind_and_anchor(broker: Broker, state: BotState, config_):
+    """Bind state and establish its risk basis without evaluating a signal."""
     quote = broker.tick()
     account = broker.account()
 
@@ -707,6 +708,29 @@ def pass_once(broker: Broker, state: BotState, config_) -> None:
                       account["equity"]):
         print(f"[DAY] {state.day_key} opens at balance {state.day_start_balance:.2f} "
               f"equity {state.day_start_equity:.2f} (loss floor uses the higher)")
+    return quote, account
+
+
+def reconcile_startup(broker: Broker, state: BotState, config_) -> None:
+    """Adopt fills that happened while the bot was not running.
+
+    A pending three-leg setup may fill between runs.  The old startup sequence
+    printed a heartbeat and then slept until the next bar before calling
+    ``sync_fills``; during that window all three live legs looked untracked and
+    could not receive split-exit management.  This deliberately performs only
+    account/state and order lifecycle work—never signal evaluation or entries.
+    """
+    _bind_and_anchor(broker, state, config_)
+    frames = {timeframe: broker.bars(timeframe, config_.history_bars)
+              for timeframe in config_.timeframes}
+    trader.sync_fills(broker, state, frames)
+    state.day_requests += broker.take_requests()
+    state.save(STATE_PATH)
+    print("[STARTUP_SYNC] existing pending orders reconciled before signal loop")
+
+
+def pass_once(broker: Broker, state: BotState, config_) -> None:
+    quote, account = _bind_and_anchor(broker, state, config_)
 
     # Housekeeping first: an open trade must be managed even when new entries are off.
     frames = {timeframe: broker.bars(timeframe, config_.history_bars)
@@ -937,6 +961,7 @@ def execute(*, live: bool = False, once: bool = False, status: bool = False,
             trader.flatten_all(broker, state, "manual flatten")
             state.save(STATE_PATH)
             return
+        reconcile_startup(broker, state, config_)
         print_status(broker, state, config_)
         if once:
             pass_once(broker, state, config_)
