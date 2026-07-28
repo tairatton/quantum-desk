@@ -1,0 +1,403 @@
+"""Turning a plan into orders, and looking after them until they are closed.
+
+The exit policy is BE + 33/33/34, which is what won every gold split in the
+technique lab:
+
+  * three legs at TP1 (1R), TP2 (1.5R) and TP3 (2R), weighted 33/33/34
+  * once TP1 is banked, the stop on what is left moves to entry
+  * anything still open 120 bars after the fill is closed at market
+
+Each leg is a separate position carrying its own take-profit. Partial closes on
+one position would work too, but separate legs let the broker enforce every exit
+even if this process dies.
+"""
+from __future__ import annotations
+
+from datetime import timedelta
+
+import pandas as pd
+
+from xau import config
+from xau.mt5_source import MT5Error
+
+from . import journal, signals
+from .broker import Broker, Position
+from .settings import JOURNAL_PATH, STATE_PATH, Settings
+from .signals import Intent
+from .sizing import SizingError, size_plan
+from .state import BotState, ManagedTrade
+
+
+def _timeframe_delta(timeframe: str) -> timedelta:
+    return timedelta(seconds=config.TIMEFRAME_SECONDS[timeframe.upper()])
+
+
+def _leg_targets(intent: Intent, leg_count: int, fallback_index: int) -> list[float]:
+    if leg_count == 1:
+        return [intent.targets[fallback_index]]
+    return list(intent.targets[:leg_count])
+
+
+def _check_exit_mode(settings: Settings, sizing, intent: Intent) -> str | None:
+    """Reason to refuse the trade because it cannot honour `exit_mode`, or None.
+
+    `be_33_33_34` on a balance too small to split would quietly become a single
+    leg — the exact silent swap `exit_mode` exists to prevent. Refusing is the
+    honest answer: the operator asked for an exit the account cannot place.
+    """
+    if settings.exit_mode == "be_33_33_34" and sizing.single_leg:
+        return (f"exit_mode=be_33_33_34 needs three legs but the balance only "
+                f"sizes {sizing.legs}; raise the balance or set exit_mode=fixed_tp3")
+    return None
+
+
+def open_trade(broker: Broker, settings: Settings, state: BotState, intent: Intent,
+               balance: float) -> ManagedTrade | None:
+    """Size the plan and place its legs. Returns None when nothing was sent."""
+    try:
+        sizing = size_plan(broker.spec, balance, settings.risk_percent,
+                           intent.risk, settings.leg_weights,
+                           rounding=settings.lot_rounding,
+                           max_overshoot=settings.max_risk_overshoot)
+    except SizingError as error:
+        journal.write(JOURNAL_PATH, "sizing_rejected", plan_id=intent.plan_id,
+                      reason=str(error))
+        print(f"[SIZING_REJECTED] plan={intent.plan_id} reason={str(error)!r}")
+        return None
+
+    # The lot step can only round down, so the position often carries less risk
+    # than the settings asked for. Say so when the gap is wide enough to matter:
+    # every R in the journal is measured against the real number, and a silent
+    # half-size position would read as a system with twice the edge it has.
+    if sizing.risk_shortfall < 0.85:
+        journal.write(JOURNAL_PATH, "risk_rounded_down", plan_id=intent.plan_id,
+                      intended=round(sizing.intended_risk_cash, 2),
+                      actual=round(sizing.risk_cash, 2),
+                      fraction=round(sizing.risk_shortfall, 3),
+                      lots=list(sizing.legs))
+        print(f"[RISK_ROUNDED] plan={intent.plan_id} "
+              f"intended={sizing.intended_risk_cash:.2f} "
+              f"actual={sizing.risk_cash:.2f} "
+              f"({sizing.risk_shortfall:.0%} of target) lots={sizing.legs}")
+
+    refusal = _check_exit_mode(settings, sizing, intent)
+    if refusal is not None:
+        journal.write(JOURNAL_PATH, "exit_mode_rejected", plan_id=intent.plan_id,
+                      reason=refusal, exit_mode=settings.exit_mode)
+        print(f"[SIZING_REJECTED] plan={intent.plan_id} reason={refusal!r}")
+        return None
+
+    targets = _leg_targets(intent, len(sizing.legs), settings.single_leg_fallback_target)
+    trade = ManagedTrade(
+        plan_id=intent.plan_id, timeframe=intent.timeframe, direction=intent.direction,
+        entry=intent.entry, stop=intent.stop, risk=intent.risk,
+        risk_cash=round(sizing.risk_cash, 2), targets=targets, legs=list(sizing.legs),
+        dry_run=broker.dry_run,
+    )
+
+    expiry = None
+    if intent.action == "limit":
+        remaining = max(signals.ENTRY_TIMEOUT_BARS - intent.bars_since_signal, 1)
+        expiry = broker.tick()["server_time"] + remaining * _timeframe_delta(intent.timeframe)
+
+    known = {ticket for other in state.trades.values() for ticket in other.position_tickets}
+
+    # Register the trade *before* the first order goes out. A leg can be rejected
+    # halfway through — bad stops, margin, a requote — and if the plan were only
+    # recorded on success, whatever did fill would be a position no part of this
+    # bot knows about: no break-even, no timeout, missing from the journal, and on
+    # the pending path the plan would look unseen and be sent again next bar.
+    state.trades[trade.plan_id] = trade
+    state.remember_plan(trade.plan_id)
+    state.save(STATE_PATH)
+
+    placed = 0
+    try:
+        for index, (volume, target) in enumerate(zip(sizing.legs, targets), start=1):
+            # Name the target the leg is actually aimed at. `index` is the leg
+            # number, which only equals the TP number when the position splits
+            # three ways. Under `fixed_tp3` there is one leg going to TP3, and
+            # labelling it "TP1" made every order in the terminal and in FTMO's
+            # trade log claim an exit the bot was not taking.
+            tp_number = (settings.single_leg_fallback_target + 1
+                         if sizing.single_leg else index)
+            comment = f"{intent.timeframe} TP{tp_number} {'|'.join(settings.tags)}"
+            if intent.action == "market":
+                broker.market_entry(intent.direction, volume, intent.stop, target, comment)
+            else:
+                result = broker.limit_entry(intent.direction, volume, intent.entry,
+                                            intent.stop, target, expiry, comment)
+                ticket = int(result.get("order") or 0)
+                if ticket:
+                    trade.pending_tickets.append(ticket)
+            placed = index
+    except MT5Error as error:
+        journal.write(JOURNAL_PATH, "leg_rejected", plan_id=trade.plan_id,
+                      placed=placed, of=len(sizing.legs), reason=str(error))
+        print(f"[ORDER_REJECTED] plan={trade.plan_id} leg={placed + 1} "
+              f"reason={str(error)!r} managed_legs={placed}")
+    finally:
+        # Adopt whatever actually reached the broker, however the loop ended, so
+        # the exit machinery owns every live leg.
+        if intent.action == "market":
+            trade.filled_at = str(broker.tick()["server_time"])
+            trade.fill_bar_time = intent.signal_time
+            # Read the tickets back rather than trusting the order id to equal
+            # the position id — brokers do not all agree on that.
+            trade.position_tickets = sorted(
+                position.ticket for position in broker.positions()
+                if position.ticket not in known)
+            if trade.position_tickets:
+                state.count_trading_day()
+        if not trade.position_tickets and not trade.pending_tickets:
+            # Nothing is live, so nothing needs managing. It stays in `trades` as
+            # a closed record, which also stops the plan being retried.
+            trade.closed = True
+        state.save(STATE_PATH)
+
+    journal.write(JOURNAL_PATH, "trade_opened", plan_id=trade.plan_id,
+                  side=intent.side, action=intent.action, timeframe=intent.timeframe,
+                  entry=intent.entry, stop=intent.stop, risk=intent.risk,
+                  targets=targets, legs=list(sizing.legs), legs_placed=placed,
+                  risk_cash=trade.risk_cash,
+                  single_leg=sizing.single_leg, dry_run=broker.dry_run)
+    if trade.position_tickets:
+        print(f"[POSITION_OPENED] plan={intent.plan_id} side={intent.side} "
+              f"positions={trade.position_tickets} volumes={list(sizing.legs)} "
+              f"entry={intent.entry} sl={intent.stop} targets={targets} "
+              f"risk_cash={trade.risk_cash:.2f}")
+    elif trade.pending_tickets:
+        expiry_text = expiry.strftime("%Y-%m-%d %H:%M:%S") if expiry else "GTC"
+        print(f"[PENDING_CREATED] plan={intent.plan_id} side={intent.side} "
+              f"orders={trade.pending_tickets} volumes={list(sizing.legs)} "
+              f"entry={intent.entry} sl={intent.stop} targets={targets} "
+              f"expires={expiry_text} risk_cash={trade.risk_cash:.2f}")
+    else:
+        print(f"[ORDER_NOT_OPENED] plan={intent.plan_id} reason='no live ticket returned'")
+    return trade
+
+
+def sync_fills(broker: Broker, state: BotState,
+               frames: dict[str, pd.DataFrame] | None = None) -> None:
+    """Reconcile pending orders with their resulting MT5 position identifiers.
+
+    MT5 order tickets and position tickets are different identifiers on many
+    brokers. Deal history provides the authoritative order-to-position mapping.
+    """
+    live_orders = {order["ticket"] for order in broker.pending_orders()}
+    pending_tickets = [
+        ticket
+        for trade in state.open_trades()
+        for ticket in trade.pending_tickets
+    ]
+    missing_tickets = [ticket for ticket in pending_tickets if ticket not in live_orders]
+    filled_by_order = broker.filled_order_positions(missing_tickets)
+    finished_states = broker.finished_order_states(missing_tickets)
+    terminal_states = {"CANCELED", "REJECTED", "EXPIRED"}
+    changed = False
+
+    for trade in state.open_trades():
+        if not trade.pending_tickets:
+            continue
+        original = list(trade.pending_tickets)
+        missing = [ticket for ticket in original if ticket not in live_orders]
+        filled_orders = [ticket for ticket in missing if ticket in filled_by_order]
+        removed_orders = [ticket for ticket in missing
+                          if finished_states.get(ticket) in terminal_states]
+        unresolved_orders = [ticket for ticket in missing
+                             if ticket not in filled_by_order
+                             and ticket not in removed_orders]
+        filled_positions = [filled_by_order[ticket] for ticket in filled_orders]
+
+        trade.pending_tickets = [ticket for ticket in original
+                                 if ticket in live_orders or ticket in unresolved_orders]
+        for position_ticket in filled_positions:
+            if position_ticket not in trade.position_tickets:
+                trade.position_tickets.append(position_ticket)
+        changed = changed or trade.pending_tickets != original
+
+        if filled_positions:
+            trade.filled_at = trade.filled_at or str(broker.tick()["server_time"])
+            if not trade.fill_bar_time:
+                trade.fill_bar_time = _fill_bar_time(frames, trade, broker)
+            state.count_trading_day()
+            journal.write(JOURNAL_PATH, "pending_filled", plan_id=trade.plan_id,
+                          order_tickets=filled_orders,
+                          position_tickets=filled_positions,
+                          fill_bar_time=trade.fill_bar_time)
+            print(f"[PENDING_FILLED] plan={trade.plan_id} "
+                  f"orders={filled_orders} positions={filled_positions}")
+
+        if removed_orders:
+            states = {ticket: finished_states[ticket] for ticket in removed_orders}
+            journal.write(JOURNAL_PATH, "pending_removed", plan_id=trade.plan_id,
+                          order_tickets=removed_orders, states=states)
+            print(f"[PENDING_REMOVED] plan={trade.plan_id} states={states}")
+
+        if unresolved_orders:
+            print(f"[PENDING_SYNC_WAIT] plan={trade.plan_id} orders={unresolved_orders} "
+                  "reason='waiting for MT5 order/deal history'")
+
+        if not trade.pending_tickets and not trade.position_tickets:
+            trade.closed = True
+            changed = True
+
+    if changed:
+        state.save(STATE_PATH)
+
+def _fill_bar_time(frames: dict[str, pd.DataFrame] | None, trade: ManagedTrade,
+                   broker: Broker) -> str:
+    """The closed bar the fill belongs to, which starts the 120-bar clock.
+
+    The strategy counts from the bar that filled, so the last closed bar on the
+    trade's own timeframe is the right anchor. Falling back to the raw server
+    time still beats leaving it unset: a timestamp `bars_since` cannot match
+    yields 0 bars, which merely delays the timeout instead of disabling it.
+    """
+    frame = (frames or {}).get(trade.timeframe)
+    if frame is not None and len(frame):
+        return str(pd.Timestamp(frame["time"].iloc[-1]))
+    return str(broker.tick()["server_time"])
+
+
+def apply_breakeven(broker: Broker, state: BotState) -> None:
+    """Move the stop to entry once TP1 is banked.
+
+    All legs share one stop, so if the TP1 leg is gone while later legs are still
+    open, TP1 must have been taken rather than stopped out.
+
+    A `fixed_tp3` trade holds one leg and is skipped by the `< 2` test below,
+    which is what should happen: there is no TP1 to bank and nothing behind it to
+    protect, and moving that single stop to entry would exit at break-even a
+    trade the measured policy carries all the way to TP3.
+    """
+    open_positions = {position.ticket: position for position in broker.positions()}
+    for trade in state.open_trades():
+        if trade.breakeven_done or len(trade.position_tickets) < 2:
+            continue
+        first, *rest = trade.position_tickets
+        if first in open_positions:
+            continue
+        survivors = [open_positions[ticket] for ticket in rest if ticket in open_positions]
+        if not survivors:
+            continue
+        for position in survivors:
+            improves = (trade.entry > position.stop if trade.direction == 1
+                        else trade.entry < position.stop)
+            if improves:
+                broker.move_stop(position, trade.entry)
+        trade.breakeven_done = True
+        journal.write(JOURNAL_PATH, "breakeven", plan_id=trade.plan_id,
+                      tickets=[position.ticket for position in survivors],
+                      stop=trade.entry)
+        print(f"[STOP_MOVED] plan={trade.plan_id} mode=BREAK_EVEN stop={trade.entry} "
+              f"positions={[position.ticket for position in survivors]}")
+
+
+def enforce_timeout(broker: Broker, state: BotState, frames: dict[str, pd.DataFrame]) -> None:
+    """Close what the backtest would have timed out at 120 bars."""
+    open_positions = {position.ticket: position for position in broker.positions()}
+    for trade in state.open_trades():
+        frame = frames.get(trade.timeframe)
+        if frame is None or not trade.fill_bar_time:
+            continue
+        if signals.bars_since(frame, trade.fill_bar_time) <= signals.TRADE_TIMEOUT_BARS:
+            continue
+        live = [open_positions[ticket] for ticket in trade.position_tickets
+                if ticket in open_positions]
+        if not live:
+            continue    # already gone; `reconcile_closed` will score it
+        for position in live:
+            broker.close(position, "timeout 120 bars")
+        journal.write(JOURNAL_PATH, "timeout_closed", plan_id=trade.plan_id,
+                      tickets=[position.ticket for position in live])
+        print(f"[CLOSE_SUBMITTED] plan={trade.plan_id} reason='timeout_120_bars' "
+              f"positions={[position.ticket for position in live]}")
+
+
+def cancel_stale(broker: Broker, state: BotState, intent: Intent) -> None:
+    """Drop a working order whose plan the strategy has abandoned."""
+    trade = state.trades.get(intent.plan_id)
+    if trade is None or not trade.pending_tickets:
+        return
+    live = {order["ticket"] for order in broker.pending_orders()}
+    for ticket in list(trade.pending_tickets):
+        if ticket in live:
+            broker.cancel(ticket, intent.status)
+    trade.pending_tickets.clear()
+    if not trade.position_tickets:
+        trade.closed = True
+    journal.write(JOURNAL_PATH, "pending_cancelled", plan_id=trade.plan_id,
+                  reason=intent.status)
+    print(f"[PENDING_CANCELLED] plan={trade.plan_id} reason={intent.status!r}")
+
+
+def reconcile_closed(broker: Broker, state: BotState) -> list[dict]:
+    """Score finished trades in R and update the loss streak."""
+    open_tickets = {position.ticket for position in broker.positions()}
+    pending_tickets = {order["ticket"] for order in broker.pending_orders()}
+    finished = []
+    for trade in state.open_trades():
+        if trade.dry_run or not trade.position_tickets:
+            continue
+        if any(ticket in open_tickets for ticket in trade.position_tickets):
+            continue
+        if any(ticket in pending_tickets for ticket in trade.pending_tickets):
+            continue
+        since = pd.Timestamp(trade.filled_at or broker.tick()["server_time"]).to_pydatetime()
+        deals = [deal for deal in broker.closed_deals(since - timedelta(days=2))
+                 if deal["position"] in trade.position_tickets]
+        # `net` is profit plus commission plus swap. Gold on M30 can be held for
+        # 60 hours, so swap is not a rounding error, and R is the number that
+        # decides whether this edge survived contact with a real broker.
+        if not deals:
+            print(f"[RECONCILE_WAIT] plan={trade.plan_id} "
+                  "reason='position disappeared but deal history is not available yet'")
+            continue
+        profit = sum(deal["net"] for deal in deals)
+        costs = sum(deal["commission"] + deal["swap"] for deal in deals)
+        r_value = profit / trade.risk_cash if trade.risk_cash else None
+        trade.closed = True
+        state.day_realised += profit
+        if profit < 0:
+            state.consecutive_losses += 1
+        elif profit > 0:
+            state.consecutive_losses = 0
+        record = journal.write(JOURNAL_PATH, "trade_closed", plan_id=trade.plan_id,
+                               timeframe=trade.timeframe, profit=round(profit, 2),
+                               costs=round(costs, 2),
+                               r=round(r_value, 4) if r_value is not None else None,
+                               breakeven_done=trade.breakeven_done)
+        finished.append(record)
+        scored = f" ({r_value:+.2f}R)" if r_value is not None else ""
+        print(f"[POSITION_CLOSED] plan={trade.plan_id} net={profit:+.2f} "
+              f"result={scored.strip() or 'n/a'} costs={costs:+.2f} "
+              f"consecutive_losses={state.consecutive_losses}")
+    return finished
+
+
+def flatten_all(broker: Broker, state: BotState, reason: str) -> None:
+    """Emergency exit: cancel everything working and close every position."""
+    for order in broker.pending_orders():
+        broker.cancel(order["ticket"], reason)
+    for position in broker.positions():
+        broker.close(position, reason)
+    for trade in state.open_trades():
+        trade.pending_tickets.clear()
+    journal.write(JOURNAL_PATH, "flatten_all", reason=reason)
+    print(f"[EMERGENCY_FLATTEN] submitted for every order and position | reason={reason!r}")
+
+
+def prune(state: BotState, keep: int = 200) -> None:
+    """Keep state.json small without losing anything still working."""
+    closed = [plan_id for plan_id, trade in state.trades.items() if trade.closed]
+    for plan_id in closed[:-keep] if len(closed) > keep else []:
+        state.trades.pop(plan_id, None)
+
+
+def describe(position: Position) -> str:
+    return (f"ticket={position.ticket} side={'BUY' if position.direction == 1 else 'SELL'} "
+            f"volume={position.volume:g} entry={position.price_open} "
+            f"sl={position.stop} tp={position.take_profit} "
+            f"pnl={position.profit:+.2f} opened={position.opened_at:%Y-%m-%d %H:%M:%S} "
+            f"comment={position.comment!r}")

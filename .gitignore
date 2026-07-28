@@ -1,0 +1,25 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.codex/
+
+# Market data and rendered output are reproducible from MT5.
+data/market/**/*.csv
+data/market/**/*.meta.json
+data/ai_decisions/*.jsonl
+outputs/charts/**/*
+outputs/backtests/**/*
+
+# Live bot runtime state: account specific, never shared.
+bot/state.json
+bot/news_cache.json
+bot/journal.jsonl
+bot/settings.local.json
+bot/STOP
+bot/code/state*.json*
+bot/code/news_cache.json
+bot/code/journal.jsonl
+bot/code/settings.local.json
+bot/code/STOP

@@ -1,0 +1,7 @@
+MetaTrader5>=5.0.45
+pandas>=2.0
+numpy>=1.24
+# web dashboard
+Flask>=3.0
+plotly>=5.18
+matplotlib>=3.8

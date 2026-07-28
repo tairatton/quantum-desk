@@ -1,0 +1,605 @@
+<!doctype html>
+<html lang="th">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>HTF Quantum Adaptive</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><text y='26' font-size='26'>🌊</text></svg>">
+<script src="/plotly.js"></script>
+<style>
+  :root{
+    --plane:#111111; --surface:#1a1a19; --ink:#ffffff; --ink2:#c3c2b7;
+    --muted:#898781; --grid:#2c2c2a; --axis:#383835;
+    --up:#0ca30c; --down:#d03b3b; --warn:#fab219;
+    --s1:#3987e5; --s2:#d95926; --s3:#199e70;
+    --radius:10px;
+  }
+  *{box-sizing:border-box}
+  body{
+    margin:0; background:var(--plane); color:var(--ink2);
+    font:14px/1.5 system-ui,-apple-system,"Segoe UI",sans-serif;
+  }
+  header{
+    display:flex; align-items:center; gap:20px; flex-wrap:wrap;
+    padding:14px 20px; border-bottom:1px solid var(--axis); background:var(--surface);
+    position:sticky; top:0; z-index:20;
+  }
+  h1{margin:0; font-size:16px; color:var(--ink); font-weight:700; letter-spacing:.2px}
+  h1 span{color:var(--muted); font-weight:400}
+
+  .tfs{display:flex; gap:4px; background:var(--plane); padding:4px; border-radius:var(--radius)}
+  .tf{
+    border:0; background:transparent; color:var(--ink2); cursor:pointer;
+    padding:7px 15px; border-radius:7px; font:600 13px/1 inherit;
+    font-variant-numeric:tabular-nums; transition:background .12s,color .12s;
+  }
+  .tf:hover{background:var(--grid); color:var(--ink)}
+  .tf[aria-pressed="true"]{background:var(--s1); color:#fff}
+
+  .ctrl{display:flex; align-items:center; gap:7px; color:var(--muted); font-size:12px}
+  .ctrl input[type=range]{width:104px; accent-color:var(--s1)}
+  .ctrl output{color:var(--ink2); font-variant-numeric:tabular-nums; min-width:20px}
+  button.action{
+    border:1px solid var(--axis); background:var(--plane); color:var(--ink2);
+    padding:7px 13px; border-radius:7px; cursor:pointer; font:600 12px/1 inherit;
+  }
+  button.action:hover{border-color:var(--muted); color:var(--ink)}
+  button.action:disabled{opacity:.5; cursor:default}
+
+  .live{gap:6px; cursor:pointer; user-select:none}
+  .live input{accent-color:var(--up); width:14px; height:14px; cursor:pointer}
+  .live #countdown{
+    color:var(--muted); font-variant-numeric:tabular-nums;
+    min-width:30px; text-align:right; font-size:11px;
+  }
+  .live.on #countdown{color:var(--up)}
+
+  .pulse{
+    width:7px; height:7px; border-radius:50%; background:var(--up); flex:none;
+    animation:beat 2s ease-in-out infinite;
+  }
+  @keyframes beat{0%,100%{opacity:1}50%{opacity:.25}}
+  @media (prefers-reduced-motion:reduce){ .pulse{animation:none} }
+
+  #status{margin-left:auto; display:flex; align-items:center; gap:8px; font-size:12px}
+  .dot{width:8px; height:8px; border-radius:50%; background:var(--muted); flex:none}
+  .dot.ok{background:var(--up)} .dot.bad{background:var(--down)}
+
+  /* align-items:start stops the chart card stretching to the sidebar height */
+  main{display:grid; grid-template-columns:1fr 330px; gap:14px; padding:14px; align-items:start}
+  @media(max-width:1080px){main{grid-template-columns:1fr}}
+
+  .card{background:var(--surface); border:1px solid var(--axis); border-radius:var(--radius); overflow:hidden}
+  .card h2{
+    margin:0; padding:11px 14px; font-size:12px; font-weight:700; color:var(--muted);
+    letter-spacing:.09em; text-transform:uppercase; border-bottom:1px solid var(--axis);
+  }
+  .card .body{padding:14px}
+  aside{display:flex; flex-direction:column; gap:14px; min-width:0}
+
+  #chart{min-height:760px}
+
+  .kv{display:flex; justify-content:space-between; gap:12px; padding:5px 0; font-size:13px}
+  .kv+.kv{border-top:1px solid var(--grid)}
+  .kv dt{color:var(--muted)}
+  .kv dd{margin:0; color:var(--ink); font-variant-numeric:tabular-nums; text-align:right}
+  dl{margin:0}
+
+  .price{font-size:27px; font-weight:700; color:var(--ink); font-variant-numeric:tabular-nums}
+  .badge{
+    display:inline-flex; align-items:center; gap:5px; padding:3px 9px; border-radius:99px;
+    font-size:11px; font-weight:700; letter-spacing:.03em;
+  }
+  .b-up{background:rgba(12,163,12,.16); color:var(--up)}
+  .b-down{background:rgba(208,59,59,.16); color:var(--down)}
+  .b-flat{background:rgba(137,135,129,.16); color:var(--ink2)}
+  .b-warn{background:rgba(250,178,25,.16); color:var(--warn)}
+
+  .pattern{padding:12px 14px; border-bottom:1px solid var(--grid)}
+  .pattern:last-child{border-bottom:0}
+  .pattern.current{background:rgba(57,135,229,.07); border-left:3px solid var(--s1)}
+  .pattern .top{display:flex; justify-content:space-between; align-items:baseline; gap:10px}
+  .pattern .nm{font-weight:700; color:var(--ink); font-size:13px}
+  .pattern .meta{font-size:11px; color:var(--muted); margin-top:3px; font-variant-numeric:tabular-nums}
+  .meter{height:4px; background:var(--grid); border-radius:99px; margin-top:8px; overflow:hidden}
+  .meter i{display:block; height:100%; background:var(--s1); border-radius:99px}
+
+  .rules{margin-top:9px; display:none}
+  .pattern.open .rules{display:block}
+  .rule{display:flex; gap:7px; font-size:11px; padding:2px 0; color:var(--muted)}
+  .rule .m{flex:none; font-weight:700}
+  .rule.pass .m{color:var(--up)} .rule.fail .m{color:var(--warn)}
+  .toggle{
+    margin-top:7px; background:none; border:0; color:var(--s1);
+    font:600 11px inherit; cursor:pointer; padding:0;
+  }
+  .path{
+    font-size:11px; color:var(--ink2); margin-top:6px; word-break:break-word;
+    font-variant-numeric:tabular-nums;
+  }
+  .fib{display:flex; justify-content:space-between; padding:4px 0; font-size:12px; font-variant-numeric:tabular-nums}
+  .fib+.fib{border-top:1px solid var(--grid)}
+  .fib span:last-child{color:var(--ink)}
+
+  .note{font-size:12px; color:var(--ink2); line-height:1.55}
+
+  .proj{margin-top:11px; border:1px solid var(--axis); border-radius:8px; overflow:hidden}
+  .proj .hd{
+    display:flex; justify-content:space-between; align-items:center; gap:8px;
+    padding:7px 10px; background:rgba(57,135,229,.10); font-size:11px;
+    font-weight:700; letter-spacing:.05em; text-transform:uppercase; color:var(--s1);
+  }
+  .proj.dead .hd{background:rgba(137,135,129,.12); color:var(--muted)}
+  .proj .step{
+    display:flex; justify-content:space-between; gap:10px; padding:5px 10px;
+    font-size:12px; font-variant-numeric:tabular-nums;
+  }
+  .proj .step+.step{border-top:1px solid var(--grid)}
+  .proj .step b{color:var(--ink); font-weight:700}
+  .proj .step .ahead{color:var(--muted); font-size:11px}
+  .proj .zone{
+    padding:6px 10px; font-size:11px; border-top:1px solid var(--grid);
+    display:flex; justify-content:space-between; font-variant-numeric:tabular-nums;
+  }
+  .proj .inval{color:var(--down)}
+
+  .lv{display:flex; justify-content:space-between; align-items:center; gap:10px;
+      padding:8px 14px; font-size:13px; font-variant-numeric:tabular-nums}
+  .lv+.lv{border-top:1px solid var(--grid)}
+  .lv .k{color:var(--muted); display:flex; align-items:center; gap:7px}
+  .lv .v{color:var(--ink); font-weight:700}
+  .lv .rr{color:var(--muted); font-weight:400; font-size:11px; margin-left:5px}
+  .swatch{width:11px; height:3px; border-radius:2px; flex:none}
+  .sw-sl{background:var(--down)} .sw-tp{background:var(--up)} .sw-en{background:var(--ink2)}
+  .side{padding:9px 14px; border-bottom:1px solid var(--grid);
+        display:flex; justify-content:space-between; align-items:center}
+  .side b{font-size:14px; letter-spacing:.05em}
+  .setup-warning{
+    padding:9px 14px; font-size:11px; line-height:1.5;
+    background:rgba(250,178,25,.09); color:#ffdf9e;
+    border-bottom:1px solid var(--grid);
+  }
+  .signal-grid{display:grid; grid-template-columns:1fr 1fr; border-bottom:1px solid var(--grid)}
+  .signal-box{padding:11px 14px}
+  .signal-box+.signal-box{border-left:1px solid var(--grid)}
+  .signal-box span{display:block; color:var(--muted); font-size:10px; letter-spacing:.05em;
+                   text-transform:uppercase; margin-bottom:4px}
+  .signal-box b{display:block; font-size:18px; letter-spacing:.05em}
+  .signal-box small{display:block; color:var(--ink2); font-size:10px; margin-top:3px; line-height:1.35}
+  .signal-note{padding:8px 14px; font-size:11px; line-height:1.5;
+               background:rgba(250,178,25,.08); color:#ffdf9e;
+               border-bottom:1px solid var(--grid)}
+  .winrate-box{padding:11px 14px; display:grid; grid-template-columns:1fr auto;
+               align-items:center; gap:2px 12px; border-bottom:1px solid var(--grid);
+               background:rgba(57,135,229,.07)}
+  .winrate-box .label{font-size:12px; color:var(--ink2)}
+  .winrate-box strong{grid-row:1/3; grid-column:2; font-size:25px;
+                      color:var(--s1); font-variant-numeric:tabular-nums}
+  .winrate-box small{font-size:10px; color:var(--muted); line-height:1.4}
+  .tp-rates{display:grid; grid-template-columns:repeat(3,1fr);
+            border-bottom:1px solid var(--grid)}
+  .tp-rate{padding:9px 5px; text-align:center; font-variant-numeric:tabular-nums}
+  .tp-rate+.tp-rate{border-left:1px solid var(--grid)}
+  .tp-rate span{display:block; color:var(--muted); font-size:10px}
+  .tp-rate b{display:block; color:var(--up); font-size:16px; margin:2px 0}
+  .tp-rate small{display:block; color:var(--muted); font-size:9px}
+  .flow-head{padding:10px 14px; display:flex; justify-content:space-between;
+             align-items:center; gap:8px; border-bottom:1px solid var(--grid)}
+  .flow-score{padding:9px 14px; font-size:12px; color:var(--ink2);
+              border-bottom:1px solid var(--grid)}
+  .filters{padding:8px 14px 11px; display:flex; flex-wrap:wrap; gap:5px}
+  .filter{font-size:10px; padding:3px 7px; border-radius:99px;
+          background:rgba(137,135,129,.13); color:var(--muted)}
+  .filter.ok{background:rgba(12,163,12,.13); color:#8ee08e}
+  .verdict{padding:9px 14px; font-size:11px; line-height:1.5; border-top:1px solid var(--grid)}
+  .verdict.bad{background:rgba(208,59,59,.10); color:#ffb4b4}
+  .verdict.meh{background:rgba(250,178,25,.09); color:#ffdf9e}
+  .verdict.good{background:rgba(12,163,12,.10); color:#8ee08e}
+  .ai-body{padding:12px 14px}
+  .ai-status{font-size:11px; color:var(--muted); line-height:1.5; margin-bottom:10px}
+  .ai-action{display:flex; justify-content:space-between; align-items:center; gap:10px;
+             padding:9px 11px; border:1px solid var(--axis); border-radius:8px; margin-bottom:9px}
+  .ai-action strong{font-size:19px; letter-spacing:.05em}
+  .ai-summary{font-size:12px; color:var(--ink2); line-height:1.55; margin:8px 0}
+  .ai-reasons{margin:7px 0 10px; padding-left:18px; color:var(--muted); font-size:11px}
+  .ai-reasons li+li{margin-top:3px}
+  .ai-button{width:100%; border:1px solid var(--s1); background:rgba(57,135,229,.12);
+             color:#9bc7ff; border-radius:7px; padding:9px; cursor:pointer; font-weight:700}
+  .ai-button:disabled{opacity:.45; cursor:default}
+  .banner{
+    margin:14px 14px 0; padding:11px 14px; border-radius:var(--radius); font-size:13px;
+    background:rgba(208,59,59,.12); border:1px solid var(--down); color:#ffb4b4;
+    white-space:pre-wrap; display:none;
+  }
+  .banner.show{display:block}
+  .banner.mock{background:rgba(250,178,25,.12); border-color:var(--warn); color:#ffdf9e}
+  .empty{color:var(--muted); font-size:12px; padding:14px}
+  #chart.loading{opacity:.45; transition:opacity .15s}
+  .chart-help{position:absolute; z-index:4; right:52px; top:10px; color:var(--muted);
+              font-size:10px; pointer-events:none; background:rgba(26,26,25,.78);
+              padding:3px 7px; border-radius:4px}
+  .chart-card{position:relative}
+</style>
+</head>
+<body>
+
+<header>
+  <h1 id="brand">HTF <span>Quantum Adaptive</span></h1>
+
+  <div class="tfs" role="group" aria-label="Symbol">
+    {% for s in symbols %}
+    <button class="tf sym" data-symbol="{{ s.key }}" type="button"
+            aria-pressed="{{ 'true' if s.key == default_symbol else 'false' }}">{{ s.label }}</button>
+    {% endfor %}
+  </div>
+
+  <div class="tfs" role="group" aria-label="Timeframe">
+    {% for tf in timeframes %}
+    <button class="tf" data-tf="{{ tf.key }}" type="button"
+            aria-pressed="{{ 'true' if tf.key == default_tf else 'false' }}">{{ tf.label }}</button>
+    {% endfor %}
+  </div>
+
+  <div class="tfs" role="group" aria-label="Chart view">
+    <button class="tf view" data-view="price" type="button" aria-pressed="true">Price</button>
+    <button class="tf view" data-view="equity" type="button" aria-pressed="false">Equity</button>
+  </div>
+
+  <label class="ctrl">Bars
+    <input id="bars" type="range" min="100" max="600" step="20" value="300">
+    <output id="barsOut">300</output>
+  </label>
+
+  <button class="action" id="refresh" type="button">Refresh</button>
+
+  <label class="ctrl live" for="auto">
+    <input type="checkbox" id="auto" checked>
+    <span>Live</span>
+    <span id="countdown">60s</span>
+  </label>
+
+  <div id="status"><span class="dot" id="dot"></span><span id="statusText">connecting…</span></div>
+</header>
+
+<div class="banner" id="banner"></div>
+
+<main>
+  <section class="card chart-card">
+    <div class="chart-help" id="chartHelp">ลาก = เลื่อน · ล้อเมาส์ = ซูม · ดับเบิลคลิก = รีเซ็ต</div>
+    <div id="chart"></div>
+  </section>
+
+  <aside>
+    <section class="card">
+      <h2>Market</h2>
+      <div class="body">
+        <div class="price" id="price">—</div>
+        <div style="margin:7px 0 12px" id="trendBadges"></div>
+        <dl id="marketKv"></dl>
+      </div>
+    </section>
+
+    <section class="card">
+      <h2>Current signal &amp; trade plan</h2>
+      <div id="setupBox"><div class="empty">—</div></div>
+    </section>
+
+    <section class="card">
+      <h2>Adaptive filters</h2>
+      <div id="flowBox"><div class="empty">—</div></div>
+    </section>
+
+    <section class="card">
+      <h2>AI Trade Review · OpenRouter</h2>
+      <div class="ai-body">
+        <div id="aiResult" class="ai-status">ตรวจสถานะ OpenRouter…</div>
+        <button class="ai-button" id="aiAnalyze" type="button" disabled>วิเคราะห์ด้วย AI</button>
+      </div>
+    </section>
+  </aside>
+</main>
+
+<script>
+const $ = s => document.querySelector(s);
+const state = {
+  tf: {{ default_tf|tojson }}, symbol: {{ default_symbol|tojson }},
+  bars: 300, view: 'price', busy: false, lastData: null, aiContext: null,
+  aiConfigured: null
+};
+
+const fmt = n => n == null ? '—' : n.toLocaleString('en-US',{minimumFractionDigits:2, maximumFractionDigits:2});
+const esc = value => String(value ?? '').replace(/[&<>'"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[c]));
+const dirClass = d => d === 'Bullish' ? 'b-up' : d === 'Bearish' ? 'b-down' : 'b-flat';
+const trendClass = t => t.includes('BULL') ? 'b-up' : t.includes('BEAR') ? 'b-down' : 'b-flat';
+
+function showBanner(msg, kind){
+  const b = $('#banner');
+  b.textContent = msg;
+  b.className = 'banner show' + (kind === 'mock' ? ' mock' : '');
+}
+function hideBanner(){ $('#banner').className = 'banner'; }
+
+function setStatus(ok, text){
+  $('#dot').className = 'dot ' + (ok === null ? '' : ok ? 'ok' : 'bad');
+  $('#statusText').textContent = text;
+}
+
+let queued = null;
+
+async function load(refresh = false){
+  // Dropping the click would leave the pressed button disagreeing with the
+  // chart, so a request arriving mid-load is queued instead of discarded.
+  if (state.busy) { queued = refresh; return; }
+  state.busy = true;
+  $('#refresh').disabled = true;
+  $('#chart').classList.add('loading');
+  setStatus(null, 'loading ' + state.tf + '…');
+
+  const qs = new URLSearchParams({
+    tf: state.tf, symbol: state.symbol, bars: state.bars, view: state.view,
+    refresh: refresh ? 1 : 0
+  });
+
+  try{
+    const res = await fetch('/api/analysis?' + qs);
+    const data = await res.json();
+
+    if(!res.ok){
+      showBanner(data.error || 'Request failed');
+      setStatus(false, 'error');
+      return;
+    }
+    data.source.is_real ? hideBanner()
+      : showBanner('MOCK DATA — ตัวเลขทั้งหมดไม่ใช่ราคาจริง', 'mock');
+    const market = trackMarket(data);
+    render(data);
+
+    const dot = $('#dot');
+    let label;
+    if(!data.live){ dot.className = 'dot bad'; label = 'MT5 ไม่ตอบ — ข้อมูลค้าง'; }
+    else if(market === 'closed'){ dot.className = 'dot ok'; label = 'ตลาดปิด'; }
+    else { dot.className = 'pulse'; label = 'live'; }
+
+    $('#statusText').innerHTML = `${data.symbol} · ${label}`
+      + `<span style="color:var(--muted)"> · ${data.served_at}</span>`;
+
+    if(!data.live){
+      showBanner('MT5 ไม่ตอบสนอง — กำลังแสดงข้อมูลล่าสุดที่บันทึกไว้ ไม่ใช่ราคาปัจจุบัน\n'
+                 + 'วิธีแก้: ปิดแล้วเปิดโปรแกรม MetaTrader 5 ใหม่', 'mock');
+    }
+  }catch(err){
+    showBanner('Cannot reach the server: ' + err.message);
+    setStatus(false, 'offline');
+  }finally{
+    state.busy = false;
+    $('#refresh').disabled = false;
+    $('#chart').classList.remove('loading');
+    if (queued !== null) { const r = queued; queued = null; load(r); }
+  }
+}
+
+function render(d){
+  state.lastData = d;
+  const aiContext = `${d.symbol}|${d.timeframe}|${d.bias.time}`;
+  if(state.aiContext !== aiContext){
+    state.aiContext = aiContext;
+    $('#aiResult').innerHTML = state.aiConfigured === false
+      ? '<div class="verdict meh">ยังไม่ได้ตั้ง OPENROUTER_API_KEY · ระบบหลักทำงานตามปกติ</div>'
+      : '<span class="ai-status">กดปุ่มเพื่อให้ AI ตรวจแผนของแท่งล่าสุด · AI ไม่มีสิทธิ์ส่งออเดอร์</span>';
+  }
+  Plotly.react('chart', d.figure.data, d.figure.layout,
+               {responsive:true, displaylogo:false, displayModeBar:true,
+                scrollZoom:true, doubleClick:'reset+autosize',
+                modeBarButtonsToAdd:['pan2d','zoom2d','resetScale2d'],
+                modeBarButtonsToRemove:['select2d','lasso2d']});
+  $('#chartHelp').textContent = state.view === 'equity'
+    ? 'Equity % แบบทบต้น · 1R = เสี่ยง 1% · หัก Spread · ลาก/ซูมได้'
+    : 'ลาก = เลื่อน · ล้อเมาส์ = ซูม · ดับเบิลคลิก = รีเซ็ต';
+
+  const q = d.quantum, su = d.setup, st = d.stats;
+  const flowAction = q.market_state.includes('BUY') ? 'BUY' :
+                     q.market_state.includes('SELL') ? 'SELL' : 'WAIT';
+  const flowClass = flowAction === 'BUY' ? 'b-up' : flowAction === 'SELL' ? 'b-down' : 'b-warn';
+  const planAction = su?.action || 'WAIT';
+  const planClass = planAction === 'BUY' ? 'b-up' : planAction === 'SELL' ? 'b-down' : 'b-warn';
+  $('#brand').innerHTML = `${d.symbol} <span>${d.label} · HTF Quantum</span>`;
+  document.title = `${d.symbol} ${d.timeframe} · HTF Quantum Adaptive`;
+  $('#price').textContent = '$' + fmt(d.bias.price);
+  $('#trendBadges').innerHTML =
+    `<span class="badge ${trendClass(q.market_bias)}">${q.market_bias.toUpperCase()}</span> ` +
+    `<span class="badge ${flowClass}">MARKET FLOW: ${flowAction}</span>`;
+
+  $('#marketKv').innerHTML = [
+    ['Bid / Ask', d.tick ? `${fmt(d.tick.bid)} / ${fmt(d.tick.ask)}` : '—'],
+    ['Quote time', d.tick ? d.tick.time.slice(5, 16) : '—'],
+    ['Last bar', d.bias.time],
+    ['Price source', `${d.broker_symbol} · ${d.source.server || d.source.kind}`],
+    ['Session VWAP', '$' + fmt(q.vwap)],
+    ['HTF CVD', q.cvd.toLocaleString('en-US')],
+    ['POC', '$' + fmt(q.poc)],
+    ['Value Area', fmt(q.val) + ' – ' + fmt(q.vah)],
+    ['ATR(14)', '$' + fmt(d.bias.atr)],
+    ['RSI(14)', q.rsi],
+    ['Structure events', d.swing_count],
+  ].map(([k,v]) => `<div class="kv"><dt>${k}</dt><dd>${v}</dd></div>`).join('');
+
+  const signalHeader = `<div class="signal-grid">
+      <div class="signal-box"><span>Market flow — ภาวะตลาด</span>
+        <b style="color:${flowAction==='BUY'?'var(--up)':flowAction==='SELL'?'var(--down)':'var(--warn)'}">${flowAction}</b>
+        <small>${q.market_state} · ใช้เป็นบริบท ไม่ใช่คำสั่งเข้า</small></div>
+      <div class="signal-box"><span>Trade plan — คำสั่งปัจจุบัน</span>
+        <b style="color:${planAction==='BUY'?'var(--up)':planAction==='SELL'?'var(--down)':'var(--warn)'}">${planAction}${su ? ' / '+su.position : ''}</b>
+        <small>${su ? su.lifecycle+' · '+su.status : 'ยังไม่มีแผนที่ผ่านตัวกรอง'}</small></div>
+    </div>`;
+  const conflictNote = su && su.ok && flowAction !== 'WAIT' && flowAction !== planAction
+    ? `<div class="signal-note">คนละความหมาย: Market Flow = ${flowAction} แต่แผนที่เปิดอยู่ = ${planAction}. ระบบจะกลับฝั่งเมื่อเกิด BOS/CHoCH ตรงข้ามที่ผ่านตัวกรองและ cooldown แล้ว ไม่ได้กลับฝั่งจาก Market Flow เพียงอย่างเดียว</div>` : '';
+  $('#setupBox').innerHTML = !su ? signalHeader + '<div class="empty">WAIT — ยังไม่มี Adaptive Structure plan ที่ผ่าน 6/9 filters</div>'
+    : signalHeader + conflictNote + `<div class="side">
+         <b style="color:${su.action==='BUY'?'var(--up)':'var(--down)'}">${su.action} / ${su.position}</b>
+         <span class="badge ${planClass}">${su.lifecycle} · risk ${su.risk_pct}%</span>
+       </div>
+       <div class="winrate-box">
+         <span class="label">Pine Adaptive Win rate (${d.symbol} ${d.timeframe})</span>
+         <strong>${st.win_rate == null?'—':st.win_rate+'%'}</strong>
+         <small>Filled ${st.trades} plans · คำนวณ W/(W+L)<br>ไม่รวม unresolved/timeout ตาม Pine ต้นฉบับ</small>
+       </div>
+       <div class="tp-rates">
+         ${['TP1','TP2','TP3'].map(label=>{
+           const rate = st.tp_win_rates?.[label];
+           const hits = st.tp_hits_by_target?.[label];
+           const i = +label.slice(-1)-1, resolved = q.counts.wins[i] + q.counts.losses[i];
+           return `<div class="tp-rate"><span>${label} Win rate</span><b>${rate == null?'—':rate+'%'}</b><small>${hits}W/${q.counts.losses[i]}L</small></div>`;
+         }).join('')}
+       </div>
+       <div class="lv"><span class="k"><i class="swatch sw-en"></i>${su.action} Entry</span><span class="v">$${fmt(su.entry)}</span></div>
+       <div class="lv"><span class="k"><i class="swatch sw-sl"></i>Stop loss</span><span class="v" style="color:var(--down)">$${fmt(su.stop)}</span></div>
+       ${su.targets.map(t=>`
+       <div class="lv"><span class="k"><i class="swatch sw-tp"></i>${t.label}</span>
+         <span class="v" style="color:${t.hit?'var(--muted)':'var(--up)'}">$${fmt(t.price)}<span class="rr">${t.rr}R · win ${t.win_rate == null?'—':t.win_rate+'%'}${t.hit?' · HIT':''}</span></span></div>`).join('')}
+       <div class="verdict meh">Adaptive Structure + ATR Buffer · TP 1R / 1.5R / 2R</div>`;
+
+  const score = su?.side === 'short' ? q.short_score : q.long_score;
+  $('#flowBox').innerHTML = `
+      <div class="flow-head">
+        <b>${q.structure.direction.toUpperCase()} · ${q.structure.kind}</b>
+        <span class="badge ${score>=q.required_score?'b-up':'b-warn'}">${score}/9 · need ${q.required_score}</span>
+      </div>
+      <div class="flow-score">
+        HTF ${q.htf_timeframe} · Long ${q.long_score}/9 · Short ${q.short_score}/9<br>
+        Filled / E-C-T-I: ${q.counts.filled} / ${q.counts.expired}-${q.counts.cancelled}-${q.counts.timed_out}-${q.counts.invalidated}
+      </div>
+      <div class="lv"><span class="k">Session VWAP</span><span class="v">$${fmt(q.vwap)}</span></div>
+      <div class="lv"><span class="k">POC / Value Area</span><span class="v">$${fmt(q.poc)} · ${fmt(q.val)}–${fmt(q.vah)}</span></div>
+      <div class="filters">
+        ${q.filters.map(f=>`<span class="filter ${f.ok?'ok':''}">${f.ok?'✓':'×'} ${f.name}</span>`).join('')}
+      </div>`;
+}
+
+function renderAIDecision(a){
+  const actionClass = a.action === 'BUY' ? 'b-up' : a.action === 'SELL' ? 'b-down' : 'b-warn';
+  const gate = a.approved ? `ยืนยัน ${a.effective_action}` : 'BLOCK → WAIT';
+  $('#aiResult').innerHTML = `
+    <div class="ai-action"><div><small>AI VERDICT</small><strong class="${actionClass}">${esc(a.action)}</strong></div>
+      <span class="badge ${a.approved?'b-up':'b-warn'}">${esc(gate)} · ${esc(a.confidence)}%</span></div>
+    <div class="ai-summary">${esc(a.summary_th)}</div>
+    <ul class="ai-reasons">${(a.reasons||[]).map(x=>`<li>${esc(x)}</li>`).join('')}</ul>
+    ${(a.risk_flags||[]).length ? `<div class="verdict bad">Risk: ${a.risk_flags.map(esc).join(' · ')}</div>` : ''}
+    <div class="ai-status">${esc(a.model)} · ${a.cached?'cached':'new'} · Quantum ${esc(a.quantum_action)} · advisory only</div>`;
+}
+
+async function runAI(){
+  if(!state.lastData) return;
+  const requestContext = `${state.symbol}|${state.tf}|${state.lastData.bias.time}`;
+  const requestSymbol = state.symbol, requestTf = state.tf;
+  const btn = $('#aiAnalyze');
+  btn.disabled = true; btn.textContent = 'AI กำลังวิเคราะห์…';
+  $('#aiResult').innerHTML = '<span class="ai-status">กำลังส่งเฉพาะข้อมูลตลาดที่ whitelist ไปยัง OpenRouter…</span>';
+  try{
+    const res = await fetch('/api/ai-analysis', {method:'POST', headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({symbol:requestSymbol, tf:requestTf})});
+    const data = await res.json();
+    if(!res.ok) throw new Error(data.error || 'OpenRouter request failed');
+    if(requestContext !== state.aiContext) return;
+    renderAIDecision(data);
+  }catch(err){
+    $('#aiResult').innerHTML = `<div class="verdict bad">${esc(err.message)}</div>`;
+  }finally{
+    btn.disabled = !state.aiConfigured; btn.textContent = 'วิเคราะห์ด้วย AI';
+  }
+}
+
+// --- controls --------------------------------------------------------------
+document.querySelectorAll('.tf[data-tf]').forEach(btn => {
+  btn.addEventListener('click', () => {
+    if(btn.dataset.tf === state.tf) return;
+    document.querySelectorAll('.tf[data-tf]').forEach(b =>
+      b.setAttribute('aria-pressed', String(b === btn)));
+    state.tf = btn.dataset.tf;
+    load();
+  });
+});
+
+document.querySelectorAll('.sym').forEach(btn => {
+  btn.addEventListener('click', () => {
+    if(btn.dataset.symbol === state.symbol) return;
+    document.querySelectorAll('.sym').forEach(b =>
+      b.setAttribute('aria-pressed', String(b === btn)));
+    state.symbol = btn.dataset.symbol;
+    load();
+  });
+});
+
+document.querySelectorAll('.view').forEach(btn => {
+  btn.addEventListener('click', () => {
+    if(btn.dataset.view === state.view) return;
+    document.querySelectorAll('.view').forEach(b =>
+      b.setAttribute('aria-pressed', String(b === btn)));
+    state.view = btn.dataset.view;
+    load();
+  });
+});
+
+let debounce;
+function slider(input, out, key){
+  input.addEventListener('input', () => {
+    out.value = input.value;
+    state[key] = +input.value;
+    clearTimeout(debounce);
+    debounce = setTimeout(load, 350);
+  });
+}
+slider($('#bars'), $('#barsOut'), 'bars');
+
+$('#refresh').addEventListener('click', () => load(true));
+$('#aiAnalyze').addEventListener('click', runAI);
+
+// --- live polling ----------------------------------------------------------
+const PERIOD = 60;                 // seconds between automatic refreshes
+let left = PERIOD, lastTickTime = null, staleCount = 0;
+
+function tickClock(){
+  const on = $('#auto').checked;
+  $('#auto').closest('.live').classList.toggle('on', on);
+
+  if(!on){ $('#countdown').textContent = 'off'; return; }
+  // Don't count down while the tab is hidden - polling is paused there.
+  if(document.hidden){ $('#countdown').textContent = '⏸'; return; }
+
+  left -= 1;
+  if(left <= 0){ left = PERIOD; load(true); }
+  $('#countdown').textContent = left + 's';
+}
+setInterval(tickClock, 1000);
+
+$('#auto').addEventListener('change', () => {
+  left = PERIOD;
+  if($('#auto').checked) load(true);
+});
+
+// Coming back to the tab should show current data immediately, not whatever
+// was on screen when it was hidden.
+document.addEventListener('visibilitychange', () => {
+  if(!document.hidden && $('#auto').checked){ left = PERIOD; load(true); }
+});
+
+// A frozen broker tick - not a frozen app - is what a closed market looks like.
+function trackMarket(d){
+  const t = d.tick && d.tick.time;
+  if(!t){ return null; }
+  if(t === lastTickTime){ staleCount++; } else { staleCount = 0; lastTickTime = t; }
+  return staleCount >= 2 ? 'closed' : 'open';
+}
+
+fetch('/api/health').then(r => r.json()).then(h => {
+  if(!h.ok) { showBanner(h.error); setStatus(false, 'MT5 unavailable'); }
+});
+fetch('/api/ai-status').then(r=>r.json()).then(a=>{
+  state.aiConfigured=!!a.configured;
+  const btn=$('#aiAnalyze'); btn.disabled=!a.configured;
+  if(!a.configured) $('#aiResult').innerHTML='<div class="verdict meh">ยังไม่ได้ตั้ง OPENROUTER_API_KEY · ระบบหลักทำงานตามปกติ</div>';
+  else $('#aiResult').innerHTML=`<span class="ai-status">พร้อมใช้ ${esc(a.model)} · กดวิเคราะห์เมื่อพร้อม</span>`;
+}).catch(()=>{$('#aiResult').textContent='ตรวจสถานะ OpenRouter ไม่สำเร็จ';});
+load();
+</script>
+</body>
+</html>

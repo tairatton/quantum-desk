@@ -1,0 +1,526 @@
+//@version=6
+// HTF Quantum Adaptive — mirror of the live bot
+// ---------------------------------------------------------------------------
+// พอร์ตกลับจาก xau/quantum.py ซึ่งเป็นตัวเดียวกับที่ bot/ ใช้เทรดจริง
+// เขียนขึ้นเพื่อให้ "เห็นสัญญาณเดียวกัน" บน TradingView กับที่บอทเห็นบน MT5
+//
+// สิ่งที่ mirror มาครบ
+//   fractal BOS/CHoCH (11 แท่ง)  ·  filter 9 ข้อ ต้องผ่าน 6
+//   setup window 8 แท่ง  ·  cooldown 2 แท่ง  ·  รอ entry ได้ 16 แท่ง
+//   stop = โครงสร้าง ± 0.20 ATR จำกัด 0.8–2.5 ATR  ·  TP 1R / 1.5R / 2R
+//   entry แบบ adaptive: เข้าเลยถ้า break ≤ 0.75 ATR ไม่งั้นรอย่อ 50%
+//   timeout 120 แท่ง  ·  ยกเลิกแผนเมื่อเจอ BOS/CHoCH ฝั่งตรงข้ามที่พร้อม
+//
+// ⚠️ สิ่งที่ต่างจากบอทโดยธรรมชาติ อ่านหัวข้อ "ข้อจำกัด" ท้ายไฟล์
+// ---------------------------------------------------------------------------
+indicator("HTF Quantum Adaptive — bot mirror", overlay = true,
+     max_lines_count = 500, max_labels_count = 500, max_boxes_count = 500)
+
+// ── ค่าคงที่ ตรงกับ xau/quantum.py ทุกตัว ──────────────────────────────────
+FRACTAL_HALF   = 5      // FRACTAL_LENGTH 11 // 2
+SETUP_WINDOW   = 8
+ENTRY_TIMEOUT  = 16
+MAX_TRADE_BARS = 120
+COOLDOWN       = 2
+MIN_STOP_ATR   = 0.8
+MAX_STOP_ATR   = 2.5
+ATR_BUFFER     = 0.20
+REQUIRED_SCORE = 6
+
+grpShow = "การแสดงผล"
+showPlan    = input.bool(true,  "เส้น entry / SL / TP",       group = grpShow)
+showStruct  = input.bool(true,  "จุด BOS / CHoCH",            group = grpShow)
+showFilters = input.bool(true,  "ตารางคะแนน filter",          group = grpShow)
+showStats   = input.bool(true,  "ตารางสถิติ win rate",        group = grpShow)
+showVwap    = input.bool(true,  "session VWAP",               group = grpShow)
+onlyTp3     = input.bool(true,  "เน้น TP3 (โหมดที่บอทใช้จริง)", group = grpShow,
+     tooltip = "บัญชี $10,000 แบ่งไม้ไม่ได้ บอทจึงออกไม้เดียวปิดที่ TP3 " +
+               "ติ๊กออกเพื่อดู TP1/TP2 เท่ากันทั้งสามเส้น")
+
+// ── indicators ─────────────────────────────────────────────────────────────
+atrV  = ta.atr(14)
+ema20 = ta.ema(close, 20)
+ema50 = ta.ema(close, 50)
+rsiV  = ta.rsi(close, 14)
+[diPlus, diMinus, adxV] = ta.dmi(14, 14)
+volAvg = ta.sma(volume, 20)
+// ta.* ต้องถูกเรียกทุกแท่งเสมอ ไม่งั้น buffer ย้อนหลังจะเพี้ยน
+// จึงคำนวณไว้ตรงนี้แล้วค่อยไปเลือกใช้ตอนสร้างแผน
+lowest20  = ta.lowest(low, 20)
+highest20 = ta.highest(high, 20)
+
+// HTF EMA ที่ยืนยันแล้ว — Python ใช้ H1 EMA20/50 ของแท่งที่ปิดแล้ว
+// สำหรับชาร์ต >= H1 ใช้ EMA ของชาร์ตเองย้อนหลัง 1 แท่ง ตามที่ Python ทำ
+// request.security ต้องเรียกที่ scope บนสุดเสมอ จึงเรียกไว้ก่อนแล้วค่อยเลือกใช้
+h1Fast = request.security(syminfo.tickerid, "60", ta.ema(close, 20)[1],
+     lookahead = barmerge.lookahead_off)
+h1Slow = request.security(syminfo.tickerid, "60", ta.ema(close, 50)[1],
+     lookahead = barmerge.lookahead_off)
+useHtf   = timeframe.in_seconds(timeframe.period) < 3600
+htfFast  = useHtf ? h1Fast : ema20[1]
+htfSlow  = useHtf ? h1Slow : ema50[1]
+htfBull  = htfFast > htfSlow
+htfBear  = htfFast < htfSlow
+
+// session VWAP และ CVD รีเซ็ตทุกวัน เหมือน groupby(day) ใน Python
+newDay = ta.change(time("D")) != 0
+var float cumTpv = 0.0
+var float cumVol = 0.0
+var float cvd    = 0.0
+if newDay
+    cumTpv := 0.0
+    cumVol := 0.0
+    cvd    := 0.0
+cumTpv += (high + low + close) / 3 * volume
+cumVol += volume
+cvd    += close >= open ? volume : -volume
+vwap = cumVol > 0 ? cumTpv / cumVol : close
+
+// ── filter 9 ข้อ ต้องผ่าน 6 ────────────────────────────────────────────────
+body       = math.abs(close - open)
+volOk      = na(volAvg) or volume >= volAvg * 0.90
+adxOk      = adxV >= 12
+nearVwap   = math.abs(close - vwap) <= atrV * 2
+
+fLongHtf    = htfBull
+fLongEma    = close > ema20 and ema20 > ema50
+fLongBody   = close > open and body >= atrV * 0.10
+fLongDi     = diPlus > diMinus
+fLongVwap   = close >= vwap and nearVwap
+fLongCvd    = cvd > cvd[3]
+fLongRsi    = rsiV >= 50
+longScore   = (fLongHtf ? 1 : 0) + (fLongEma ? 1 : 0) + (fLongBody ? 1 : 0) +
+     (volOk ? 1 : 0) + (adxOk ? 1 : 0) + (fLongDi ? 1 : 0) + (fLongVwap ? 1 : 0) +
+     (fLongCvd ? 1 : 0) + (fLongRsi ? 1 : 0)
+
+fShortHtf   = htfBear
+fShortEma   = close < ema20 and ema20 < ema50
+fShortBody  = close < open and body >= atrV * 0.10
+fShortDi    = diMinus > diPlus
+fShortVwap  = close <= vwap and nearVwap
+fShortCvd   = cvd < cvd[3]
+fShortRsi   = rsiV <= 50
+shortScore  = (fShortHtf ? 1 : 0) + (fShortEma ? 1 : 0) + (fShortBody ? 1 : 0) +
+     (volOk ? 1 : 0) + (adxOk ? 1 : 0) + (fShortDi ? 1 : 0) + (fShortVwap ? 1 : 0) +
+     (fShortCvd ? 1 : 0) + (fShortRsi ? 1 : 0)
+
+longTrend  = htfBull or (close > ema20 and ema20 > ema50)
+shortTrend = htfBear or (close < ema20 and ema20 < ema50)
+
+// ── โครงสร้าง BOS / CHoCH ──────────────────────────────────────────────────
+ph = ta.pivothigh(high, FRACTAL_HALF, FRACTAL_HALF)
+pl = ta.pivotlow(low,  FRACTAL_HALF, FRACTAL_HALF)
+
+var float upLevel   = na
+var float downLevel = na
+var bool  upBroken   = false
+var bool  downBroken = false
+var int   state      = 0
+
+if not na(ph)
+    upLevel   := ph
+    upBroken  := false
+if not na(pl)
+    downLevel   := pl
+    downBroken  := false
+
+int    brkEvent = 0
+string brkKind  = ""
+float  brkLevel = na
+// ลำดับเดียวกับ Python: เช็คฝั่งขึ้นก่อน แล้วฝั่งลงทับได้ในแท่งเดียวกัน
+if not na(upLevel) and not upBroken and close > upLevel
+    brkEvent := 1
+    brkKind  := state == -1 ? "CHoCH" : "BOS"
+    brkLevel := upLevel
+    upBroken := true
+    state    := 1
+if not na(downLevel) and not downBroken and close < downLevel
+    brkEvent := -1
+    brkKind  := state == 1 ? "CHoCH" : "BOS"
+    brkLevel := downLevel
+    downBroken := true
+    state      := -1
+
+// ── หน้าต่างรับสัญญาณ ──────────────────────────────────────────────────────
+var int   lastLongBar   = na
+var int   lastShortBar  = na
+var float lastLongLevel = na
+var float lastShortLevel= na
+var bool  longUsed      = false
+var bool  shortUsed     = false
+
+if brkEvent == 1
+    lastLongBar   := bar_index
+    lastLongLevel := brkLevel
+    longUsed      := false
+if brkEvent == -1
+    lastShortBar   := bar_index
+    lastShortLevel := brkLevel
+    shortUsed      := false
+
+longAlive  = not na(lastLongBar)  and bar_index - lastLongBar  <= SETUP_WINDOW and
+     not longUsed  and state == 1
+shortAlive = not na(lastShortBar) and bar_index - lastShortBar <= SETUP_WINDOW and
+     not shortUsed and state == -1
+longReady  = longAlive  and longScore  >= REQUIRED_SCORE and longTrend
+shortReady = shortAlive and shortScore >= REQUIRED_SCORE and shortTrend
+
+// ── สถานะแผนเทรด ───────────────────────────────────────────────────────────
+var int   planDir    = 0        // 1 long, -1 short, 0 ไม่มีแผน
+var float planEntry  = na
+var float planStop   = na
+var float planRisk   = na
+var float planTp1    = na
+var float planTp2    = na
+var float planTp3    = na
+var bool  planPend   = false
+var bool  planActive = false
+var int   planSignalBar = na
+var int   planFillBar   = na
+var int   lastEndBar    = -10000
+var string planStatus   = "ไม่มีแผน"
+// แต่ละ TP ถูกตัดสินแยกกัน เหมือน resolved[] ใน quantum.py
+// 0 = ยังไม่ตัดสิน, 1 = แตะ TP แล้ว, -1 = โดน SL ก่อน
+var int tp1State = 0
+var int tp2State = 0
+var int tp3State = 0
+
+// ตัวนับแยกราย TP — สูตรเดียวกับ Pine ต้นฉบับ: W / (W + L)
+// ไม้ที่หมดเวลาโดย TP ยังไม่ถูกแตะ จะไม่เข้าทั้งเศษและส่วน
+// Pine ประกาศได้บรรทัดละตัว จะคั่นด้วย , เหมือนภาษาอื่นไม่ได้
+var int w1 = 0
+var int l1 = 0
+var int w2 = 0
+var int l2 = 0
+var int w3 = 0
+var int l3 = 0
+
+// ยกเลิกแผนที่กำลังวิ่ง เมื่อเจอโครงสร้างฝั่งตรงข้ามที่ผ่าน filter แล้ว
+oppositeReady = planDir == 1 ? shortReady : longReady
+if planActive and brkEvent == -planDir and oppositeReady
+    planActive := false
+    planStatus := "INVALIDATED"
+    lastEndBar := bar_index
+
+canAccept = (planDir == 0 or (not planPend and not planActive)) and
+     bar_index - lastEndBar > COOLDOWN
+newPlan = false
+
+if canAccept and (longReady or shortReady)
+    dir = longReady and (not shortReady or state == 1 or longScore > shortScore) ? 1 : -1
+    lvl = dir == 1 ? lastLongLevel : lastShortLevel
+    if not na(lvl)
+        // ระยะจากจุด break — ไกลเกิน 0.75 ATR ให้รอย่อ 50% แทนการเข้าเลย
+        validBreak = dir == 1 ? lvl <= close : lvl >= close
+        dist       = validBreak ? math.abs(close - lvl) : 0.0
+        immediate  = not validBreak or dist <= atrV * 0.75
+        entry      = immediate ? close : close - dir * dist * 0.50
+
+        // stop วางที่โครงสร้างฝั่งตรงข้าม เผื่อ buffer แล้วบีบให้อยู่ใน 0.8–2.5 ATR
+        structure  = dir == 1 ? downLevel : upLevel
+        structOk   = not na(structure) and (dir == 1 ? structure < entry : structure > entry)
+        fallback   = dir == 1 ? lowest20 : highest20
+        anchor     = structOk ? structure : fallback
+        rawStop    = anchor - dir * atrV * ATR_BUFFER
+        risk       = math.min(math.max(math.abs(entry - rawStop), atrV * MIN_STOP_ATR),
+             atrV * MAX_STOP_ATR)
+
+        planDir       := dir
+        planEntry     := entry
+        planRisk      := risk
+        planStop      := entry - dir * risk
+        planTp1       := entry + dir * risk * 1.0
+        planTp2       := entry + dir * risk * 1.5
+        planTp3       := entry + dir * risk * 2.0
+        planPend      := not immediate
+        planActive    := immediate
+        planSignalBar := bar_index
+        planFillBar   := immediate ? bar_index : na
+        side          = dir == 1 ? "BUY" : "SELL"
+        planStatus    := side + (immediate ? " ACTIVE" : " WAIT ENTRY")
+        tp1State      := 0
+        tp2State      := 0
+        tp3State      := 0
+        newPlan       := true
+        if dir == 1
+            longUsed := true
+        else
+            shortUsed := true
+
+// ── เดินสถานะแผนที่มีอยู่ ──────────────────────────────────────────────────
+if not newPlan and planDir != 0 and (planPend or planActive)
+    // โครงสร้างฝั่งตรงข้ามยกเลิกแผนที่ยังไม่ fill
+    if planPend and brkEvent == -planDir
+        planPend   := false
+        planStatus := "CANCELLED"
+        lastEndBar := bar_index
+    else if planPend and bar_index - planSignalBar > ENTRY_TIMEOUT
+        planPend   := false
+        planStatus := "EXPIRED"
+        lastEndBar := bar_index
+    else if planActive and bar_index - planFillBar > MAX_TRADE_BARS
+        planActive := false
+        planStatus := "TIMEOUT"
+        lastEndBar := bar_index
+    else if planPend
+        touched = planDir == 1 ? low <= planEntry : high >= planEntry
+        if touched
+            planPend    := false
+            planActive  := true
+            planFillBar := bar_index
+            planStatus  := planDir == 1 ? "BUY ACTIVE" : "SELL ACTIVE"
+        // Pine ต้นฉบับไม่ resolve TP/SL บนแท่งที่ fill จึงหยุดแค่นี้
+    else if planActive
+        stopHit = planDir == 1 ? low <= planStop : high >= planStop
+        hit1    = planDir == 1 ? high >= planTp1 : low <= planTp1
+        hit2    = planDir == 1 ? high >= planTp2 : low <= planTp2
+        hit3    = planDir == 1 ? high >= planTp3 : low <= planTp3
+        side    = planDir == 1 ? "BUY" : "SELL"
+        if stopHit
+            // SL ชนะเสมอเมื่อแท่งเดียวแตะทั้ง SL และ TP — แบบระวังไว้ก่อน
+            // ตรงกับ quantum.py ที่ `continue` ทันทีโดยไม่ดู target ในแท่งนั้น
+            if tp1State == 0
+                tp1State := -1
+                l1 += 1
+            if tp2State == 0
+                tp2State := -1
+                l2 += 1
+            if tp3State == 0
+                tp3State := -1
+                l3 += 1
+            planActive := false
+            planStatus := side + " SL"
+            lastEndBar := bar_index
+        else
+            if hit1 and tp1State == 0
+                tp1State := 1
+                w1 += 1
+            if hit2 and tp2State == 0
+                tp2State := 1
+                w2 += 1
+            if hit3 and tp3State == 0
+                tp3State := 1
+                w3 += 1
+            if hit3
+                planActive := false
+                planStatus := side + " TP3"
+                lastEndBar := bar_index
+            else if tp2State == 1
+                planStatus := side + " TP2 ACTIVE"
+            else if tp1State == 1
+                planStatus := side + " TP1 ACTIVE"
+
+// ── นับสถิติ ───────────────────────────────────────────────────────────────
+// นับตอนสถานะเปลี่ยน จึงไม่ต้องแทรกตัวนับเข้าไปในเครื่องสถานะข้างบน
+// R ที่ใช้: ชนะ +2R (TP3) แพ้ −1R (SL) หมดเวลา 0R — ตรงกับ fixed_tp3 ที่บอทรัน
+// ไม่ได้หัก spread/commission ต่างจาก technique lab ที่หักแล้ว
+var int   nWin     = 0
+var int   nLoss    = 0
+var int   nTimeout = 0
+var int   nExpired = 0
+var int   nDropped = 0      // CANCELLED + INVALIDATED
+var float netR     = 0.0
+
+if planStatus != planStatus[1]
+    if str.contains(planStatus, "TP3")
+        nWin  += 1
+        netR  += 2.0
+    else if str.contains(planStatus, "SL")
+        nLoss += 1
+        netR  -= 1.0
+    else if planStatus == "TIMEOUT"
+        nTimeout += 1
+    else if planStatus == "EXPIRED"
+        nExpired += 1
+    else if planStatus == "CANCELLED" or planStatus == "INVALIDATED"
+        nDropped += 1
+
+nFilled  = nWin + nLoss + nTimeout          // ไม้ที่เข้าจริง
+nSettled = nWin + nLoss                     // ไม้ที่จบด้วย TP3 หรือ SL
+winRateAll  = nFilled  > 0 ? nWin / nFilled  * 100 : na
+winRateSet  = nSettled > 0 ? nWin / nSettled * 100 : na
+expectancy  = nFilled  > 0 ? netR / nFilled : na
+
+// win rate ราย TP — W / (W + L) เหมือน Pine ต้นฉบับ
+// ตัวหารไม่รวมไม้ที่หมดเวลาโดย TP นั้นยังไม่ถูกตัดสิน
+rate1 = w1 + l1 > 0 ? w1 / (w1 + l1) * 100 : na
+rate2 = w2 + l2 > 0 ? w2 / (w2 + l2) * 100 : na
+rate3 = w3 + l3 > 0 ? w3 / (w3 + l3) * 100 : na
+// จุดคุ้มทุนของแต่ละ TP ต่างกัน เพราะ reward ต่างกันแต่ risk เท่ากัน 1R
+//   TP1 1R -> 50.0%   TP2 1.5R -> 40.0%   TP3 2R -> 33.3%
+be1 = 50.0
+be2 = 40.0
+be3 = 100.0 / 3.0
+
+// ฟังก์ชันต้องประกาศที่ระดับบนสุดเท่านั้น ประกาศไว้ใน if จะได้ syntax error
+okBg(float rate, float breakEven) =>
+    na(rate) ? color.new(color.gray, 60) : rate >= breakEven ? color.new(color.teal, 20) : color.new(color.red, 30)
+
+pctTxt(float v) =>
+    na(v) ? "—" : str.tostring(v, "#.#") + "%"
+
+// ── วาด ────────────────────────────────────────────────────────────────────
+plot(showVwap ? vwap : na, "Session VWAP", color = color.new(color.orange, 30),
+     linewidth = 1, style = plot.style_stepline)
+plot(ema20, "EMA 20", color = color.new(color.teal, 55), linewidth = 1,
+     display = display.pane)
+plot(ema50, "EMA 50", color = color.new(color.blue, 55), linewidth = 1,
+     display = display.pane)
+
+plotshape(showStruct and brkEvent == 1, "BOS/CHoCH ขึ้น", shape.triangleup,
+     location.belowbar, color.new(color.teal, 20), size = size.tiny)
+plotshape(showStruct and brkEvent == -1, "BOS/CHoCH ลง", shape.triangledown,
+     location.abovebar, color.new(color.red, 20), size = size.tiny)
+// ป้ายบอกว่าเป็น BOS หรือ CHoCH — CHoCH คือโครงสร้างกลับทิศ จึงสำคัญกว่า
+if showStruct and brkEvent != 0
+    label.new(bar_index, brkEvent == 1 ? low : high, brkKind,
+         style = brkEvent == 1 ? label.style_label_up : label.style_label_down,
+         color = color.new(brkEvent == 1 ? color.teal : color.red,
+              brkKind == "CHoCH" ? 25 : 70),
+         textcolor = color.white, size = size.tiny)
+
+live = planDir != 0 and (planPend or planActive)
+entryCol = planDir == 1 ? color.teal : color.red
+plot(showPlan and live ? planEntry : na, "Entry", color = color.new(entryCol, 0),
+     linewidth = 2, style = plot.style_linebr)
+plot(showPlan and live ? planStop : na, "SL", color = color.new(color.red, 0),
+     linewidth = 1, style = plot.style_linebr)
+// TP ที่ถูกแตะแล้วจะทึบขึ้น เพื่อให้เห็นว่าไม้เดินไปถึงไหน
+plot(showPlan and live ? planTp1 : na, "TP1  1R",
+     color = color.new(color.green, tp1State == 1 ? 10 : 62), linewidth = 1,
+     style = plot.style_linebr)
+plot(showPlan and live ? planTp2 : na, "TP2  1.5R",
+     color = color.new(color.green, tp2State == 1 ? 10 : 50), linewidth = 1,
+     style = plot.style_linebr)
+plot(showPlan and live ? planTp3 : na, "TP3  2R (จุดที่บอทออกจริง)",
+     color = color.new(color.green, 0), linewidth = onlyTp3 ? 3 : 2,
+     style = plot.style_linebr)
+
+if newPlan and showPlan
+    label.new(bar_index, planDir == 1 ? low : high,
+         (planDir == 1 ? "BUY " : "SELL ") + (planPend ? "รอย่อ" : "เข้าเลย") +
+         "\nentry " + str.tostring(planEntry, format.mintick) +
+         "\nSL " + str.tostring(planStop, format.mintick) +
+         "\nTP3 " + str.tostring(planTp3, format.mintick) +
+         "\nR " + str.tostring(planRisk, format.mintick) +
+         "\nscore " + str.tostring(planDir == 1 ? longScore : shortScore) + "/9",
+         style = planDir == 1 ? label.style_label_up : label.style_label_down,
+         color = color.new(entryCol, 20), textcolor = color.white, size = size.small)
+
+// ── ตารางคะแนน ─────────────────────────────────────────────────────────────
+if showFilters and barstate.islast
+    var table t = table.new(position.top_right, 3, 12, border_width = 1)
+    okCol  = color.new(color.teal, 20)
+    badCol = color.new(color.gray, 60)
+    table.cell(t, 0, 0, "filter", bgcolor = color.new(color.gray, 80),
+         text_color = color.white, text_size = size.tiny)
+    table.cell(t, 1, 0, "long",  bgcolor = color.new(color.gray, 80),
+         text_color = color.white, text_size = size.tiny)
+    table.cell(t, 2, 0, "short", bgcolor = color.new(color.gray, 80),
+         text_color = color.white, text_size = size.tiny)
+    rows = array.from("HTF EMA", "Local EMA", "Candle body", "Volume", "ADX",
+         "DI direction", "VWAP", "CVD slope", "RSI")
+    longs = array.from(fLongHtf, fLongEma, fLongBody, volOk, adxOk, fLongDi,
+         fLongVwap, fLongCvd, fLongRsi)
+    shorts = array.from(fShortHtf, fShortEma, fShortBody, volOk, adxOk, fShortDi,
+         fShortVwap, fShortCvd, fShortRsi)
+    for i = 0 to 8
+        table.cell(t, 0, i + 1, array.get(rows, i), text_size = size.tiny,
+             text_color = color.gray)
+        table.cell(t, 1, i + 1, array.get(longs, i) ? "✓" : "·", text_size = size.tiny,
+             bgcolor = array.get(longs, i) ? okCol : badCol, text_color = color.white)
+        table.cell(t, 2, i + 1, array.get(shorts, i) ? "✓" : "·", text_size = size.tiny,
+             bgcolor = array.get(shorts, i) ? okCol : badCol, text_color = color.white)
+    table.cell(t, 0, 10, "คะแนน", text_size = size.tiny, text_color = color.white,
+         bgcolor = color.new(color.gray, 60))
+    table.cell(t, 1, 10, str.tostring(longScore) + "/9", text_size = size.tiny,
+         text_color = color.white,
+         bgcolor = longScore >= REQUIRED_SCORE ? okCol : badCol)
+    table.cell(t, 2, 10, str.tostring(shortScore) + "/9", text_size = size.tiny,
+         text_color = color.white,
+         bgcolor = shortScore >= REQUIRED_SCORE ? okCol : badCol)
+    table.cell(t, 0, 11, "สถานะ", text_size = size.tiny, text_color = color.white,
+         bgcolor = color.new(color.gray, 60))
+    table.cell(t, 1, 11, planStatus, text_size = size.tiny, text_color = color.white,
+         bgcolor = color.new(live ? entryCol : color.gray, 40))
+    table.cell(t, 2, 11, "state " + (state == 1 ? "↑" : state == -1 ? "↓" : "—"),
+         text_size = size.tiny, text_color = color.white,
+         bgcolor = color.new(color.gray, 60))
+
+// ── ตารางสถิติ ─────────────────────────────────────────────────────────────
+if showStats and barstate.islast
+    var table s = table.new(position.bottom_right, 5, 9, border_width = 1)
+    hdr  = color.new(color.gray, 80)
+    dim  = color.new(color.gray, 85)
+    table.cell(s, 0, 0, "ราย TP", bgcolor = hdr, text_color = color.white,
+         text_size = size.tiny)
+    table.cell(s, 1, 0, "ชนะ",   bgcolor = hdr, text_color = color.white, text_size = size.tiny)
+    table.cell(s, 2, 0, "แพ้",   bgcolor = hdr, text_color = color.white, text_size = size.tiny)
+    table.cell(s, 3, 0, "win%",  bgcolor = hdr, text_color = color.white, text_size = size.tiny)
+    table.cell(s, 4, 0, "คุ้มทุน", bgcolor = hdr, text_color = color.white, text_size = size.tiny)
+
+    names = array.from("TP1  1R", "TP2  1.5R", "TP3  2R")
+    wins  = array.from(w1, w2, w3)
+    losses= array.from(l1, l2, l3)
+    rates = array.from(rate1, rate2, rate3)
+    bes   = array.from(be1, be2, be3)
+    for i = 0 to 2
+        table.cell(s, 0, i + 1, array.get(names, i), text_size = size.tiny,
+             text_color = i == 2 ? color.white : color.gray,
+             bgcolor = i == 2 ? color.new(color.blue, 70) : dim)
+        table.cell(s, 1, i + 1, str.tostring(array.get(wins, i)), text_size = size.tiny,
+             text_color = color.white, bgcolor = dim)
+        table.cell(s, 2, i + 1, str.tostring(array.get(losses, i)), text_size = size.tiny,
+             text_color = color.white, bgcolor = dim)
+        table.cell(s, 3, i + 1, pctTxt(array.get(rates, i)), text_size = size.tiny,
+             text_color = color.white,
+             bgcolor = okBg(array.get(rates, i), array.get(bes, i)))
+        table.cell(s, 4, i + 1, str.tostring(array.get(bes, i), "#.#") + "%",
+             text_size = size.tiny, text_color = color.gray, bgcolor = dim)
+
+    // สรุปรวมของไม้ทั้งก้อน — โหมด fixed_tp3 ที่บอทรันจริง
+    table.cell(s, 0, 4, "ไม้ทั้งก้อน (fixed_tp3)", bgcolor = hdr,
+         text_color = color.white, text_size = size.tiny)
+    table.cell(s, 1, 4, str.tostring(nFilled) + " ไม้", bgcolor = hdr,
+         text_color = color.white, text_size = size.tiny)
+    table.cell(s, 2, 4, "", bgcolor = hdr)
+    table.cell(s, 3, 4, "", bgcolor = hdr)
+    table.cell(s, 4, 4, "", bgcolor = hdr)
+    netCol = netR > 0 ? color.new(color.teal, 20) : color.new(color.red, 30)
+    lbl2 = array.from("หมดเวลา (ไม่นับเป็นแพ้)", "win% นับหมดเวลาเป็นแพ้",
+         "net R", "expectancy ต่อไม้")
+    val2 = array.from(str.tostring(nTimeout), pctTxt(winRateAll),
+         str.tostring(netR, "#.#") + "R",
+         na(expectancy) ? "—" : str.tostring(expectancy, "#.###") + "R")
+    bg2  = array.from(dim, color.new(color.gray, 70), netCol, netCol)
+    for i = 0 to 3
+        table.cell(s, 0, i + 5, array.get(lbl2, i), text_size = size.tiny,
+             text_color = color.gray, bgcolor = dim)
+        table.cell(s, 1, i + 5, array.get(val2, i), text_size = size.tiny,
+             text_color = color.white, bgcolor = array.get(bg2, i))
+        table.cell(s, 2, i + 5, "", bgcolor = array.get(bg2, i))
+        table.cell(s, 3, i + 5, "", bgcolor = array.get(bg2, i))
+        table.cell(s, 4, i + 5, "", bgcolor = array.get(bg2, i))
+
+// ── alert ──────────────────────────────────────────────────────────────────
+alertcondition(newPlan, "แผนใหม่", "HTF Quantum: แผนใหม่บน {{ticker}} {{interval}}")
+
+// ---------------------------------------------------------------------------
+// ข้อจำกัด — อ่านก่อนใช้เทียบกับบอท
+//
+// 1. VOLUME ไม่เท่ากัน  บอทอ่าน tick_volume จาก MT5 ส่วน TradingView ใช้ volume
+//    ของ feed ตัวเอง ทำให้ filter "Volume" และ "CVD slope" อาจต่างกันได้
+//    สองข้อจาก 9 ข้อ จึงมีโอกาสที่คะแนนต่างกัน 1–2 แต้ม และบางสัญญาณไม่ตรงกัน
+//
+// 2. FEED ต่างกัน  ราคา XAUUSD ของ FTMO กับของ TradingView ไม่ตรงกันทุก tick
+//    จุด BOS/CHoCH ที่อยู่ติดขอบพอดีจึงอาจตัดสินคนละอย่าง
+//
+// 3. PIVOT เทียบไม่เท่ากันเป๊ะ  Python ใช้ >= ในการหา fractal ส่วน ta.pivothigh
+//    ของ Pine ใช้เกณฑ์เข้มกว่าเล็กน้อยเมื่อมีแท่งสูงเท่ากันติดกัน
+//
+// 4. ตัวนี้เป็น "กระจก" ไม่ใช่ตัวสั่งเทรด  ไม่มี position sizing, guardrails ของ
+//    FTMO, news blackout หรือ market-close blackout — ของพวกนั้นอยู่ใน bot/code/
+//
+// 5. สคริปต์วาดเฉพาะแผนล่าสุด ไม่ได้เก็บสถิติย้อนหลัง  ถ้าต้องการตัวเลข
+//    win rate / expectancy ให้ดูจาก outputs/backtests/technique_lab/
+// ---------------------------------------------------------------------------
