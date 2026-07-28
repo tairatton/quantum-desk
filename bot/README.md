@@ -333,6 +333,12 @@ Capital tier เป็นตัวกำหนด exit:
 
 State ถูกผูกกับ login/server เพื่อป้องกันนำ state จากบัญชีเดิมมาใช้ผิดบัญชี. เมื่อ MT5 หรือเครือข่ายหลุด บอทจะ reconnect แบบ backoff และ reconcile position/pending order; อย่างไรก็ดี SL/TP เท่านั้นที่อยู่ broker-side ส่วนการเลื่อน break-even เป็น client-side จึงต้องปล่อย MT5 และบอททำงานต่อเนื่อง
 
+บอทเก็บ audit log แบบ append-only ที่ `bot/code/journal.jsonl` โดยไม่บันทึกรหัสผ่าน. เหตุการณ์สำคัญ เช่น เริ่ม/หยุดบอท, ผูกบัญชี, startup sync, heartbeat, เปิด/filled/cancelled order, เลื่อน SL ไป break-even, guard block และการ reconnect จะถูกบันทึกไว้เพื่อย้อนตรวจภายหลัง. ดู 100 รายการล่าสุดได้ด้วย:
+
+```powershell
+Get-Content bot\code\journal.jsonl -Tail 100
+```
+
 ก่อนย้ายบัญชีหรือเริ่ม Challenge ใหม่ ให้ archive `state.json` และ `journal.jsonl`, ยืนยัน initial balance/phase ให้ตรงบัญชี และตรวจว่าเหลือ process บอทเพียงตัวเดียว
 
 ### FTMO $50K: ผลที่ใช้เป็นข้อมูลอ้างอิง

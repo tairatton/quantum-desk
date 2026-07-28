@@ -695,6 +695,7 @@ def _bind_and_anchor(broker: Broker, state: BotState, config_):
     try:
         newly_bound = state.bind_account(account)
     except ValueError as error:
+        journal.write(JOURNAL_PATH, "account_mismatch", reason=str(error))
         print(status_line("ACCOUNT_MISMATCH", str(error), "error"))
         raise SystemExit(f"blocked: {error}") from error
     if newly_bound:
@@ -704,6 +705,10 @@ def _bind_and_anchor(broker: Broker, state: BotState, config_):
     if not state.initial_balance:
         state.initial_balance = config_.initial_balance or account["balance"]
         print(f"[INIT] initial balance anchored at {state.initial_balance:.2f}")
+    if newly_bound:
+        journal.write(JOURNAL_PATH, "account_bound",
+                      login=state.account_login, server=state.account_server,
+                      initial_balance=state.initial_balance)
     if state.roll_day(quote["server_time"].date(), account["balance"],
                       account["equity"]):
         print(f"[DAY] {state.day_key} opens at balance {state.day_start_balance:.2f} "
@@ -720,12 +725,21 @@ def reconcile_startup(broker: Broker, state: BotState, config_) -> None:
     could not receive split-exit management.  This deliberately performs only
     account/state and order lifecycle work—never signal evaluation or entries.
     """
-    _bind_and_anchor(broker, state, config_)
+    _, account = _bind_and_anchor(broker, state, config_)
     frames = {timeframe: broker.bars(timeframe, config_.history_bars)
               for timeframe in config_.timeframes}
     trader.sync_fills(broker, state, frames)
     state.day_requests += broker.take_requests()
     state.save(STATE_PATH)
+    journal.write(
+        JOURNAL_PATH, "startup_sync",
+        login=account["login"], server=account["server"],
+        managed_trades=len(state.open_trades()),
+        position_tickets=[ticket for trade in state.open_trades()
+                          for ticket in trade.position_tickets],
+        pending_tickets=[ticket for trade in state.open_trades()
+                         for ticket in trade.pending_tickets],
+    )
     print("[STARTUP_SYNC] existing pending orders reconciled before signal loop")
 
 
@@ -847,6 +861,10 @@ def _seconds_to_next_close(server_time, timeframes) -> float:
 
 def loop(broker: Broker, state: BotState, config_) -> None:
     mode = "LIVE" if not broker.dry_run else "DRY-RUN"
+    account = broker.account()
+    journal.write(JOURNAL_PATH, "bot_started", mode=mode,
+                  login=account["login"], server=account["server"],
+                  symbol=config_.symbol, timeframes=list(config_.timeframes))
     print(status_line("RUN",
                       f"mode={paint(mode, _Ansi.BOLD, _Ansi.MAGENTA if mode == 'LIVE' else _Ansi.YELLOW)} "
                       f"symbol={config_.symbol} timeframes={'+'.join(config_.timeframes)} | "
@@ -894,6 +912,11 @@ def loop(broker: Broker, state: BotState, config_) -> None:
                 print(f"[ENTRY_CAPACITY] {capacity}")
             else:
                 print("[ENTRY_CAPACITY] NO | initial balance not anchored yet")
+                capacity = "NO | initial balance not anchored yet"
+            journal.write(JOURNAL_PATH, "heartbeat", mode=mode,
+                          server_time=server_time, positions=len(positions),
+                          pending_orders=len(orders), floating_pnl=round(floating, 2),
+                          entry_capacity=capacity)
             print_management_alerts(state, positions, orders)
             sleep_and_manage_split(broker, state, config_, sleep_seconds)
             pass_once(broker, state, config_)
@@ -937,6 +960,8 @@ def loop(broker: Broker, state: BotState, config_) -> None:
                     f"reconnected but first sync is incomplete: {sync_error}",
                     "warn"))
         except KeyboardInterrupt:
+            journal.write(JOURNAL_PATH, "bot_stopped", mode=mode,
+                          reason="keyboard interrupt")
             print("\n" + status_line(
                 "STOP", "interrupted; open positions keep their broker-side SL/TP", "warn"))
             return
@@ -956,6 +981,9 @@ def execute(*, live: bool = False, once: bool = False, status: bool = False,
                 dry_run=not live) as broker:
         if status:
             print_status(broker, state, config_)
+            account = broker.account()
+            journal.write(JOURNAL_PATH, "status_checked", mode="DRY-RUN",
+                          login=account["login"], server=account["server"])
             return
         if flatten:
             trader.flatten_all(broker, state, "manual flatten")
