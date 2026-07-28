@@ -264,3 +264,89 @@ python -B -c "import bot.main; import bot.code.run; print('imports OK')"
 ```
 
 ห้ามรัน `bot/main.py` หรือ `bot/main.bat` ระหว่างการทดสอบทั่วไป เพราะทั้งสองตัวเปิด live ทันที
+
+---
+
+## เอกสารรวม: สถานะ production, Capital Tier และผลจำลอง FTMO
+
+> ส่วนนี้รวบรวมสาระจากเอกสารการเตรียม production, การตรวจ Capital Tier,
+> และแบบจำลอง FTMO $50K ไว้ในที่เดียว เพื่อให้ `bot/README.md` เป็นเอกสาร
+> Markdown เพียงไฟล์เดียวของบอท
+
+### สถานะการใช้งาน
+
+Execution layer ออกแบบให้ใช้กับ MT5 ได้ แต่การเปิดใช้งานจริงเป็น **conditional go**:
+
+- ต้องสร้าง virtual environment จาก `requirements-live.txt` และรัน unit tests ให้ผ่าน
+- MT5 ต้องล็อกอินบัญชีที่ถูกต้องและเปิด Algorithmic Trading
+- เริ่มจาก `--status` และ `--once` (dry-run) เสมอ
+- ต้องตรวจ log, lot, SL/TP, symbol, server clock และ news gate ก่อนใช้ `--live`
+- ต้องเก็บผล forward test บน FTMO demo อย่างน้อย 50 closed trades ก่อนสรุปว่า edge จาก backtest ยังคงอยู่
+
+คำสั่งมาตรฐานสำหรับ production environment:
+
+```powershell
+py -3.13 -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -r requirements-live.txt
+.\.venv\Scripts\python.exe -B -m unittest discover -s tests -q
+.\.venv\Scripts\python.exe -m bot.code.run --status
+.\.venv\Scripts\python.exe -m bot.code.run --once
+```
+
+ใช้ `--live` เมื่อรายการตรวจทั้งหมดผ่านและผู้ดูแลยืนยันเท่านั้น ส่วน `--flatten --live` เป็นคำสั่งฉุกเฉินที่ปิด position/pending order จึงต้องใช้ด้วยความระมัดระวัง
+
+### นโยบายกลยุทธ์และความเสี่ยง
+
+บอทรัน XAUUSD บน M15 และ M30 โดยใช้แท่งที่ปิดแล้วเท่านั้น มี quality filter อย่างน้อย 6/9, จำกัด stop ที่ 0.8–2.5 ATR, และไม่เปิดฝั่งตรงข้ามกับ position ที่มีอยู่
+
+| รายการ | ค่าเริ่มต้น |
+|---|---:|
+| Risk ต่อ setup | 0.40% ของ initial balance |
+| Open-risk cap | 0.80% |
+| Internal daily stop | 1.50% |
+| FTMO daily / max loss guard | 5% / 10% |
+| News blackout | USD high-impact −5 / +3 นาที |
+| Pending expiry / active timeout | 16 / 120 แท่ง |
+
+Capital tier เป็นตัวกำหนด exit:
+
+- Initial balance ต่ำกว่า $30,000: `fixed_tp3` — เปิดหนึ่ง position และปิดที่ TP3 (2R)
+- Initial balance ตั้งแต่ $30,000: `be_after_tp1_33_33_34` — แบ่ง TP1/TP2/TP3 เป็น 33/33/34 และเลื่อนส่วนที่เหลือไป break-even หลัง TP1
+
+อย่าแก้ exit ของ position ที่เปิดอยู่ย้อนหลัง และอย่าใช้ martingale, averaging down หรือขยาย SL; นโยบายเหล่านี้ถูกห้ามโดยการออกแบบ
+
+### Position health, reconnect และ state
+
+`--status` คือแหล่งข้อมูลจริงสำหรับ account, exposure, risk room, news cache และ position health. หากพบ `UNTRACKED`, `MISSING_SL/TP`, `ALERT` หรือ `CHECK SETTINGS` ต้องแก้ก่อนเปิด live ใหม่
+
+State ถูกผูกกับ login/server เพื่อป้องกันนำ state จากบัญชีเดิมมาใช้ผิดบัญชี. เมื่อ MT5 หรือเครือข่ายหลุด บอทจะ reconnect แบบ backoff และ reconcile position/pending order; อย่างไรก็ดี SL/TP เท่านั้นที่อยู่ broker-side ส่วนการเลื่อน break-even เป็น client-side จึงต้องปล่อย MT5 และบอททำงานต่อเนื่อง
+
+ก่อนย้ายบัญชีหรือเริ่ม Challenge ใหม่ ให้ archive `state.json` และ `journal.jsonl`, ยืนยัน initial balance/phase ให้ตรงบัญชี และตรวจว่าเหลือ process บอทเพียงตัวเดียว
+
+### FTMO $50K: ผลที่ใช้เป็นข้อมูลอ้างอิง
+
+สำหรับ $50K บอทใช้ BE 33/33/34 ที่ risk 0.40% ต่อ setup. ผล holdout จากข้อมูล 50,000 bars มีดังนี้:
+
+| Stream | Trades | Win rate | Expectancy | PF | Max DD ที่ risk 0.40% |
+|---|---:|---:|---:|---:|---:|
+| M15 BE33 | 221 | 46.61% | +0.1888R | 1.573 | 2.24% |
+| M30 BE33 | 204 | 56.37% | +0.3142R | 1.917 | 1.97% |
+
+แบบจำลอง Monte Carlo ใช้เพื่อวางแผน ไม่ใช่การรับประกันผลสอบ: เมื่อ edge เหลือ +0.05R ต่อ trade โอกาสผ่านสองขั้นจากแบบจำลองอยู่ที่ 90.95%; หาก edge เป็น 0R ลดเหลือ 19.74%. ความแตกต่างของ feed, spread, slippage, swap, ข่าว และ floating drawdown ทำให้ผลจริงต่างจาก backtest ได้
+
+### Checklist ก่อน live
+
+1. ตรวจ unit tests และ import ใน `.venv` ที่ใช้รันจริง
+2. ตรวจ `--status`: login/server, symbol, risk, session clock, news, SL/TP และไม่มี alert
+3. รัน `--once` แล้วอ่าน intent, lot, SL และ TP ที่ log แสดง
+4. ปล่อย dry-run อย่างน้อยหนึ่งสัปดาห์ และเก็บ forward evidence ให้ครบอย่างน้อย 50 closed demo trades
+5. ยืนยันกติกา FTMO ล่าสุด, ประเภทบัญชี Swing, phase และเวลาปิดตลาดก่อนเริ่ม Challenge
+6. จัด watchdog/notification และปิด sleep/auto-restart เพื่อให้การดูแล break-even ทำงานต่อเนื่อง
+
+### ข้อจำกัดที่ต้องยอมรับ
+
+- Backtest และ Monte Carlo ไม่ยืนยันกำไรหรือการผ่าน FTMO
+- News cache, holiday schedule และ weekly-close setting ต้องตรวจจาก `--status` เป็นระยะ
+- บอทยังไม่รองรับหลาย symbol ใน process เดียว
+- ไม่มี trailing stop นอกจาก break-even หลัง TP1
+- หากเครื่องหรือบอทหยุดทำงาน การเลื่อน break-even จะหยุดตาม แต่ SL/TP ที่ส่งให้โบรกเกอร์ยังคงอยู่
