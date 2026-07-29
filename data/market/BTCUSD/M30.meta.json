@@ -1,0 +1,12 @@
+{
+  "source": "mt5",
+  "symbol": "BTCUSDm",
+  "timeframe": "M30",
+  "bars": 6004,
+  "fetched_at": "2026-07-26T08:39:34+00:00",
+  "first_bar": "2026-03-23 04:30:00",
+  "last_bar": "2026-07-26 08:30:00",
+  "account": "416043796",
+  "server": "Exness-MT5Trial14",
+  "key": "BTCUSD"
+}

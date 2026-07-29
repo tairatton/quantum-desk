@@ -1,0 +1,18 @@
+{
+  "account_login": 1514115848,
+  "account_server": "FTMO-Demo",
+  "initial_balance": 50000.0,
+  "server_utc_offset": null,
+  "day_key": "2026-07-29",
+  "day_start_balance": 49999.76,
+  "day_start_equity": 50037.23,
+  "day_realised": 0.0,
+  "day_requests": 5,
+  "consecutive_losses": 0,
+  "halted_forever": false,
+  "halted_reason": "",
+  "paused_until_day": "",
+  "trading_days": [],
+  "seen_plan_ids": [],
+  "trades": {}
+}

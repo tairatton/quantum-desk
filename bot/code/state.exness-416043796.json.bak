@@ -1,0 +1,16 @@
+{
+  "initial_balance": 10000.0,
+  "server_utc_offset": 0.0,
+  "day_key": "2026-07-27",
+  "day_start_balance": 10000.0,
+  "day_start_equity": 10000.0,
+  "day_realised": 0.0,
+  "day_requests": 52,
+  "consecutive_losses": 0,
+  "halted_forever": false,
+  "halted_reason": "",
+  "paused_until_day": "",
+  "trading_days": [],
+  "seen_plan_ids": [],
+  "trades": {}
+}

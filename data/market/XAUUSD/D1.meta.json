@@ -1,0 +1,11 @@
+{
+  "source": "mt5",
+  "symbol": "XAUUSDm",
+  "timeframe": "D1",
+  "bars": 800,
+  "fetched_at": "2026-07-26T03:40:04+00:00",
+  "first_bar": "2024-01-01 00:00:00",
+  "last_bar": "2026-07-24 00:00:00",
+  "account": "416043796",
+  "server": "Exness-MT5Trial14"
+}

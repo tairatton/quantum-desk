@@ -1,0 +1,54 @@
+{
+  "_account": "FTMO Demo, USD 50,000, DEMO. Symbol is XAUUSD (no 'm' suffix) with 2 digits; resolve_symbol handles the name and value_per_point works out to 100.0.",
+  "symbol": "XAUUSD",
+  "initial_balance": 50000.0,
+
+  "_measured_week": "Measured from 4,000 FTMO M15 bars, not assumed: the last bar of the week opens Fri 23:45 and closes Sat 00:00 server, and the first opens Mon 01:00. Seven of nine weeks agreed; the two that ended Fri 20:00 were short weeks. There are no Saturday bars at all. So gold's 21:00 UTC close lands at 00:00 Saturday on this UTC+3 server -- which is why the close weekday is 5 and the hour is 0, not Friday 23:00. Re-measure in winter, when FTMO moves to UTC+2 (EET) and the close becomes Fri 23:00.",
+  "weekly_close_weekday": 5,
+  "weekly_close_hour": 0,
+  "weekly_open_weekday": 0,
+  "weekly_open_hour": 1,
+
+  "_comment_offset": "Measured UTC+3 from a live tick (EEST). Only used while the market is shut and the offset cannot be measured. Becomes 2.0 in winter; the bot re-measures on its own whenever quotes are flowing.",
+  "fallback_server_utc_offset": 3.0,
+
+  "_measured_spread": "FTMO's median gold spread is $0.40 on M15 and $0.42 on M30, against $0.20 in the Exness data the backtest was built on -- double. It costs less than it sounds: gold's R is $11-16, so the extra is +0.012 to +0.018R per trade and M15's holdout expectancy goes from +0.156R to about +0.140R. This is why gold survived the cost correction and the FX pairs did not: their R was small enough that spread ate the edge outright.",
+
+  "_comment_risk": "0.40% is the smallest risk that still splits three ways on a 10,000 balance: at 0.25% the size rounds down to a single 0.02 leg, and one leg exiting at TP2 is not the exit the lab measured. Below this the system being run stops being the system that was tested.",
+  "_comment_risk_ruin": "Measured by sweeping expectancy through the simulator rather than trusting M15's own train split, which sits entirely inside the 2024-25 gold bull market and is therefore no stress test. At +0.156R/trade -- the recent regime -- Step 1 passes 100% of paths. At +0.003R/trade, what gold M30 actually printed through the flat 2023, Step 1 passes 32% and 28% of paths hit the 10% max loss first. Ruin risk here is set by whether the edge holds, not by the risk percentage.",
+  "_comment_risk_size": "A 25,000 account at 0.25% does NOT buy safety: in the same flat case it passes 24.9% and ruins 20.3%, slightly worse, because a smaller risk needs more trades to reach +10% and so spends longer inside the random walk. Account size is not the lever; measuring real cost is.",
+  "risk_percent": 0.40,
+  "max_open_risk_percent": 0.80,
+  "max_risk_per_idea_percent": 0.80,
+  "max_concurrent_trades": 2,
+  "daily_loss_percent": 5.0,
+  "max_loss_percent": 10.0,
+  "internal_daily_stop_percent": 1.50,
+  "max_consecutive_losses": 3,
+  "stop_at_target": true,
+
+  "_comment_exit": "Capital tier is anchored to the account's initial balance, not live balance/equity: below 30,000 uses one leg to fixed TP3; 30,000 or above requires three executable 33/33/34 legs and moves survivors to break-even only after TP1 is confirmed closed. The active policy never flips while an account is running.",
+  "exit_mode": "capital_tier",
+  "split_exit_min_balance": 30000.0,
+
+  "_comment_timeframes": "M15 + M30, both on the pinned fixed_tp3 exit above.",
+  "_comment_timeframes_why": "M30 added 28 Jul 2026 to lift frequency from 1.9 to 2.8 trades/day. It earns the slot on evidence, not frequency: 4.2 years of data covering the flat 2023, and the highest expectancy of any stream tested (+0.299R against M15's +0.156R). A second SYMBOL was rejected instead -- USDJPY and GBPUSD sit at +0.03 to +0.07R and would dilute the book, and running every qualifying stream at once produced a worst day of -5.11%, which breaches the 5% daily loss rule on its own.",
+  "timeframes": ["M15", "M30"],
+
+  "_comment_news": "Fail closed for production safety: if the high-impact USD calendar is unavailable or stale, existing positions remain managed but no new entry is allowed.",
+  "news_enabled": true,
+  "news_require_calendar": true,
+  "news_currencies": ["USD"],
+  "news_min_impact": "high",
+  "news_minutes_before": 5,
+  "news_minutes_after": 3,
+
+  "_comment_tags": "The concrete exit tag (fixedtp3 or be33) is appended by trader.py after resolving the capital tier.",
+  "tags": ["quantum"],
+
+  "_comment_closures": "Holidays and early closes on the server clock, maintained by hand because MT5 5.0.5735 exposes no session schedule. These spans are deliberately generous and are ESTIMATES -- confirm them against FTMO's own notice before December. Being an hour too wide costs a skipped trade; being an hour too narrow is a forbidden-practice breach. A span shorter than two hours is ignored, since the gap-trading rule does not reach it.",
+  "market_closures": [
+    ["2026-12-24 22:00", "2026-12-26 03:00", "Christmas"],
+    ["2026-12-31 22:00", "2027-01-02 01:00", "New Year"]
+  ]
+}

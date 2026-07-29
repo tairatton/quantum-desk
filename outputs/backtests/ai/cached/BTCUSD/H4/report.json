@@ -1,0 +1,65 @@
+{
+  "symbol": "BTCUSD",
+  "timeframe": "H4",
+  "prompt_version": "quantum-review-v1",
+  "model": "openai/gpt-5-mini",
+  "coverage": {
+    "filled_plans": 114,
+    "ai_reviewed": 0,
+    "ai_approved": 0,
+    "percent": 0.0
+  },
+  "base": {
+    "plans": 114,
+    "targets": {
+      "TP1": {
+        "wins": 62,
+        "losses": 47,
+        "unresolved": 5,
+        "win_rate": 56.88,
+        "spread_adjusted_r": 14.023
+      },
+      "TP2": {
+        "wins": 51,
+        "losses": 53,
+        "unresolved": 10,
+        "win_rate": 49.04,
+        "spread_adjusted_r": 22.523
+      },
+      "TP3": {
+        "wins": 39,
+        "losses": 57,
+        "unresolved": 18,
+        "win_rate": 40.62,
+        "spread_adjusted_r": 20.023
+      }
+    }
+  },
+  "ai_filter": {
+    "plans": 0,
+    "targets": {
+      "TP1": {
+        "wins": 0,
+        "losses": 0,
+        "unresolved": 0,
+        "win_rate": null,
+        "spread_adjusted_r": 0.0
+      },
+      "TP2": {
+        "wins": 0,
+        "losses": 0,
+        "unresolved": 0,
+        "win_rate": null,
+        "spread_adjusted_r": 0.0
+      },
+      "TP3": {
+        "wins": 0,
+        "losses": 0,
+        "unresolved": 0,
+        "win_rate": null,
+        "spread_adjusted_r": 0.0
+      }
+    }
+  },
+  "warning": "Forward decisions only; do not interpret low-coverage results as a historical AI backtest."
+}

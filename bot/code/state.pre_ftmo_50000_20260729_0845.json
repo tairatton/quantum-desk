@@ -1,0 +1,91 @@
+{
+  "initial_balance": 10000.0,
+  "server_utc_offset": 3.0,
+  "day_key": "2026-07-28",
+  "day_start_balance": 9999.57,
+  "day_start_equity": 9999.57,
+  "day_realised": 0.0,
+  "day_requests": 797,
+  "consecutive_losses": 0,
+  "halted_forever": false,
+  "halted_reason": "",
+  "paused_until_day": "",
+  "trading_days": [
+    "2026-07-28"
+  ],
+  "seen_plan_ids": [
+    "M15@2026-07-27 16:45:00",
+    "M30@2026-07-28 04:30:00",
+    "M15@2026-07-28 12:30:00"
+  ],
+  "trades": {
+    "M15@2026-07-27 16:45:00": {
+      "plan_id": "M15@2026-07-27 16:45:00",
+      "timeframe": "M15",
+      "direction": -1,
+      "entry": 4080.21,
+      "stop": 4100.629122272001,
+      "risk": 20.419122272000592,
+      "risk_cash": 40.0,
+      "targets": [
+        4039.371755455999
+      ],
+      "legs": [
+        0.01
+      ],
+      "position_tickets": [],
+      "pending_tickets": [],
+      "filled_at": null,
+      "fill_bar_time": null,
+      "breakeven_done": false,
+      "closed": true,
+      "dry_run": false
+    },
+    "M30@2026-07-28 04:30:00": {
+      "plan_id": "M30@2026-07-28 04:30:00",
+      "timeframe": "M30",
+      "direction": -1,
+      "entry": 4055.145,
+      "stop": 4076.781814990775,
+      "risk": 21.63681499077464,
+      "risk_cash": 40.0,
+      "targets": [
+        4011.8713700184508
+      ],
+      "legs": [
+        0.01
+      ],
+      "position_tickets": [],
+      "pending_tickets": [],
+      "filled_at": null,
+      "fill_bar_time": null,
+      "breakeven_done": false,
+      "closed": true,
+      "dry_run": false
+    },
+    "M15@2026-07-28 12:30:00": {
+      "plan_id": "M15@2026-07-28 12:30:00",
+      "timeframe": "M15",
+      "direction": -1,
+      "entry": 4033.23,
+      "stop": 4047.9359447839224,
+      "risk": 14.705944783922186,
+      "risk_cash": 44.12,
+      "targets": [
+        4003.8181104321557
+      ],
+      "legs": [
+        0.03
+      ],
+      "position_tickets": [
+        505785091
+      ],
+      "pending_tickets": [],
+      "filled_at": "2026-07-28 12:45:21",
+      "fill_bar_time": "2026-07-28 12:30:00",
+      "breakeven_done": false,
+      "closed": false,
+      "dry_run": false
+    }
+  }
+}

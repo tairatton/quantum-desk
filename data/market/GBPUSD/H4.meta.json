@@ -1,0 +1,12 @@
+{
+  "source": "mt5",
+  "symbol": "GBPUSDm",
+  "timeframe": "H4",
+  "bars": 6415,
+  "fetched_at": "2026-07-26T10:35:28+00:00",
+  "first_bar": "2022-08-01 00:00:00",
+  "last_bar": "2026-07-24 20:00:00",
+  "account": "416043796",
+  "server": "Exness-MT5Trial14",
+  "key": "GBPUSD"
+}
