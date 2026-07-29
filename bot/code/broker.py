@@ -11,11 +11,16 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 import os
+import time
 
 import pandas as pd
 
 from xau import config, mt5_source
 from xau.mt5_source import MT5Error
+
+
+class OrderRejected(MT5Error):
+    """A broker accepted the request but refused to carry out the order."""
 
 
 def _configured_mt5_login() -> dict[str, object]:
@@ -76,11 +81,19 @@ class Position:
 class Broker:
     """Thin, explicit wrapper. Raises MT5Error rather than returning None."""
 
-    def __init__(self, symbol_key: str, magic: int, deviation: int, dry_run: bool):
+    def __init__(self, symbol_key: str, magic: int, deviation: int, dry_run: bool,
+                 write_spacing_seconds: float = 0.0):
         self.symbol_key = symbol_key.upper()
         self.magic = magic
         self.deviation = deviation
         self.dry_run = dry_run
+        # Minimum gap between two writes. A `be_33_33_34` entry sends three orders
+        # back to back, which brokers read as automated order flooding and answer
+        # with a temporary block. Spacing them is a compliance measure, not a
+        # trading one: nothing about the plan — entry, stop, targets, sizing —
+        # changes, only how fast the legs leave.
+        self.write_spacing_seconds = max(0.0, write_spacing_seconds)
+        self._last_write: float | None = None
         self._mt = None
         self._spec: SymbolSpec | None = None
         # FTMO caps an EA at roughly 2,000 server requests a day. Sleeping to the
@@ -389,18 +402,41 @@ class Broker:
                 for d in deals if d.magic == self.magic and d.symbol == self.spec.name]
 
     # -- writes -----------------------------------------------------------
+    def _pace(self) -> None:
+        """Hold off until `write_spacing_seconds` have passed since the last write.
+
+        Called at the top of every write method rather than inside `_send`,
+        because `market_entry` and `close` read a quote before building the
+        request: sleeping after that would price the order off a tick that is
+        already `write_spacing_seconds` old, and gold moves in two seconds.
+
+        Dry runs never wait — nothing reaches the broker, so there is nothing to
+        pace, and tests would pay the delay for no reason.
+        """
+        if self.dry_run or self.write_spacing_seconds <= 0 or self._last_write is None:
+            return
+        waited = time.monotonic() - self._last_write
+        remaining = self.write_spacing_seconds - waited
+        if remaining > 0:
+            print(f"[ORDER_SPACING] waiting {remaining:.2f}s before the next write")
+            time.sleep(remaining)
+
     def _send(self, request: dict, what: str) -> dict:
         if self.dry_run:
             print(f"[ORDER_SIMULATED] action={what!r} request={request}")
             return {"dry_run": True, "request": request}
         self._requests += 1
+        # Stamped before the call, not after, so a slow or failed `order_send`
+        # cannot stretch the gap: what the broker rates is when requests arrive.
+        # A rejection still counts — it was a request either way.
+        self._last_write = time.monotonic()
         result = self.mt.order_send(request)
         if result is None:
             code, desc = self.mt.last_error()
             raise MT5Error(f"{what} got no result: ({code}) {desc}")
         ok = result.retcode in (self.mt.TRADE_RETCODE_DONE, self.mt.TRADE_RETCODE_PLACED)
         if not ok:
-            raise MT5Error(f"{what} rejected: retcode={result.retcode} {result.comment}")
+            raise OrderRejected(f"{what} rejected: retcode={result.retcode} {result.comment}")
         print(f"[ORDER_SUBMITTED] action={what!r} ticket={result.order or result.deal} "
               f"price={float(result.price or 0):.{self.spec.digits}f}")
         return {"dry_run": False, "retcode": result.retcode,
@@ -419,6 +455,7 @@ class Broker:
 
     def market_entry(self, direction: int, volume: float, stop: float,
                      take_profit: float, comment: str) -> dict:
+        self._pace()
         quote = self.tick()
         return self._send({
             "action": self.mt.TRADE_ACTION_DEAL, "symbol": self.spec.name,
@@ -448,6 +485,7 @@ class Broker:
 
     def limit_entry(self, direction: int, volume: float, price: float, stop: float,
                     take_profit: float, expires_at: datetime, comment: str) -> dict:
+        self._pace()
         return self._send({
             "action": self.mt.TRADE_ACTION_PENDING, "symbol": self.spec.name,
             "volume": self._volume(volume),
@@ -467,6 +505,7 @@ class Broker:
         if not improves:
             raise MT5Error(f"refusing to widen stop on #{position.ticket}: "
                            f"{position.stop} -> {stop}")
+        self._pace()
         return self._send({
             "action": self.mt.TRADE_ACTION_SLTP, "symbol": self.spec.name,
             "position": position.ticket, "sl": round(stop, self.spec.digits),
@@ -474,6 +513,7 @@ class Broker:
         }, f"move stop #{position.ticket} -> {stop}")
 
     def close(self, position: Position, reason: str) -> dict:
+        self._pace()
         quote = self.tick()
         return self._send({
             "action": self.mt.TRADE_ACTION_DEAL, "symbol": self.spec.name,
@@ -486,5 +526,6 @@ class Broker:
         }, f"close #{position.ticket} ({reason})")
 
     def cancel(self, ticket: int, reason: str) -> dict:
+        self._pace()
         return self._send({"action": self.mt.TRADE_ACTION_REMOVE, "order": ticket},
                           f"cancel order #{ticket} ({reason})")

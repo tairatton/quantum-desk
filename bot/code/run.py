@@ -26,7 +26,7 @@ from xau.mt5_source import MT5Error
 
 from . import (guardrails, journal, market_hours, news,
                settings as settings_module, signals, trader)
-from .broker import Broker
+from .broker import Broker, OrderRejected
 from .settings import JOURNAL_PATH, KILL_SWITCH, STATE_PATH
 from .sizing import open_risk_percent
 from .state import BotState
@@ -752,6 +752,7 @@ def pass_once(broker: Broker, state: BotState, config_) -> None:
     trader.sync_fills(broker, state, frames)
     trader.apply_breakeven(broker, state)
     trader.enforce_timeout(broker, state, frames)
+    trader.enforce_orphan_timeout(broker, state, frames)
     trader.reconcile_closed(broker, state)
 
     health = guardrails.account_health(config_, state, account["equity"], account["balance"])
@@ -921,6 +922,12 @@ def loop(broker: Broker, state: BotState, config_) -> None:
             sleep_and_manage_split(broker, state, config_, sleep_seconds)
             pass_once(broker, state, config_)
             reconnect_failures = 0
+        except OrderRejected as error:
+            # A broker refusal used to be called a lost connection, which spent
+            # every pass reconnecting while the rejected ticket stayed exposed.
+            print(status_line("ORDER_REJECTED", str(error), "warn"))
+            journal.write(JOURNAL_PATH, "order_rejected", reason=str(error))
+            continue
         except MT5Error as error:
             # Broker-side SL/TP and pending orders survive this process losing
             # connectivity. What stops is observation, BE moves, timeouts and new
@@ -978,7 +985,8 @@ def execute(*, live: bool = False, once: bool = False, status: bool = False,
     state = BotState.load(STATE_PATH)
 
     with Broker(config_.symbol, config_.magic, config_.deviation_points,
-                dry_run=not live) as broker:
+                dry_run=not live,
+                write_spacing_seconds=config_.write_spacing_seconds) as broker:
         if status:
             print_status(broker, state, config_)
             account = broker.account()

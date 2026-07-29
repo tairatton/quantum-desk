@@ -17,6 +17,8 @@ from contextlib import redirect_stdout
 from dataclasses import dataclass, field, replace
 from datetime import date, datetime, timedelta
 from pathlib import Path
+from types import SimpleNamespace
+from unittest import mock
 
 import pandas as pd
 
@@ -24,8 +26,8 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from bot.code import guardrails, market_hours, run, trader  # noqa: E402
-from bot.code.broker import SymbolSpec  # noqa: E402
+from bot.code import guardrails, market_hours, run, signals, trader  # noqa: E402
+from bot.code.broker import OrderRejected, SymbolSpec  # noqa: E402
 from bot.code.instance_lock import LiveInstanceLock  # noqa: E402
 from bot.code.settings import Settings  # noqa: E402
 from bot.code.signals import Intent  # noqa: E402
@@ -293,12 +295,97 @@ class TraderPathsTests(unittest.TestCase):
         self.assertTrue(all(stop == trade.entry for _, stop in broker.stops_moved))
         self.assertTrue(trade.breakeven_done)
 
+    def test_one_rejected_breakeven_move_does_not_abort_the_other_survivor(self):
+        """The first refusal escaped the loop, so the other survivor kept its
+        original stop even though the broker would have accepted its move."""
+        class PickyBroker(FakeBroker):
+            def move_stop(self, position, stop):
+                if position.ticket == rejected:
+                    raise MT5Error("move stop rejected: retcode=10004 Requote")
+                return super().move_stop(position, stop)
+
+        broker = PickyBroker()
+        trade = trader.open_trade(broker, self.settings, self.state, intent(), 100_000.0)
+        first, rejected, accepted = trade.position_tickets
+        broker._positions = [position for position in broker._positions if position.ticket != first]
+        trader.apply_breakeven(broker, self.state)
+        self.assertEqual(broker.stops_moved, [(accepted, trade.entry)])
+        self.assertTrue(trade.breakeven_done)
+
+    def test_all_rejected_breakeven_moves_leave_the_trade_retryable(self):
+        """The unconditional flag said break-even was done after a refusal, so
+        the next pass never tried to protect the remaining legs again."""
+        class RefusingBroker(FakeBroker):
+            def move_stop(self, position, stop):
+                raise MT5Error("move stop rejected: retcode=10018 Market closed")
+
+        broker = RefusingBroker()
+        trade = trader.open_trade(broker, self.settings, self.state, intent(), 100_000.0)
+        first, *_ = trade.position_tickets
+        broker._positions = [position for position in broker._positions if position.ticket != first]
+        trader.apply_breakeven(broker, self.state)
+        self.assertFalse(trade.breakeven_done)
+
     def test_breakeven_does_nothing_when_the_stop_took_every_leg(self):
         broker = FakeBroker()
         trader.open_trade(broker, self.settings, self.state, intent(), 100_000.0)
         broker._positions = []          # SL hit: all three gone at once
         trader.apply_breakeven(broker, self.state)
         self.assertEqual(broker.stops_moved, [])
+
+    def test_one_rejected_timeout_close_does_not_abort_the_other_trade(self):
+        """A refused timeout close stopped the management pass before later
+        trades received the same 120-bar exit attempt."""
+        class PickyBroker(FakeBroker):
+            def close(self, position, reason):
+                if position.ticket == rejected:
+                    raise MT5Error("close rejected: retcode=10018 Market closed")
+                return super().close(position, reason)
+
+        broker = PickyBroker()
+        first_trade = trader.open_trade(broker, self.settings, self.state, intent(), 100_000.0)
+        second_trade = trader.open_trade(
+            broker, self.settings, self.state,
+            replace(intent(), plan_id="M15@2026-06-01 00:15:00"), 100_000.0)
+        for trade in (first_trade, second_trade):
+            trade.fill_bar_time = str(bars(1)["time"].iloc[0])
+        rejected = first_trade.position_tickets[0]
+        trader.enforce_timeout(broker, self.state, {"M15": bars(350)})
+        self.assertIn(second_trade.position_tickets[0], [ticket for ticket, _ in broker.closed])
+
+    def test_a_rejected_stale_cancel_keeps_the_ticket_managed(self):
+        """The unconditional clear forgot a still-working order after its cancel
+        was refused, so it could fill without a managed trade owning it."""
+        class RefusingBroker(FakeBroker):
+            def cancel(self, ticket, reason):
+                raise MT5Error("cancel rejected: retcode=10018 Market closed")
+
+        broker = RefusingBroker()
+        trade = trader.open_trade(broker, self.settings, self.state,
+                                  intent("limit"), 100_000.0)
+        ticket = trade.pending_tickets[0]
+        trader.cancel_stale(broker, self.state,
+                            replace(intent("limit"), status="BUY STALE"))
+        self.assertIn(ticket, trade.pending_tickets)
+        self.assertFalse(trade.closed)
+
+    def test_one_rejected_flatten_close_does_not_abort_the_others(self):
+        """The first emergency-close refusal escaped, leaving later positions
+        open while the operator line incorrectly claimed the account was flat."""
+        class PickyBroker(FakeBroker):
+            def close(self, position, reason):
+                if position.ticket == 701:
+                    raise MT5Error("close rejected: retcode=10018 Market closed")
+                return super().close(position, reason)
+
+        broker = PickyBroker(_positions=[FakePos(ticket=ticket) for ticket in (701, 702, 703)])
+        output = io.StringIO()
+        with redirect_stdout(output):
+            trader.flatten_all(broker, self.state, "manual flatten")
+        self.assertEqual([ticket for ticket, _ in broker.closed], [702, 703])
+        self.assertIn("incomplete; refused=[701]", output.getvalue())
+        self.assertIn('"event": "flatten_rejected"',
+                      (Path(self.tmp.name) / "journal.jsonl").read_text(encoding="utf-8"))
 
     def test_missing_deal_history_does_not_close_trade_at_zero(self):
         broker = FakeBroker()
@@ -468,6 +555,293 @@ class ReconnectTests(unittest.TestCase):
         self.assertIsNone(broker._mt)
         self.assertIsNone(broker._spec)
         self.assertEqual(rebuilt, [True])
+
+    def test_an_order_rejection_does_not_reconnect(self):
+        """A rejected write was treated as a lost connection, so a permanent
+        broker refusal entered a pointless reconnect and backoff loop."""
+        class LoopBroker:
+            dry_run = True
+            requests = 0
+            spec = GOLD
+
+            def __init__(self):
+                self.reconnects = 0
+
+            def account(self):
+                return {"login": 1, "server": "test"}
+
+            def tick(self):
+                return {"server_time": datetime(2026, 7, 27, 12, 0)}
+
+            def positions(self):
+                return []
+
+            def pending_orders(self):
+                return []
+
+            def feed_stale_minutes(self):
+                return None
+
+            def reconnect(self):
+                self.reconnects += 1
+
+        broker = LoopBroker()
+        config_ = SimpleNamespace(symbol="XAUUSDm", timeframes=("M15",),
+                                  entry_grace_seconds=0, initial_balance=0.0)
+        with tempfile.TemporaryDirectory() as directory, \
+                mock.patch.object(run, "JOURNAL_PATH", Path(directory) / "journal.jsonl"), \
+                mock.patch.object(run, "sleep_and_manage_split"), \
+                mock.patch.object(run, "pass_once",
+                                  side_effect=[OrderRejected("close rejected"),
+                                               KeyboardInterrupt()]):
+            with redirect_stdout(io.StringIO()):
+                run.loop(broker, BotState(), config_)
+        self.assertEqual(broker.reconnects, 0)
+
+
+class OrphanTimeoutTests(unittest.TestCase):
+    """A position whose local record was lost used to be held forever."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        for attr in ("STATE_PATH", "JOURNAL_PATH"):
+            patcher = mock.patch.object(trader, attr, Path(self.tmp.name) / attr.lower())
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        self.frames = {"M15": bars(300, 15), "M30": bars(300, 30)}
+        self.old = self.frames["M15"]["time"].iloc[0].to_pydatetime()
+        self.recent = self.frames["M15"]["time"].iloc[-3].to_pydatetime()
+
+    def _managed(self, ticket: int) -> BotState:
+        state = BotState(initial_balance=50_000.0)
+        state.trades["p1"] = ManagedTrade(
+            plan_id="p1", timeframe="M15", direction=1, entry=4000.0, stop=3984.0,
+            risk=16.0, risk_cash=200.0, targets=[4016.0], legs=[0.01],
+            exit_mode="fixed_tp3", position_tickets=[ticket],
+            fill_bar_time=str(self.frames["M15"]["time"].iloc[-1]))
+        return state
+
+    def test_an_unmanaged_position_is_closed_once_its_own_clock_runs_out(self):
+        broker = FakeBroker(_positions=[
+            FakePos(ticket=999, comment="M15 TP2 quantum|be33", opened_at=self.old)])
+        trader.enforce_orphan_timeout(broker, BotState(initial_balance=50_000.0),
+                                      self.frames)
+        self.assertEqual([ticket for ticket, _ in broker.closed], [999])
+
+    def test_an_unmanaged_position_inside_its_window_is_left_alone(self):
+        broker = FakeBroker(_positions=[
+            FakePos(ticket=999, comment="M15 TP2 quantum|be33", opened_at=self.recent)])
+        trader.enforce_orphan_timeout(broker, BotState(initial_balance=50_000.0),
+                                      self.frames)
+        self.assertEqual(broker.closed, [])
+
+    def test_a_managed_position_is_left_to_enforce_timeout(self):
+        """Both paths firing would send two closes for one position, and the
+        second would be a close on a ticket that no longer exists."""
+        broker = FakeBroker(_positions=[
+            FakePos(ticket=111, comment="M15 TP2 quantum|be33", opened_at=self.old)])
+        trader.enforce_orphan_timeout(broker, self._managed(111), self.frames)
+        self.assertEqual(broker.closed, [])
+
+    def test_a_record_marked_closed_no_longer_shields_a_live_position(self):
+        """`open_trades()` skips closed records, so a position that outlived its
+        record fell through both paths and was held indefinitely."""
+        state = self._managed(111)
+        state.trades["p1"].closed = True
+        broker = FakeBroker(_positions=[
+            FakePos(ticket=111, comment="M15 TP2 quantum|be33", opened_at=self.old)])
+        trader.enforce_orphan_timeout(broker, state, self.frames)
+        self.assertEqual([ticket for ticket, _ in broker.closed], [111])
+
+    def test_an_unreadable_comment_falls_back_to_the_slowest_timeframe(self):
+        """Guessing M15 would close a position 120 M30 bars early. The slower
+        frame is the safe guess: it can only delay the close."""
+        self.assertEqual(trader._orphan_timeframe("", self.frames), "M30")
+        self.assertEqual(trader._orphan_timeframe("hand edited", self.frames), "M30")
+        self.assertEqual(trader._orphan_timeframe("M15 TP1 quantum", self.frames), "M15")
+
+    def test_bars_are_counted_not_hours_so_a_weekend_does_not_expire_a_trade(self):
+        """120 M30 bars is 60 *trading* hours. Counting wall clock instead would
+        time out anything held over a weekend the moment Monday opened."""
+        frame = bars(200, 30)
+        gap = frame.copy()
+        gap.loc[100:, "time"] = gap.loc[100:, "time"] + pd.Timedelta(days=2)
+        opened = frame["time"].iloc[50].to_pydatetime()
+        self.assertEqual(signals.bars_since_moment(gap, opened),
+                         signals.bars_since_moment(frame, opened))
+
+    def test_a_new_trade_does_not_adopt_a_position_that_was_already_live(self):
+        """`known` was built from `state.trades`, which assumed every live
+        position had a record. An orphan has none, so it was swept into the next
+        trade: scored against that trade's risk_cash, its stop moved to that
+        trade's entry, and hidden from the orphan timeout that would close it."""
+        orphan = FakePos(ticket=777, direction=-1, volume=0.05,
+                         comment="M15 TP1 quantum|be33", opened_at=self.old)
+        broker = FakeBroker(_positions=[orphan])
+        trade = trader.open_trade(broker, Settings(exit_mode="fixed_tp3"),
+                                  BotState(initial_balance=50_000.0),
+                                  intent(), 50_000.0)
+        self.assertNotIn(777, trade.position_tickets)
+        self.assertEqual(len(trade.position_tickets), 1)
+
+    def test_one_unclosable_orphan_does_not_abort_the_others(self):
+        """A refused close used to escape the pass and reach `run.loop`, which
+        reads every MT5Error as a lost connection and answers with a reconnect —
+        no help against a rejection, and the second orphan never got its turn."""
+        class PickyBroker(FakeBroker):
+            def close(self, position, reason):
+                if position.ticket == 901:
+                    raise MT5Error("close rejected: retcode=10018 Market closed")
+                return super().close(position, reason)
+
+        broker = PickyBroker(_positions=[
+            FakePos(ticket=ticket, comment="M30 TP1 quantum|be33", opened_at=self.old)
+            for ticket in (901, 902)])
+        trader.enforce_orphan_timeout(broker, BotState(initial_balance=50_000.0),
+                                      self.frames)
+        self.assertEqual([ticket for ticket, _ in broker.closed], [902])
+
+    def test_positions_from_another_source_are_never_touched(self):
+        """`broker.positions()` filters on this bot's magic, so an EA's or a
+        hand-opened position is invisible here and stays that way."""
+        broker = FakeBroker(_positions=[])
+        trader.enforce_orphan_timeout(broker, BotState(initial_balance=50_000.0),
+                                      self.frames)
+        self.assertEqual(broker.closed, [])
+
+
+class WriteSpacingTests(unittest.TestCase):
+    """Three legs leaving in the same instant reads as order flooding."""
+
+    def _broker(self, **kwargs):
+        from bot.code.broker import Broker
+
+        return Broker("XAUUSD", magic=1, deviation=30, **kwargs)
+
+    def test_a_second_write_waits_out_the_remaining_gap(self):
+        broker = self._broker(dry_run=False, write_spacing_seconds=2.0)
+        slept = []
+        with mock.patch("bot.code.broker.time.sleep", slept.append), \
+                mock.patch("bot.code.broker.time.monotonic", return_value=100.5):
+            broker._last_write = None
+            broker._pace()                      # first write never waits
+            self.assertEqual(slept, [])
+            broker._last_write = 100.0
+            broker._pace()                      # 0.5s elapsed of the 2.0s gap
+        self.assertEqual(len(slept), 1)
+        self.assertAlmostEqual(slept[0], 1.5)
+
+    def test_a_gap_already_served_does_not_sleep(self):
+        broker = self._broker(dry_run=False, write_spacing_seconds=2.0)
+        slept = []
+        broker._last_write = 100.0
+        with mock.patch("bot.code.broker.time.sleep", slept.append), \
+                mock.patch("bot.code.broker.time.monotonic", return_value=105.0):
+            broker._pace()
+        self.assertEqual(slept, [])
+
+    def test_a_dry_run_never_pays_the_delay(self):
+        broker = self._broker(dry_run=True, write_spacing_seconds=2.0)
+        slept = []
+        broker._last_write = 100.0
+        with mock.patch("bot.code.broker.time.sleep", slept.append), \
+                mock.patch("bot.code.broker.time.monotonic", return_value=100.1):
+            broker._pace()
+        self.assertEqual(slept, [])
+
+    def test_the_wait_happens_before_the_quote_is_read(self):
+        """Sleeping after `tick()` would price the order off a stale quote:
+        gold moves in two seconds, and the deviation guard would reject or the
+        fill would land somewhere the plan never asked for."""
+        broker = self._broker(dry_run=False, write_spacing_seconds=2.0)
+        order = []
+        broker._pace = lambda: order.append("pace")
+        broker.tick = lambda: (order.append("tick"),
+                               {"ask": 3300.0, "bid": 3299.5})[1]
+        broker._send = lambda request, what: order.append("send") or {}
+        broker._spec = GOLD
+        broker._mt = SimpleNamespace(TRADE_ACTION_DEAL=1, ORDER_TYPE_BUY=0,
+                                     ORDER_TYPE_SELL=1, ORDER_TIME_GTC=0)
+
+        broker.market_entry(1, 0.01, 3290.0, 3320.0, "M15 TP3")
+        broker.close(FakePos(ticket=1), "timeout")
+
+        self.assertEqual(order, ["pace", "tick", "send"] * 2)
+
+    def test_the_stamp_is_taken_when_the_request_leaves_not_when_it_returns(self):
+        """A slow `order_send` must not stretch the gap: the broker rates when
+        requests arrive, so pacing from the reply would double the real spacing."""
+        broker = self._broker(dry_run=False, write_spacing_seconds=2.0)
+
+        class SlowTerminal:
+            TRADE_RETCODE_DONE = 10009
+            TRADE_RETCODE_PLACED = 10008
+
+            def order_send(self, request):
+                return SimpleNamespace(retcode=10009, order=7, deal=0, price=3300.0,
+                                       comment="ok")
+
+        broker._mt = SlowTerminal()
+        broker._spec = GOLD
+        with mock.patch("bot.code.broker.time.monotonic", return_value=100.0):
+            broker._send({}, "market buy")
+        self.assertEqual(broker._last_write, 100.0)
+
+    def test_a_rejected_write_still_counts_against_the_gap(self):
+        """A rejection is a request the broker saw. Retrying it instantly is
+        exactly the burst the spacing exists to prevent."""
+        broker = self._broker(dry_run=False, write_spacing_seconds=2.0)
+
+        class RejectingTerminal:
+            TRADE_RETCODE_DONE = 10009
+            TRADE_RETCODE_PLACED = 10008
+
+            def order_send(self, request):
+                return SimpleNamespace(retcode=10004, order=0, deal=0, price=0.0,
+                                       comment="requote")
+
+        broker._mt = RejectingTerminal()
+        broker._spec = GOLD
+        with mock.patch("bot.code.broker.time.monotonic", return_value=100.0):
+            with self.assertRaises(MT5Error):
+                broker._send({}, "market buy")
+        self.assertEqual(broker._last_write, 100.0)
+
+    def test_bad_retcode_raises_an_order_rejection_but_no_result_is_an_mt5_error(self):
+        """Both failures raised the same error, so the loop reconnected after a
+        broker refusal even though only a missing terminal response needed it."""
+        self.assertTrue(issubclass(OrderRejected, MT5Error))
+        broker = self._broker(dry_run=False)
+
+        class RejectingTerminal:
+            TRADE_RETCODE_DONE = 10009
+            TRADE_RETCODE_PLACED = 10008
+
+            def order_send(self, request):
+                return SimpleNamespace(retcode=10004, order=0, deal=0, price=0.0,
+                                       comment="requote")
+
+        broker._mt = RejectingTerminal()
+        broker._spec = GOLD
+        with self.assertRaises(OrderRejected):
+            broker._send({}, "market buy")
+
+        class SilentTerminal(RejectingTerminal):
+            def order_send(self, request):
+                return None
+
+            def last_error(self):
+                return (1, "terminal unavailable")
+
+        broker._mt = SilentTerminal()
+        with self.assertRaises(MT5Error) as raised:
+            broker._send({}, "market buy")
+        self.assertNotIsInstance(raised.exception, OrderRejected)
+
+    def test_spacing_must_not_be_negative(self):
+        with self.assertRaises(ValueError):
+            Settings(write_spacing_seconds=-1.0)
 
 
 class DailyRulesTests(unittest.TestCase):

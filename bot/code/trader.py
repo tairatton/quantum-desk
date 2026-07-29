@@ -1,9 +1,16 @@
 """Turn a plan into orders and manage it until it is closed.
 
-The production setting pins ``fixed_tp3``: one position, full exit at TP3 (2R),
-plus the same 120-bar timeout measured by the study. The optional
-``be_33_33_34`` mode uses three broker-side legs and moves the survivors to
-break-even after TP1; it is not selected by the current live configuration.
+The production setting is ``capital_tier``, so which exit runs depends on the
+account's anchored capital: ``fixed_tp3`` below 30,000 — one position, full exit
+at TP3 (2R) — and ``be_33_33_34`` at or above it, which uses three broker-side
+legs and moves the survivors to break-even after TP1. A 50,000 account is on the
+split. Both carry the same 120-bar timeout the study measured.
+
+The three legs are sent one at a time with `Broker.write_spacing_seconds`
+between them. Firing them in the same instant reads as automated order flooding
+and earns a temporary block, which is the one failure that can strand a
+half-placed trade. Only the timing changes; entry, stop, targets and sizing are
+still exactly what the plan asked for.
 """
 from __future__ import annotations
 
@@ -108,7 +115,15 @@ def open_trade(broker: Broker, settings: Settings, state: BotState, intent: Inte
         remaining = max(signals.ENTRY_TIMEOUT_BARS - intent.bars_since_signal, 1)
         expiry = broker.tick()["server_time"] + remaining * _timeframe_delta(intent.timeframe)
 
-    known = {ticket for other in state.trades.values() for ticket in other.position_tickets}
+    # What is live *before* the first leg goes out. This used to be assembled
+    # from `state.trades`, which silently assumed every live position had a local
+    # record. An orphan — state.json reset, a crash mid-placement — has none, so
+    # it failed the `not in known` test below and was adopted into this trade:
+    # its P/L scored against this trade's `risk_cash`, its stop moved to this
+    # trade's entry, and it disappeared from `enforce_orphan_timeout`, the one
+    # thing that would have closed it. Asking the broker costs one request and
+    # cannot be wrong: anything already open is not a leg we just sent.
+    known = {position.ticket for position in broker.positions()}
 
     # Register the trade *before* the first order goes out. A leg can be rejected
     # halfway through — bad stops, margin, a requote — and if the plan were only
@@ -293,17 +308,97 @@ def apply_breakeven(broker: Broker, state: BotState) -> None:
         survivors = [open_positions[ticket] for ticket in rest if ticket in open_positions]
         if not survivors:
             continue
+        moved = []
         for position in survivors:
             improves = (trade.entry > position.stop if trade.direction == 1
                         else trade.entry < position.stop)
             if improves:
-                broker.move_stop(position, trade.entry)
+                # A refused move used to escape and stop later survivor legs from
+                # reaching break-even, then marked the whole trade protected.
+                try:
+                    broker.move_stop(position, trade.entry)
+                except MT5Error as error:
+                    journal.write(JOURNAL_PATH, "breakeven_rejected",
+                                  ticket=position.ticket, reason=str(error))
+                    print(f"[STOP_REJECTED] ticket={position.ticket} "
+                          f"reason={str(error)!r} scope='break_even'")
+                    continue
+                moved.append(position)
+        if not moved:
+            continue
         trade.breakeven_done = True
         journal.write(JOURNAL_PATH, "breakeven", plan_id=trade.plan_id,
-                      tickets=[position.ticket for position in survivors],
+                      tickets=[position.ticket for position in moved],
                       stop=trade.entry)
         print(f"[STOP_MOVED] plan={trade.plan_id} mode=BREAK_EVEN stop={trade.entry} "
-              f"positions={[position.ticket for position in survivors]}")
+              f"positions={[position.ticket for position in moved]}")
+
+
+def _orphan_timeframe(comment: str, frames: dict[str, pd.DataFrame]) -> str | None:
+    """The timeframe an unmanaged position belongs to, read off its comment.
+
+    `open_trade` writes "M15 TP3 quantum|be33", so the timeframe survives in MT5
+    even when the local record does not. When the comment is unreadable — hand
+    edited, truncated by a broker, written by an older build — fall back to the
+    slowest configured timeframe. That is deliberately the conservative choice:
+    120 M30 bars is twice the patience of 120 M15 bars, so guessing wrong delays
+    the close rather than cutting a position short of the measured hold.
+    """
+    if not frames:
+        return None
+    head = comment.split()[0].upper() if comment.split() else ""
+    if head in frames:
+        return head
+    return max(frames, key=lambda tf: config.TIMEFRAME_SECONDS[tf.upper()])
+
+
+def enforce_orphan_timeout(broker: Broker, state: BotState,
+                           frames: dict[str, pd.DataFrame]) -> None:
+    """Time out the bot's own positions that no managed trade owns.
+
+    `enforce_timeout` walks `state.open_trades()`, so a position whose record was
+    lost — state.json reset, a crash before the trade was written, a record
+    already marked closed while the position lived on — was held forever: no
+    120-bar close, and the only sign of it was an `UNTRACKED_POSITION` alert
+    nobody may be reading. The clock here runs from `opened_at`, the one
+    timestamp such a position still carries.
+
+    Scope is the same as everywhere else in this module: `broker.positions()`
+    only returns this bot's magic, so a position opened by hand or by another EA
+    is never touched.
+    """
+    managed = {ticket for trade in state.open_trades()
+               for ticket in trade.position_tickets}
+    for position in broker.positions():
+        if position.ticket in managed:
+            continue
+        timeframe = _orphan_timeframe(position.comment, frames)
+        frame = frames.get(timeframe) if timeframe else None
+        if frame is None or not len(frame):
+            continue
+        bars = signals.bars_since_moment(frame, position.opened_at)
+        if bars <= signals.TRADE_TIMEOUT_BARS:
+            continue
+        # An orphan is the position this bot knows least about, so it is also the
+        # likeliest to be refused — a holiday session, a symbol gone read-only, a
+        # ticket the broker has already retired. Letting that escape would abort
+        # the rest of the pass and surface as `CONNECTION_LOST`, whose remedy is
+        # a reconnect that cannot fix a rejection. Record it and carry on: the
+        # next pass tries again, and the other orphans still get their close.
+        try:
+            broker.close(position, "timeout 120 bars")
+        except MT5Error as error:
+            journal.write(JOURNAL_PATH, "orphan_timeout_rejected",
+                          ticket=position.ticket, reason=str(error))
+            print(f"[CLOSE_REJECTED] ticket={position.ticket} "
+                  f"reason={str(error)!r} scope='unmanaged position'")
+            continue
+        journal.write(JOURNAL_PATH, "orphan_timeout_closed", ticket=position.ticket,
+                      timeframe=timeframe, bars=bars,
+                      opened_at=str(position.opened_at), comment=position.comment)
+        print(f"[CLOSE_SUBMITTED] ticket={position.ticket} reason='timeout_120_bars' "
+              f"scope='unmanaged position' timeframe={timeframe} bars={bars} "
+              f"opened={position.opened_at:%Y-%m-%d %H:%M:%S}")
 
 
 def enforce_timeout(broker: Broker, state: BotState, frames: dict[str, pd.DataFrame]) -> None:
@@ -319,12 +414,24 @@ def enforce_timeout(broker: Broker, state: BotState, frames: dict[str, pd.DataFr
                 if ticket in open_positions]
         if not live:
             continue    # already gone; `reconcile_closed` will score it
+        closed = []
         for position in live:
-            broker.close(position, "timeout 120 bars")
-        journal.write(JOURNAL_PATH, "timeout_closed", plan_id=trade.plan_id,
-                      tickets=[position.ticket for position in live])
-        print(f"[CLOSE_SUBMITTED] plan={trade.plan_id} reason='timeout_120_bars' "
-              f"positions={[position.ticket for position in live]}")
+            # A refused close used to escape and leave the later legs of this
+            # timeout pass unattempted, even though each could still close.
+            try:
+                broker.close(position, "timeout 120 bars")
+            except MT5Error as error:
+                journal.write(JOURNAL_PATH, "timeout_close_rejected",
+                              ticket=position.ticket, reason=str(error))
+                print(f"[CLOSE_REJECTED] ticket={position.ticket} "
+                      f"reason={str(error)!r} scope='timeout_120_bars'")
+                continue
+            closed.append(position)
+        if closed:
+            journal.write(JOURNAL_PATH, "timeout_closed", plan_id=trade.plan_id,
+                          tickets=[position.ticket for position in closed])
+            print(f"[CLOSE_SUBMITTED] plan={trade.plan_id} reason='timeout_120_bars' "
+                  f"positions={[position.ticket for position in closed]}")
 
 
 def cancel_stale(broker: Broker, state: BotState, intent: Intent) -> None:
@@ -333,15 +440,29 @@ def cancel_stale(broker: Broker, state: BotState, intent: Intent) -> None:
     if trade is None or not trade.pending_tickets:
         return
     live = {order["ticket"] for order in broker.pending_orders()}
+    remaining = []
     for ticket in list(trade.pending_tickets):
         if ticket in live:
-            broker.cancel(ticket, intent.status)
-    trade.pending_tickets.clear()
-    if not trade.position_tickets:
+            # A refused cancel used to be forgotten below, leaving a working
+            # order unowned until it filled or the orphan path eventually saw it.
+            try:
+                broker.cancel(ticket, intent.status)
+            except MT5Error as error:
+                journal.write(JOURNAL_PATH, "cancel_rejected",
+                              ticket=ticket, reason=str(error))
+                print(f"[CANCEL_REJECTED] ticket={ticket} "
+                      f"reason={str(error)!r} scope='stale_pending'")
+                remaining.append(ticket)
+    trade.pending_tickets[:] = remaining
+    if not trade.pending_tickets and not trade.position_tickets:
         trade.closed = True
-    journal.write(JOURNAL_PATH, "pending_cancelled", plan_id=trade.plan_id,
-                  reason=intent.status)
-    print(f"[PENDING_CANCELLED] plan={trade.plan_id} reason={intent.status!r}")
+    if remaining:
+        print(f"[PENDING_CANCEL_INCOMPLETE] plan={trade.plan_id} tickets={remaining} "
+              f"reason={intent.status!r}")
+    else:
+        journal.write(JOURNAL_PATH, "pending_cancelled", plan_id=trade.plan_id,
+                      reason=intent.status)
+        print(f"[PENDING_CANCELLED] plan={trade.plan_id} reason={intent.status!r}")
 
 
 def reconcile_closed(broker: Broker, state: BotState) -> list[dict]:
@@ -390,14 +511,36 @@ def reconcile_closed(broker: Broker, state: BotState) -> list[dict]:
 
 def flatten_all(broker: Broker, state: BotState, reason: str) -> None:
     """Emergency exit: cancel everything working and close every position."""
+    refused = []
     for order in broker.pending_orders():
-        broker.cancel(order["ticket"], reason)
+        ticket = order["ticket"]
+        # One refusal used to abort the emergency exit and report a flat account
+        # while every later order and position was still exposed.
+        try:
+            broker.cancel(ticket, reason)
+        except MT5Error as error:
+            refused.append(ticket)
+            journal.write(JOURNAL_PATH, "flatten_rejected",
+                          ticket=ticket, reason=str(error))
+            print(f"[CANCEL_REJECTED] ticket={ticket} "
+                  f"reason={str(error)!r} scope='emergency_flatten'")
     for position in broker.positions():
-        broker.close(position, reason)
+        try:
+            broker.close(position, reason)
+        except MT5Error as error:
+            refused.append(position.ticket)
+            journal.write(JOURNAL_PATH, "flatten_rejected",
+                          ticket=position.ticket, reason=str(error))
+            print(f"[CLOSE_REJECTED] ticket={position.ticket} "
+                  f"reason={str(error)!r} scope='emergency_flatten'")
     for trade in state.open_trades():
-        trade.pending_tickets.clear()
-    journal.write(JOURNAL_PATH, "flatten_all", reason=reason)
-    print(f"[EMERGENCY_FLATTEN] submitted for every order and position | reason={reason!r}")
+        trade.pending_tickets[:] = [ticket for ticket in trade.pending_tickets
+                                    if ticket in refused]
+    journal.write(JOURNAL_PATH, "flatten_all", reason=reason, refused=refused)
+    if refused:
+        print(f"[EMERGENCY_FLATTEN] incomplete; refused={refused} | reason={reason!r}")
+    else:
+        print(f"[EMERGENCY_FLATTEN] submitted for every order and position | reason={reason!r}")
 
 
 def prune(state: BotState, keep: int = 200) -> None:

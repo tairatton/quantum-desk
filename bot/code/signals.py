@@ -80,5 +80,18 @@ def bars_since(frame: pd.DataFrame, bar_time: str) -> int:
     return int(len(frame) - 1 - matches[0])
 
 
+def bars_since_moment(frame: pd.DataFrame, moment) -> int:
+    """How many closed bars have printed after an arbitrary instant.
+
+    `bars_since` needs a timestamp that *is* a bar boundary and answers 0 for
+    anything else, which is the right answer for a plan anchored to its fill bar
+    but the wrong one for a position whose only timestamp is the moment it
+    opened. Counting bars rather than wall-clock hours is what makes the two
+    agree: 120 M30 bars is 60 trading hours, and a weekend is not part of it.
+    """
+    stamps = pd.to_datetime(frame["time"])
+    return int((stamps > pd.Timestamp(moment)).sum())
+
+
 TRADE_TIMEOUT_BARS = quantum.MAX_TRADE_BARS
 ENTRY_TIMEOUT_BARS = quantum.ENTRY_TIMEOUT

@@ -110,6 +110,15 @@ class Settings:
     magic: int = 20260726                # the bot only ever touches its own orders
     deviation_points: int = 30           # max slippage accepted on a market order
     entry_grace_seconds: int = 20        # wait after a bar closes before acting
+    # Minimum gap between two writes to the broker. `be_33_33_34` sends three
+    # orders for one signal, and three in the same instant reads as automated
+    # order flooding — brokers answer that with a temporary block, which would
+    # strand a partly-placed trade. One second is enough to break the burst and
+    # halves the price drift the last leg has to wear: on gold that drift is
+    # what the tight `deviation_points` guard rejects.
+    # This changes only the timing of the requests: entry, stop, targets and
+    # sizing are untouched, so the trade is still the one the study measured.
+    write_spacing_seconds: float = 1.0
     # The terminal is allowed roughly 2,000 server requests a day, so the loop
     # sleeps until the next bar close instead of polling continuously.
     poll_seconds: int = 60               # fallback heartbeat only
@@ -198,6 +207,8 @@ class Settings:
             errors.append("reconnect_initial_seconds must be > 0")
         if self.reconnect_max_seconds < self.reconnect_initial_seconds:
             errors.append("reconnect_max_seconds must be >= reconnect_initial_seconds")
+        if self.write_spacing_seconds < 0:
+            errors.append("write_spacing_seconds must be >= 0")
         if self.max_requests_per_day < 1:
             errors.append("max_requests_per_day must be >= 1")
         if self.news_minutes_before < 0 or self.news_minutes_after < 0:
