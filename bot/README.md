@@ -329,7 +329,7 @@ Capital tier เป็นตัวกำหนด exit:
 
 ### Position health, reconnect และ state
 
-`--status` คือแหล่งข้อมูลจริงสำหรับ account, exposure, risk room, news cache และ position health. หากพบ `UNTRACKED`, `MISSING_SL/TP`, `ALERT` หรือ `CHECK SETTINGS` ต้องแก้ก่อนเปิด live ใหม่
+`--status` คือแหล่งข้อมูลจริงสำหรับ account, exposure, risk room, news cache และ position health. หากพบ `UNTRACKED`, `MISSING_SL/TP`, `ALERT` หรือ `CHECK SETTINGS` ต้องแก้ก่อนเปิด live ใหม่. โดยเฉพาะ `UNTRACKED` ที่มี position เปิดอยู่: อย่า archive/recreate state ซ้ำแล้วปล่อยบอททำงานต่อ เพราะ SL/TP ยังอยู่ที่โบรกเกอร์ก็จริง แต่การเลื่อน break-even และ active timeout จะไม่ถูกดูแล; ต้องตรวจและรับ position นั้นเข้า state ก่อน
 
 State ถูกผูกกับ login/server เพื่อป้องกันนำ state จากบัญชีเดิมมาใช้ผิดบัญชี. เมื่อ MT5 หรือเครือข่ายหลุด บอทจะ reconnect แบบ backoff และ reconcile position/pending order; อย่างไรก็ดี SL/TP เท่านั้นที่อยู่ broker-side ส่วนการเลื่อน break-even เป็น client-side จึงต้องปล่อย MT5 และบอททำงานต่อเนื่อง
 
