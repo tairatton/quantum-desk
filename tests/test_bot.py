@@ -393,7 +393,8 @@ class StateTests(unittest.TestCase):
         state.trades["M30@x"] = ManagedTrade(
             plan_id="M30@x", timeframe="M30", direction=1, entry=4000.0, stop=3984.0,
             risk=16.0, risk_cash=400.0, targets=[4016.0, 4024.0, 4032.0],
-            legs=[0.08, 0.08, 0.09], position_tickets=[1, 2, 3])
+            legs=[0.08, 0.08, 0.09], position_tickets=[1, 2, 3],
+            tp1_position_ticket=1, tp1_pending_ticket=101)
         with tempfile.TemporaryDirectory() as folder:
             path = Path(folder) / "state.json"
             state.save(path)
@@ -401,6 +402,8 @@ class StateTests(unittest.TestCase):
         self.assertEqual(restored.initial_balance, 100_000)
         self.assertEqual(restored.trades["M30@x"].legs, [0.08, 0.08, 0.09])
         self.assertEqual(restored.trades["M30@x"].position_tickets, [1, 2, 3])
+        self.assertEqual(restored.trades["M30@x"].tp1_position_ticket, 1)
+        self.assertEqual(restored.trades["M30@x"].tp1_pending_ticket, 101)
 
     def test_seen_plan_ids_are_capped(self):
         state = BotState()

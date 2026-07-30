@@ -39,6 +39,16 @@ def _leg_targets(intent: Intent, leg_count: int, fallback_index: int) -> list[fl
     return list(intent.targets[:leg_count])
 
 
+def _position_target_index(trade: ManagedTrade, position: Position) -> int:
+    """Match a broker position to its planned target, independent of ticket order."""
+    if not trade.targets:
+        return 999
+    return min(
+        range(len(trade.targets)),
+        key=lambda index: abs(position.take_profit - trade.targets[index]),
+    )
+
+
 def _check_exit_mode(exit_mode: str, sizing, intent: Intent) -> str | None:
     """Reason to refuse the trade because it cannot honour `exit_mode`, or None.
 
@@ -156,6 +166,8 @@ def open_trade(broker: Broker, settings: Settings, state: BotState, intent: Inte
                 ticket = int(result.get("order") or 0)
                 if ticket:
                     trade.pending_tickets.append(ticket)
+                    if index == 1 and actual_exit_mode == "be_33_33_34":
+                        trade.tp1_pending_ticket = ticket
             placed = index
     except MT5Error as error:
         journal.write(JOURNAL_PATH, "leg_rejected", plan_id=trade.plan_id,
@@ -170,9 +182,20 @@ def open_trade(broker: Broker, settings: Settings, state: BotState, intent: Inte
             trade.fill_bar_time = intent.signal_time
             # Read the tickets back rather than trusting the order id to equal
             # the position id — brokers do not all agree on that.
-            trade.position_tickets = sorted(
-                position.ticket for position in broker.positions()
-                if position.ticket not in known)
+            opened = [
+                position for position in broker.positions()
+                if position.ticket not in known
+            ]
+            opened.sort(key=lambda position: (
+                _position_target_index(trade, position), position.ticket,
+            ))
+            trade.position_tickets = [position.ticket for position in opened]
+            if opened and actual_exit_mode == "be_33_33_34":
+                tp1 = min(opened, key=lambda position: (
+                    _position_target_index(trade, position), position.ticket,
+                ))
+                if _position_target_index(trade, tp1) == 0:
+                    trade.tp1_position_ticket = tp1.ticket
             if trade.position_tickets:
                 state.count_trading_day()
         if not trade.position_tickets and not trade.pending_tickets:
@@ -238,9 +261,11 @@ def sync_fills(broker: Broker, state: BotState,
 
         trade.pending_tickets = [ticket for ticket in original
                                  if ticket in live_orders or ticket in unresolved_orders]
-        for position_ticket in filled_positions:
+        for order_ticket, position_ticket in zip(filled_orders, filled_positions):
             if position_ticket not in trade.position_tickets:
                 trade.position_tickets.append(position_ticket)
+            if order_ticket == trade.tp1_pending_ticket:
+                trade.tp1_position_ticket = position_ticket
         changed = changed or trade.pending_tickets != original
 
         if filled_positions:
@@ -298,40 +323,74 @@ def apply_breakeven(broker: Broker, state: BotState) -> None:
     protect, and moving that single stop to entry would exit at break-even a
     trade the measured policy carries all the way to TP3.
     """
+    # A dry-run Broker reports the account's real positions but simulates every
+    # write. Marking those positions protected would corrupt durable live state
+    # even though no modification reached MT5.
+    if broker.dry_run:
+        return
+
     open_positions = {position.ticket: position for position in broker.positions()}
     for trade in state.open_trades():
-        if trade.breakeven_done or len(trade.position_tickets) < 2:
+        if trade.exit_mode != "be_33_33_34" or len(trade.position_tickets) < 2:
             continue
-        first, *rest = trade.position_tickets
-        if first in open_positions:
+        tp1_ticket = trade.tp1_position_ticket or trade.position_tickets[0]
+        if tp1_ticket in open_positions:
             continue
-        survivors = [open_positions[ticket] for ticket in rest if ticket in open_positions]
+        survivors = [
+            open_positions[ticket]
+            for ticket in trade.position_tickets
+            if ticket != tp1_ticket and ticket in open_positions
+        ]
         if not survivors:
             continue
+        desired_stop = round(trade.entry, broker.spec.digits)
         moved = []
+        rejected = []
+        already_protected = []
         for position in survivors:
-            improves = (trade.entry > position.stop if trade.direction == 1
-                        else trade.entry < position.stop)
+            improves = (desired_stop > position.stop if trade.direction == 1
+                        else desired_stop < position.stop)
             if improves:
-                # A refused move used to escape and stop later survivor legs from
-                # reaching break-even, then marked the whole trade protected.
                 try:
-                    broker.move_stop(position, trade.entry)
+                    broker.move_stop(position, desired_stop)
                 except MT5Error as error:
                     journal.write(JOURNAL_PATH, "breakeven_rejected",
                                   ticket=position.ticket, reason=str(error))
                     print(f"[STOP_REJECTED] ticket={position.ticket} "
                           f"reason={str(error)!r} scope='break_even'")
+                    rejected.append(position.ticket)
                     continue
                 moved.append(position)
-        if not moved:
+            else:
+                # A previous process may have moved this leg at the broker and
+                # crashed before persisting `breakeven_done`. Treat a stop at or
+                # beyond entry as protected so startup reconciliation is
+                # idempotent and can repair the local state without another
+                # broker write.
+                already_protected.append(position.ticket)
+
+        # Do not claim the transition is complete when only some survivor legs
+        # accepted the modification. Leaving the flag false makes the next
+        # management pass retry only the legs that are still below break-even.
+        if rejected:
+            # Older versions could persist True after only one survivor moved.
+            # Clear that stale flag so fast split polling becomes active again.
+            trade.breakeven_done = False
+            continue
+        if trade.breakeven_done and not moved:
             continue
         trade.breakeven_done = True
         journal.write(JOURNAL_PATH, "breakeven", plan_id=trade.plan_id,
-                      tickets=[position.ticket for position in moved],
-                      stop=trade.entry)
-        print(f"[STOP_MOVED] plan={trade.plan_id} mode=BREAK_EVEN stop={trade.entry} "
-              f"positions={[position.ticket for position in moved]}")
+                      tickets=[position.ticket for position in survivors],
+                      moved_tickets=[position.ticket for position in moved],
+                      already_protected=already_protected,
+                      stop=desired_stop)
+        if moved:
+            print(f"[STOP_MOVED] plan={trade.plan_id} mode=BREAK_EVEN stop={desired_stop} "
+                  f"positions={[position.ticket for position in moved]}")
+        else:
+            print(f"[STOP_CONFIRMED] plan={trade.plan_id} mode=BREAK_EVEN "
+                  f"stop={desired_stop} positions={already_protected}")
 
 
 def _orphan_timeframe(comment: str, frames: dict[str, pd.DataFrame]) -> str | None:

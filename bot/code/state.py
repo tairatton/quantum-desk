@@ -28,6 +28,11 @@ class ManagedTrade:
     legs: list[float]
     position_tickets: list[int] = field(default_factory=list)
     pending_tickets: list[int] = field(default_factory=list)
+    # TP1 identity is persisted separately from list order. Pending fills can
+    # become visible to MT5 history out of order, so "first position ticket" is
+    # not a safe long-term definition of the TP1 leg.
+    tp1_position_ticket: int | None = None
+    tp1_pending_ticket: int | None = None
     filled_at: str | None = None
     fill_bar_time: str | None = None
     breakeven_done: bool = False

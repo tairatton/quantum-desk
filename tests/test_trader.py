@@ -251,6 +251,32 @@ class TraderPathsTests(unittest.TestCase):
         self.assertEqual(trade.position_tickets, position_tickets)
         self.assertEqual(self.state.trading_days, ["2026-06-01"])
 
+    def test_out_of_order_pending_fills_keep_the_real_tp1_identity(self):
+        broker = FakeBroker()
+        trade = trader.open_trade(
+            broker, self.settings, self.state, intent("limit"), 100_000.0,
+        )
+        tp1_order, tp2_order, _ = list(trade.pending_tickets)
+
+        tp2_position = broker.fill_order(tp2_order)
+        trader.sync_fills(broker, self.state, {"M15": bars(300)})
+        tp1_position = broker.fill_order(tp1_order)
+        trader.sync_fills(broker, self.state, {"M15": bars(300)})
+
+        # Position discovery order is TP2 then TP1, but the durable identity
+        # must still point at the actual TP1 leg.
+        self.assertEqual(trade.position_tickets[:2], [tp2_position, tp1_position])
+        self.assertEqual(trade.tp1_position_ticket, tp1_position)
+
+        broker._positions = [
+            position for position in broker._positions
+            if position.ticket != tp1_position
+        ]
+        trader.apply_breakeven(broker, self.state)
+
+        self.assertIn((tp2_position, trade.entry), broker.stops_moved)
+        self.assertTrue(trade.breakeven_done)
+
     def test_missing_pending_order_waits_when_mt5_history_is_not_ready(self):
         broker = FakeBroker()
         trade = trader.open_trade(broker, self.settings, self.state,
@@ -297,7 +323,8 @@ class TraderPathsTests(unittest.TestCase):
 
     def test_one_rejected_breakeven_move_does_not_abort_the_other_survivor(self):
         """The first refusal escaped the loop, so the other survivor kept its
-        original stop even though the broker would have accepted its move."""
+        original stop even though the broker would have accepted its move. The
+        trade must remain retryable until every survivor is protected."""
         class PickyBroker(FakeBroker):
             def move_stop(self, position, stop):
                 if position.ticket == rejected:
@@ -310,7 +337,179 @@ class TraderPathsTests(unittest.TestCase):
         broker._positions = [position for position in broker._positions if position.ticket != first]
         trader.apply_breakeven(broker, self.state)
         self.assertEqual(broker.stops_moved, [(accepted, trade.entry)])
+        self.assertFalse(trade.breakeven_done)
+
+    def test_partial_breakeven_is_retried_until_every_survivor_is_protected(self):
+        class RetryBroker(FakeBroker):
+            refused_once = False
+
+            def move_stop(self, position, stop):
+                if position.ticket == retried and not self.refused_once:
+                    self.refused_once = True
+                    raise MT5Error("move stop rejected: retcode=10004 Requote")
+                return super().move_stop(position, stop)
+
+        broker = RetryBroker()
+        trade = trader.open_trade(broker, self.settings, self.state, intent(), 100_000.0)
+        first, retried, accepted = trade.position_tickets
+        broker._positions = [position for position in broker._positions if position.ticket != first]
+
+        trader.apply_breakeven(broker, self.state)
+        self.assertFalse(trade.breakeven_done)
+        self.assertEqual(broker.stops_moved, [(accepted, trade.entry)])
+
+        trader.apply_breakeven(broker, self.state)
         self.assertTrue(trade.breakeven_done)
+        self.assertEqual(
+            broker.stops_moved,
+            [(accepted, trade.entry), (retried, trade.entry)],
+        )
+
+    def test_a_stale_done_flag_is_repaired_when_a_survivor_is_not_at_be(self):
+        broker = FakeBroker()
+        trade = trader.open_trade(broker, self.settings, self.state, intent(), 100_000.0)
+        first, *survivors = trade.position_tickets
+        broker._positions = [
+            position for position in broker._positions if position.ticket != first
+        ]
+        # A prior release could write this after only one successful move.
+        trade.breakeven_done = True
+
+        trader.apply_breakeven(broker, self.state)
+
+        self.assertEqual(
+            sorted(ticket for ticket, _ in broker.stops_moved),
+            sorted(survivors),
+        )
+        self.assertTrue(trade.breakeven_done)
+
+    def test_a_failed_stale_flag_repair_reactivates_fast_polling(self):
+        class RefusingBroker(FakeBroker):
+            def move_stop(self, position, stop):
+                raise MT5Error("move stop rejected: retcode=10018 Market closed")
+
+        broker = RefusingBroker()
+        trade = trader.open_trade(broker, self.settings, self.state, intent(), 100_000.0)
+        first, *_ = trade.position_tickets
+        broker._positions = [
+            position for position in broker._positions if position.ticket != first
+        ]
+        trade.breakeven_done = True
+
+        trader.apply_breakeven(broker, self.state)
+
+        self.assertFalse(trade.breakeven_done)
+        self.assertTrue(run.needs_split_management(self.state))
+
+    def test_dry_run_cannot_mark_real_survivors_as_protected(self):
+        broker = FakeBroker()
+        trade = trader.open_trade(broker, self.settings, self.state, intent(), 100_000.0)
+        first, *_ = trade.position_tickets
+        broker._positions = [
+            position for position in broker._positions if position.ticket != first
+        ]
+        broker.dry_run = True
+
+        trader.apply_breakeven(broker, self.state)
+
+        self.assertEqual(broker.stops_moved, [])
+        self.assertFalse(trade.breakeven_done)
+
+    def test_be_comparison_uses_the_price_precision_sent_to_the_broker(self):
+        broker = FakeBroker(_positions=[
+            FakePos(ticket=102, stop=4000.0),
+            FakePos(ticket=103, stop=4000.0),
+        ])
+        trade = ManagedTrade(
+            plan_id="M15@rounded", timeframe="M15", direction=1,
+            entry=4000.0004, stop=3984.0, risk=16.0004, risk_cash=400.0,
+            targets=[4016.0, 4024.0, 4032.0], legs=[0.08, 0.08, 0.09],
+            position_tickets=[101, 102, 103], exit_mode="be_33_33_34",
+        )
+        self.state.trades[trade.plan_id] = trade
+
+        trader.apply_breakeven(broker, self.state)
+
+        self.assertEqual(broker.stops_moved, [])
+        self.assertTrue(trade.breakeven_done)
+
+    def test_startup_reconciliation_moves_survivors_after_offline_tp1(self):
+        class StartupBroker(FakeBroker):
+            requests = 0
+
+            def account(self):
+                return {
+                    "login": 1, "server": "test",
+                    "balance": 100_000.0, "equity": 100_000.0,
+                }
+
+            def bars(self, timeframe, count):
+                return bars(count)
+
+            def take_requests(self):
+                return 0
+
+        broker = StartupBroker()
+        trade = trader.open_trade(broker, self.settings, self.state, intent(), 100_000.0)
+        first, *survivors = trade.position_tickets
+        broker._positions = [
+            position for position in broker._positions if position.ticket != first
+        ]
+        config_ = SimpleNamespace(
+            timeframes=("M15",), history_bars=300, initial_balance=100_000.0,
+        )
+
+        with mock.patch.object(
+                run, "_bind_and_anchor",
+                return_value=(broker.tick(), broker.account())), \
+                mock.patch.object(run, "STATE_PATH",
+                                  Path(self.tmp.name) / "startup-state.json"), \
+                mock.patch.object(run, "JOURNAL_PATH",
+                                  Path(self.tmp.name) / "startup-journal.jsonl"):
+            run.reconcile_startup(broker, self.state, config_)
+
+        self.assertEqual(
+            sorted(ticket for ticket, _ in broker.stops_moved),
+            sorted(survivors),
+        )
+        self.assertTrue(trade.breakeven_done)
+
+    def test_startup_protects_known_survivors_even_if_bar_loading_fails(self):
+        class FailingBarsBroker(FakeBroker):
+            requests = 0
+
+            def account(self):
+                return {
+                    "login": 1, "server": "test",
+                    "balance": 100_000.0, "equity": 100_000.0,
+                }
+
+            def bars(self, timeframe, count):
+                raise MT5Error("price history unavailable")
+
+        broker = FailingBarsBroker()
+        trade = trader.open_trade(broker, self.settings, self.state, intent(), 100_000.0)
+        tp1 = trade.tp1_position_ticket
+        survivors = [
+            ticket for ticket in trade.position_tickets if ticket != tp1
+        ]
+        broker._positions = [
+            position for position in broker._positions if position.ticket != tp1
+        ]
+        config_ = SimpleNamespace(
+            timeframes=("M15",), history_bars=300, initial_balance=100_000.0,
+        )
+
+        with mock.patch.object(
+                run, "_bind_and_anchor",
+                return_value=(broker.tick(), broker.account())):
+            with self.assertRaisesRegex(MT5Error, "price history unavailable"):
+                run.reconcile_startup(broker, self.state, config_)
+
+        self.assertEqual(
+            sorted(ticket for ticket, _ in broker.stops_moved),
+            sorted(survivors),
+        )
 
     def test_all_rejected_breakeven_moves_leave_the_trade_retryable(self):
         """The unconditional flag said break-even was done after a refusal, so

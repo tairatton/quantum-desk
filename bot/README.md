@@ -331,7 +331,7 @@ Capital tier เป็นตัวกำหนด exit:
 
 `--status` คือแหล่งข้อมูลจริงสำหรับ account, exposure, risk room, news cache และ position health. หากพบ `UNTRACKED`, `MISSING_SL/TP`, `ALERT` หรือ `CHECK SETTINGS` ต้องแก้ก่อนเปิด live ใหม่. โดยเฉพาะ `UNTRACKED` ที่มี position เปิดอยู่: อย่า archive/recreate state ซ้ำแล้วปล่อยบอททำงานต่อ เพราะ SL/TP ยังอยู่ที่โบรกเกอร์ก็จริง แต่การเลื่อน break-even และ active timeout จะไม่ถูกดูแล; ต้องตรวจและรับ position นั้นเข้า state ก่อน
 
-State ถูกผูกกับ login/server เพื่อป้องกันนำ state จากบัญชีเดิมมาใช้ผิดบัญชี. เมื่อ MT5 หรือเครือข่ายหลุด บอทจะ reconnect แบบ backoff และ reconcile position/pending order; อย่างไรก็ดี SL/TP เท่านั้นที่อยู่ broker-side ส่วนการเลื่อน break-even เป็น client-side จึงต้องปล่อย MT5 และบอททำงานต่อเนื่อง
+State ถูกผูกกับ login/server เพื่อป้องกันนำ state จากบัญชีเดิมมาใช้ผิดบัญชี. เมื่อ MT5 หรือเครือข่ายหลุด บอทจะ reconnect แบบ backoff และ reconcile position/pending order; หาก TP1 ปิดระหว่างที่เครื่องหรือบอทหยุด การเปิดบอทครั้งถัดไปจะตรวจออเดอร์เดิมและเลื่อน SL ของ TP2/TP3 ไป break-even ทันทีใน startup sync. อย่างไรก็ดี SL/TP เท่านั้นที่อยู่ broker-side ส่วนการเลื่อน break-even เป็น client-side จึงควรปล่อย MT5 และบอททำงานต่อเนื่อง
 
 บอทเก็บ audit log แบบ append-only ที่ `bot/code/journal.jsonl` โดยไม่บันทึกรหัสผ่าน. เหตุการณ์สำคัญ เช่น เริ่ม/หยุดบอท, ผูกบัญชี, startup sync, heartbeat, เปิด/filled/cancelled order, เลื่อน SL ไป break-even, guard block และการ reconnect จะถูกบันทึกไว้เพื่อย้อนตรวจภายหลัง. ดู 100 รายการล่าสุดได้ด้วย:
 
@@ -367,4 +367,4 @@ Get-Content bot\code\journal.jsonl -Tail 100
 - News cache, holiday schedule และ weekly-close setting ต้องตรวจจาก `--status` เป็นระยะ
 - บอทยังไม่รองรับหลาย symbol ใน process เดียว
 - ไม่มี trailing stop นอกจาก break-even หลัง TP1
-- หากเครื่องหรือบอทหยุดทำงาน การเลื่อน break-even จะหยุดตาม แต่ SL/TP ที่ส่งให้โบรกเกอร์ยังคงอยู่
+- หากเครื่องหรือบอทหยุดทำงาน การเลื่อน break-even จะหยุดตาม แต่ SL/TP ที่ส่งให้โบรกเกอร์ยังคงอยู่; เมื่อเปิดบอทใหม่ startup sync จะตรวจ TP1 และเลื่อนส่วนที่เหลือทันที

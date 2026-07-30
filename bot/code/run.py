@@ -717,18 +717,26 @@ def _bind_and_anchor(broker: Broker, state: BotState, config_):
 
 
 def reconcile_startup(broker: Broker, state: BotState, config_) -> None:
-    """Adopt fills that happened while the bot was not running.
+    """Adopt fills and catch up exit management after the bot was not running.
 
     A pending three-leg setup may fill between runs.  The old startup sequence
     printed a heartbeat and then slept until the next bar before calling
     ``sync_fills``; during that window all three live legs looked untracked and
-    could not receive split-exit management.  This deliberately performs only
-    account/state and order lifecycle work—never signal evaluation or entries.
+    could not receive split-exit management. TP1 may also close while the
+    computer is down, so break-even is reconciled here before any wait. This
+    deliberately performs only account/state and order lifecycle work—never
+    signal evaluation or entries.
     """
     _, account = _bind_and_anchor(broker, state, config_)
+    # Protect already-mapped market positions before loading bars. A temporary
+    # history/feed failure must not postpone a broker-side stop modification.
+    trader.apply_breakeven(broker, state)
     frames = {timeframe: broker.bars(timeframe, config_.history_bars)
               for timeframe in config_.timeframes}
     trader.sync_fills(broker, state, frames)
+    # A pending TP1 may only become identifiable after sync_fills maps its order
+    # ticket to the resulting position ticket, so check once more after sync.
+    trader.apply_breakeven(broker, state)
     state.day_requests += broker.take_requests()
     state.save(STATE_PATH)
     journal.write(
@@ -740,16 +748,22 @@ def reconcile_startup(broker: Broker, state: BotState, config_) -> None:
         pending_tickets=[ticket for trade in state.open_trades()
                          for ticket in trade.pending_tickets],
     )
-    print("[STARTUP_SYNC] existing pending orders reconciled before signal loop")
+    print("[STARTUP_SYNC] existing positions, pending orders, and break-even "
+          "reconciled before signal loop")
 
 
 def pass_once(broker: Broker, state: BotState, config_) -> None:
     quote, account = _bind_and_anchor(broker, state, config_)
 
     # Housekeeping first: an open trade must be managed even when new entries are off.
+    # Known split positions can be protected without bar data. Do this before
+    # loading history so a restored MT5 position channel is useful even if the
+    # chart/feed channel is still recovering.
+    trader.apply_breakeven(broker, state)
     frames = {timeframe: broker.bars(timeframe, config_.history_bars)
               for timeframe in config_.timeframes}
     trader.sync_fills(broker, state, frames)
+    # Newly mapped pending fills need the same check after sync.
     trader.apply_breakeven(broker, state)
     trader.enforce_timeout(broker, state, frames)
     trader.enforce_orphan_timeout(broker, state, frames)

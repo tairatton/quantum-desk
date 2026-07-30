@@ -3,18 +3,22 @@
   "account_server": "FTMO-Demo",
   "initial_balance": 50000.0,
   "server_utc_offset": 3.0,
-  "day_key": "2026-07-29",
-  "day_start_balance": 49999.76,
-  "day_start_equity": 50037.23,
+  "day_key": "2026-07-30",
+  "day_start_balance": 50359.65,
+  "day_start_equity": 50484.0,
   "day_realised": 0.0,
-  "day_requests": 348,
+  "day_requests": 34,
   "consecutive_losses": 0,
   "halted_forever": false,
   "halted_reason": "",
   "paused_until_day": "",
-  "trading_days": [],
+  "trading_days": [
+    "2026-07-29"
+  ],
   "seen_plan_ids": [
-    "M30@2026-07-28 15:00:00"
+    "M30@2026-07-28 15:00:00",
+    "M15@2026-07-29 21:00:00",
+    "M30@2026-07-29 22:30:00"
   ],
   "trades": {
     "M30@2026-07-28 15:00:00": {
@@ -43,7 +47,69 @@
       "pending_tickets": [],
       "filled_at": "2026-07-28 15:20:20",
       "fill_bar_time": "2026-07-28 15:00:00",
-      "breakeven_done": false,
+      "breakeven_done": true,
+      "closed": true,
+      "dry_run": false,
+      "exit_mode": "be_33_33_34"
+    },
+    "M15@2026-07-29 21:00:00": {
+      "plan_id": "M15@2026-07-29 21:00:00",
+      "timeframe": "M15",
+      "direction": 1,
+      "entry": 4058.46,
+      "stop": 4028.8110112360914,
+      "risk": 29.648988763908676,
+      "risk_cash": 207.54,
+      "targets": [
+        4088.1089887639087,
+        4102.933483145863,
+        4117.757977527817
+      ],
+      "legs": [
+        0.02,
+        0.02,
+        0.03
+      ],
+      "position_tickets": [
+        507467177,
+        507467196,
+        507467215
+      ],
+      "pending_tickets": [],
+      "filled_at": "2026-07-29 21:45:20",
+      "fill_bar_time": "2026-07-29 21:30:00",
+      "breakeven_done": true,
+      "closed": true,
+      "dry_run": false,
+      "exit_mode": "be_33_33_34"
+    },
+    "M30@2026-07-29 22:30:00": {
+      "plan_id": "M30@2026-07-29 22:30:00",
+      "timeframe": "M30",
+      "direction": 1,
+      "entry": 4044.77,
+      "stop": 3995.4411360141544,
+      "risk": 49.32886398584578,
+      "risk_cash": 197.32,
+      "targets": [
+        4094.0988639858456,
+        4118.763295978769,
+        4143.427727971692
+      ],
+      "legs": [
+        0.01,
+        0.01,
+        0.02
+      ],
+      "position_tickets": [
+        507634721,
+        507634850,
+        507634905
+      ],
+      "pending_tickets": [],
+      "filled_at": "2026-07-29 23:00:24",
+      "fill_bar_time": "2026-07-29 22:30:00",
+      "breakeven_done": true,
       "closed": false,
       "dry_run": false,
       "exit_mode": "be_33_33_34"
