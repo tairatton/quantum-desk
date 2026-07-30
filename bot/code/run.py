@@ -27,9 +27,12 @@ from xau.mt5_source import MT5Error
 from . import (guardrails, journal, market_hours, news,
                settings as settings_module, signals, trader)
 from .broker import Broker, OrderRejected
-from .settings import JOURNAL_PATH, KILL_SWITCH, STATE_PATH
+from .instance_lock import LiveInstanceLock
+from .settings import BOT_DIR, JOURNAL_PATH, KILL_SWITCH, STATE_PATH
 from .sizing import open_risk_percent
 from .state import BotState
+
+LIVE_LOCK_PATH = BOT_DIR / ".live.lock"
 
 
 class _Ansi:
@@ -293,11 +296,13 @@ def active_setup_count(state: BotState, positions, orders) -> int:
     for trade in state.open_trades():
         trade_positions = set(trade.position_tickets)
         trade_orders = set(trade.pending_tickets)
+        unresolved_market_orders = set(trade.market_order_tickets)
         managed_positions.update(trade_positions)
         managed_orders.update(trade_orders)
         if (trade_positions & live_position_tickets
                 or trade_orders & live_order_tickets
-                or trade_positions or trade_orders):
+                or trade_positions or trade_orders
+                or unresolved_market_orders):
             managed_setups += 1
     untracked = len(live_position_tickets - managed_positions)
     untracked += len(live_order_tickets - managed_orders)
@@ -305,11 +310,15 @@ def active_setup_count(state: BotState, positions, orders) -> int:
 
 
 def needs_split_management(state: BotState) -> bool:
-    """Whether a live three-leg trade is still waiting for its BE transition."""
+    """Whether a split trade still needs ticket sync or its BE transition."""
     return any(
         trade.exit_mode == "be_33_33_34"
         and not trade.breakeven_done
-        and len(trade.position_tickets) >= 2
+        and (
+            len(trade.position_tickets) >= 2
+            or bool(trade.pending_tickets)
+            or bool(trade.market_order_tickets)
+        )
         for trade in state.open_trades()
     )
 
@@ -462,6 +471,10 @@ def sleep_and_manage_split(broker: Broker, state: BotState, config_,
         remaining -= interval
         if remaining <= 0 or not fast or budget_near_limit:
             continue
+        # A pending fill or a market order whose position visibility lagged
+        # cannot be managed until its order ticket is mapped. Reconcile tickets
+        # in the same fast loop that watches for TP1, then move survivors.
+        trader.sync_fills(broker, state)
         trader.apply_breakeven(broker, state)
         state.day_requests += broker.take_requests()
         state.save(STATE_PATH)
@@ -731,6 +744,16 @@ def reconcile_startup(broker: Broker, state: BotState, config_) -> None:
     # Protect already-mapped market positions before loading bars. A temporary
     # history/feed failure must not postpone a broker-side stop modification.
     trader.apply_breakeven(broker, state)
+    unresolved_tickets = any(
+        trade.market_order_tickets or trade.pending_tickets
+        for trade in state.open_trades()
+    )
+    if unresolved_tickets:
+        # Deal/order history does not need chart bars. Recover identities first
+        # so a hard placement crash can still reach BE while the price-history
+        # channel is unavailable.
+        trader.sync_fills(broker, state)
+        trader.apply_breakeven(broker, state)
     frames = {timeframe: broker.bars(timeframe, config_.history_bars)
               for timeframe in config_.timeframes}
     trader.sync_fills(broker, state, frames)
@@ -747,6 +770,8 @@ def reconcile_startup(broker: Broker, state: BotState, config_) -> None:
                           for ticket in trade.position_tickets],
         pending_tickets=[ticket for trade in state.open_trades()
                          for ticket in trade.pending_tickets],
+        market_order_tickets=[ticket for trade in state.open_trades()
+                              for ticket in trade.market_order_tickets],
     )
     print("[STARTUP_SYNC] existing positions, pending orders, and break-even "
           "reconciled before signal loop")
@@ -760,6 +785,13 @@ def pass_once(broker: Broker, state: BotState, config_) -> None:
     # loading history so a restored MT5 position channel is useful even if the
     # chart/feed channel is still recovering.
     trader.apply_breakeven(broker, state)
+    unresolved_tickets = any(
+        trade.market_order_tickets or trade.pending_tickets
+        for trade in state.open_trades()
+    )
+    if unresolved_tickets:
+        trader.sync_fills(broker, state)
+        trader.apply_breakeven(broker, state)
     frames = {timeframe: broker.bars(timeframe, config_.history_bars)
               for timeframe in config_.timeframes}
     trader.sync_fills(broker, state, frames)
@@ -995,29 +1027,43 @@ def execute(*, live: bool = False, once: bool = False, status: bool = False,
     Separate from `main` so `bot.main`'s menu can ask for an action directly
     rather than assembling command-line strings and re-parsing them.
     """
-    config_ = settings_module.load()
-    state = BotState.load(STATE_PATH)
+    instance_lock = LiveInstanceLock(LIVE_LOCK_PATH) if live else None
+    if instance_lock is not None and not instance_lock.acquire():
+        message = "another Quantum Desk LIVE process is already running"
+        print(status_line("BLOCKED", message, "error"))
+        raise SystemExit(f"blocked: {message}")
+    try:
+        config_ = settings_module.load()
+        state = BotState.load(STATE_PATH)
+        if not live:
+            # Dry-run may mutate its in-memory copy while simulating lifecycle
+            # events, but it must never mark production plans seen/closed or
+            # race a live process by replacing state.json.
+            state.disable_persistence()
 
-    with Broker(config_.symbol, config_.magic, config_.deviation_points,
-                dry_run=not live,
-                write_spacing_seconds=config_.write_spacing_seconds) as broker:
-        if status:
+        with Broker(config_.symbol, config_.magic, config_.deviation_points,
+                    dry_run=not live,
+                    write_spacing_seconds=config_.write_spacing_seconds) as broker:
+            if status:
+                print_status(broker, state, config_)
+                account = broker.account()
+                journal.write(JOURNAL_PATH, "status_checked", mode="DRY-RUN",
+                              login=account["login"], server=account["server"])
+                return
+            if flatten:
+                trader.flatten_all(broker, state, "manual flatten")
+                state.save(STATE_PATH)
+                return
+            reconcile_startup(broker, state, config_)
             print_status(broker, state, config_)
-            account = broker.account()
-            journal.write(JOURNAL_PATH, "status_checked", mode="DRY-RUN",
-                          login=account["login"], server=account["server"])
-            return
-        if flatten:
-            trader.flatten_all(broker, state, "manual flatten")
+            if once:
+                pass_once(broker, state, config_)
+            else:
+                loop(broker, state, config_)
             state.save(STATE_PATH)
-            return
-        reconcile_startup(broker, state, config_)
-        print_status(broker, state, config_)
-        if once:
-            pass_once(broker, state, config_)
-        else:
-            loop(broker, state, config_)
-        state.save(STATE_PATH)
+    finally:
+        if instance_lock is not None:
+            instance_lock.release()
 
 
 def main(argv: list[str] | None = None) -> None:

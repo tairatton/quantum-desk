@@ -23,7 +23,21 @@ def write(path: Path, event: str, **payload) -> dict:
 def read(path: Path) -> list[dict]:
     if not path.exists():
         return []
-    return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line]
+    lines = path.read_text(encoding="utf-8").splitlines()
+    records = []
+    for index, line in enumerate(lines):
+        if not line:
+            continue
+        try:
+            records.append(json.loads(line))
+        except json.JSONDecodeError:
+            # Append-only logs can end with half a JSON object if power is lost
+            # during the final write. Ignore only that final torn record; an
+            # invalid interior row is genuine corruption and must still fail.
+            if index == len(lines) - 1:
+                continue
+            raise
+    return records
 
 
 def summarise(path: Path) -> dict:

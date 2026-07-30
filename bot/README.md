@@ -74,6 +74,11 @@ python -m bot.code.run --flatten --live
 - `--once` เป็น dry-run หนึ่งรอบ
 - ไม่ใส่ flag เป็น dry-run แบบวนลูป
 - `--flatten --live` ยกเลิก order และปิด position ของบอท เป็นคำสั่งฉุกเฉิน
+
+ทุกช่องทางที่ใช้ `--live` ใช้ instance lock เดียวกัน จึงไม่สามารถเปิดสอง
+process เพื่อส่งออเดอร์พร้อมกันได้ ส่วน dry-run ใช้ state ในหน่วยความจำและไม่
+เขียนทับ `state.json` ของ production
+
 ## Terminal status และ notifications
 
 ข้อความระหว่างรันเป็น English ทั้งหมดและใช้ event label คงที่:

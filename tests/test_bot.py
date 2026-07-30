@@ -394,6 +394,7 @@ class StateTests(unittest.TestCase):
             plan_id="M30@x", timeframe="M30", direction=1, entry=4000.0, stop=3984.0,
             risk=16.0, risk_cash=400.0, targets=[4016.0, 4024.0, 4032.0],
             legs=[0.08, 0.08, 0.09], position_tickets=[1, 2, 3],
+            market_order_tickets=[201], tp1_market_order_ticket=201,
             tp1_position_ticket=1, tp1_pending_ticket=101)
         with tempfile.TemporaryDirectory() as folder:
             path = Path(folder) / "state.json"
@@ -402,8 +403,41 @@ class StateTests(unittest.TestCase):
         self.assertEqual(restored.initial_balance, 100_000)
         self.assertEqual(restored.trades["M30@x"].legs, [0.08, 0.08, 0.09])
         self.assertEqual(restored.trades["M30@x"].position_tickets, [1, 2, 3])
+        self.assertEqual(restored.trades["M30@x"].market_order_tickets, [201])
+        self.assertEqual(restored.trades["M30@x"].tp1_market_order_ticket, 201)
         self.assertEqual(restored.trades["M30@x"].tp1_position_ticket, 1)
         self.assertEqual(restored.trades["M30@x"].tp1_pending_ticket, 101)
+
+    def test_load_reopens_a_closed_trade_with_unresolved_market_orders(self):
+        import json
+        import tempfile
+
+        payload = {
+            "trades": {
+                "M15@lagged": {
+                    "plan_id": "M15@lagged",
+                    "timeframe": "M15",
+                    "direction": 1,
+                    "entry": 4000.0,
+                    "stop": 3984.0,
+                    "risk": 16.0,
+                    "risk_cash": 400.0,
+                    "targets": [4016.0, 4024.0, 4032.0],
+                    "legs": [0.08, 0.08, 0.09],
+                    "market_order_tickets": [201, 202, 203],
+                    "closed": True,
+                    "exit_mode": "be_33_33_34",
+                },
+            },
+        }
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "state.json"
+            path.write_text(json.dumps(payload), encoding="utf-8")
+            restored = BotState.load(path)
+
+        trade = restored.trades["M15@lagged"]
+        self.assertFalse(trade.closed)
+        self.assertIn(trade, restored.open_trades())
 
     def test_seen_plan_ids_are_capped(self):
         state = BotState()
@@ -436,6 +470,24 @@ class StateTests(unittest.TestCase):
             self.assertFalse(path.with_name("state.json.tmp").exists())
             self.assertEqual(BotState.load(path).initial_balance, 50_000)
 
+    def test_dry_run_state_mutations_cannot_replace_production_state(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "state.json"
+            live_state = BotState(initial_balance=50_000)
+            live_state.save(path)
+
+            rehearsal = BotState.load(path)
+            rehearsal.disable_persistence()
+            rehearsal.initial_balance = 1.0
+            rehearsal.seen_plan_ids.append("dry-only")
+            rehearsal.save(path)
+
+            restored = BotState.load(path)
+            self.assertEqual(restored.initial_balance, 50_000)
+            self.assertNotIn("dry-only", restored.seen_plan_ids)
+
     def test_invalid_production_settings_fail_loudly(self):
         from dataclasses import replace
 
@@ -443,6 +495,29 @@ class StateTests(unittest.TestCase):
             replace(Settings(), risk_percent=1.0, max_open_risk_percent=0.5)
         with self.assertRaisesRegex(ValueError, "reconnect_max_seconds"):
             replace(Settings(), reconnect_initial_seconds=60, reconnect_max_seconds=10)
+
+    def test_journal_ignores_only_a_torn_final_record(self):
+        import tempfile
+
+        from bot.code import journal
+
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "journal.jsonl"
+            path.write_text(
+                '{"event":"complete","r":1.0}\n{"event":"torn"',
+                encoding="utf-8",
+            )
+            self.assertEqual(
+                journal.read(path),
+                [{"event": "complete", "r": 1.0}],
+            )
+
+            path.write_text(
+                '{"event":"complete"}\nnot-json\n{"event":"later"}\n',
+                encoding="utf-8",
+            )
+            with self.assertRaises(__import__("json").JSONDecodeError):
+                journal.read(path)
 
     def test_status_exposes_account_state_mismatch(self):
         from bot.code.run import account_binding_status

@@ -10,6 +10,7 @@ Each test names the defect it pins down, because these all started as real bugs.
 from __future__ import annotations
 
 import io
+import copy
 import sys
 import tempfile
 import unittest
@@ -50,6 +51,32 @@ class LiveInstanceLockTests(unittest.TestCase):
             first.release()
             self.assertTrue(second.acquire())
             second.release()
+
+    def test_every_live_entry_point_uses_the_same_instance_lock(self):
+        with tempfile.TemporaryDirectory() as directory, \
+                mock.patch.object(run, "LIVE_LOCK_PATH",
+                                  Path(directory) / ".live.lock"):
+            held = LiveInstanceLock(run.LIVE_LOCK_PATH)
+            self.assertTrue(held.acquire())
+            try:
+                with self.assertRaisesRegex(
+                        SystemExit, "another Quantum Desk LIVE process"):
+                    run.execute(live=True)
+            finally:
+                held.release()
+
+    def test_live_lock_is_released_when_startup_fails(self):
+        with tempfile.TemporaryDirectory() as directory, \
+                mock.patch.object(run, "LIVE_LOCK_PATH",
+                                  Path(directory) / ".live.lock"), \
+                mock.patch.object(run.settings_module, "load",
+                                  side_effect=MT5Error("settings unavailable")):
+            with self.assertRaisesRegex(MT5Error, "settings unavailable"):
+                run.execute(live=True)
+
+            probe = LiveInstanceLock(run.LIVE_LOCK_PATH)
+            self.assertTrue(probe.acquire())
+            probe.release()
 
 
 @dataclass
@@ -206,6 +233,94 @@ class TraderPathsTests(unittest.TestCase):
         self.assertIn(trade.plan_id, self.state.trades)
         self.assertEqual(self.state.trading_days, ["2026-06-01"])
 
+    def test_each_pending_ticket_is_durable_before_the_next_leg_is_sent(self):
+        broker = FakeBroker()
+        snapshots = []
+
+        def capture(_path):
+            snapshots.append(copy.deepcopy(self.state))
+
+        with mock.patch.object(self.state, "save", side_effect=capture):
+            trade = trader.open_trade(
+                broker, self.settings, self.state, intent("limit"), 100_000.0,
+            )
+
+        saved_counts = [
+            len(snapshot.trades[trade.plan_id].pending_tickets)
+            for snapshot in snapshots
+        ]
+        self.assertIn(1, saved_counts)
+        self.assertIn(2, saved_counts)
+        self.assertIn(3, saved_counts)
+
+    def test_each_market_order_id_is_durable_before_the_next_leg_is_sent(self):
+        broker = FakeBroker()
+        snapshots = []
+
+        def capture(_path):
+            snapshots.append(copy.deepcopy(self.state))
+
+        with mock.patch.object(self.state, "save", side_effect=capture):
+            trade = trader.open_trade(
+                broker, self.settings, self.state, intent(), 100_000.0,
+            )
+
+        saved_counts = [
+            len(snapshot.trades[trade.plan_id].market_order_tickets)
+            for snapshot in snapshots
+        ]
+        self.assertIn(1, saved_counts)
+        self.assertIn(2, saved_counts)
+        self.assertIn(3, saved_counts)
+
+    def test_delayed_market_visibility_stays_open_until_history_recovers_it(self):
+        class DelayedVisibilityBroker(FakeBroker):
+            def market_entry(self, direction, volume, stop, take_profit, comment):
+                self._guard(f"market {volume}")
+                ticket = self._ticket()
+                # MT5 accepted the order, but positions_get() has not exposed
+                # its resulting position yet.
+                return {"dry_run": False, "order": ticket, "deal": ticket}
+
+        broker = DelayedVisibilityBroker()
+        output = io.StringIO()
+        with redirect_stdout(output):
+            trade = trader.open_trade(
+                broker, self.settings, self.state, intent(), 100_000.0,
+            )
+
+        orders = list(trade.market_order_tickets)
+        self.assertEqual(len(orders), 3)
+        self.assertFalse(trade.closed)
+        self.assertIn("orders accepted; waiting for MT5 position visibility",
+                      output.getvalue())
+        self.assertEqual(
+            run.active_setup_count(self.state, broker.positions(),
+                                   broker.pending_orders()),
+            1,
+        )
+        self.assertTrue(run.needs_split_management(self.state))
+
+        # Deal history can lag too. The first reconciliation must retain every
+        # id and retry, not close the plan as an empty trade.
+        trader.sync_fills(broker, self.state)
+        self.assertEqual(trade.market_order_tickets, orders)
+        self.assertFalse(trade.closed)
+
+        broker.filled_orders = dict(zip(orders, (301, 302, 303)))
+        broker._positions = [
+            FakePos(ticket=302, stop=trade.stop, take_profit=trade.targets[1]),
+            FakePos(ticket=303, stop=trade.stop, take_profit=trade.targets[2]),
+        ]
+        trader.sync_fills(broker, self.state)
+        trader.apply_breakeven(broker, self.state)
+
+        self.assertEqual(trade.market_order_tickets, [])
+        self.assertEqual(trade.tp1_position_ticket, 301)
+        self.assertEqual(sorted(broker.stops_moved),
+                         [(302, trade.entry), (303, trade.entry)])
+        self.assertTrue(trade.breakeven_done)
+
     def test_a_rejected_second_leg_keeps_the_first_under_management(self):
         """Was: the trade was only recorded after all three legs succeeded, so a
         rejection left a live position no part of the bot knew about."""
@@ -277,6 +392,56 @@ class TraderPathsTests(unittest.TestCase):
         self.assertIn((tp2_position, trade.entry), broker.stops_moved)
         self.assertTrue(trade.breakeven_done)
 
+    def test_unresolved_real_tp1_identity_never_uses_tp2_as_a_fallback(self):
+        trade = ManagedTrade(
+            plan_id="M15@tp1-unresolved", timeframe="M15", direction=1,
+            entry=4000.0, stop=3984.0, risk=16.0, risk_cash=400.0,
+            targets=[4016.0, 4024.0, 4032.0], legs=[0.08, 0.08, 0.09],
+            position_tickets=[302, 303],
+            market_order_tickets=[201],
+            tp1_market_order_ticket=201,
+            exit_mode="be_33_33_34",
+        )
+        self.state.trades[trade.plan_id] = trade
+        # TP2 has disappeared, TP3 survives. TP1 is still unresolved, so TP2's
+        # absence cannot be used as evidence that TP1 was banked.
+        broker = FakeBroker(_positions=[
+            FakePos(ticket=303, stop=trade.stop, take_profit=trade.targets[2]),
+        ])
+
+        trader.apply_breakeven(broker, self.state)
+
+        self.assertEqual(broker.stops_moved, [])
+        self.assertFalse(trade.breakeven_done)
+
+    def test_market_order_history_recovers_tickets_after_a_hard_placement_crash(self):
+        trade = ManagedTrade(
+            plan_id="M15@crash", timeframe="M15", direction=1,
+            entry=4000.0, stop=3984.0, risk=16.0, risk_cash=400.0,
+            targets=[4016.0, 4024.0, 4032.0], legs=[0.08, 0.08, 0.09],
+            market_order_tickets=[201, 202, 203],
+            tp1_market_order_ticket=201, exit_mode="be_33_33_34",
+        )
+        self.state.trades[trade.plan_id] = trade
+        broker = FakeBroker(
+            _positions=[
+                FakePos(ticket=302, stop=3984.0, take_profit=4024.0),
+                FakePos(ticket=303, stop=3984.0, take_profit=4032.0),
+            ],
+            filled_orders={201: 301, 202: 302, 203: 303},
+        )
+
+        trader.sync_fills(broker, self.state, {"M15": bars(300)})
+        self.assertEqual(trade.position_tickets, [301, 302, 303])
+        self.assertEqual(trade.tp1_position_ticket, 301)
+        self.assertEqual(trade.market_order_tickets, [])
+
+        trader.apply_breakeven(broker, self.state)
+        self.assertEqual(
+            sorted(broker.stops_moved),
+            [(302, trade.entry), (303, trade.entry)],
+        )
+        self.assertTrue(trade.breakeven_done)
     def test_missing_pending_order_waits_when_mt5_history_is_not_ready(self):
         broker = FakeBroker()
         trade = trader.open_trade(broker, self.settings, self.state,
@@ -401,6 +566,33 @@ class TraderPathsTests(unittest.TestCase):
         self.assertFalse(trade.breakeven_done)
         self.assertTrue(run.needs_split_management(self.state))
 
+    def test_fast_split_wait_reconciles_tickets_before_checking_be(self):
+        trade = ManagedTrade(
+            plan_id="M15@waiting", timeframe="M15", direction=1,
+            entry=4000.0, stop=3984.0, risk=16.0, risk_cash=400.0,
+            targets=[4016.0, 4024.0, 4032.0], legs=[0.08, 0.08, 0.09],
+            pending_tickets=[201, 202, 203], exit_mode="be_33_33_34",
+        )
+        self.state.trades[trade.plan_id] = trade
+        broker = FakeBroker()
+        broker.requests = 0
+        broker.take_requests = lambda: 0
+        config_ = SimpleNamespace(
+            split_management_poll_seconds=1,
+            max_requests_per_day=2_000,
+        )
+
+        with tempfile.TemporaryDirectory() as folder, \
+                mock.patch.object(run, "STATE_PATH",
+                                  Path(folder) / "state.json"), \
+                mock.patch.object(run.time, "sleep"), \
+                mock.patch.object(trader, "sync_fills") as sync, \
+                mock.patch.object(trader, "apply_breakeven") as apply:
+            run.sleep_and_manage_split(broker, self.state, config_, 2)
+
+        sync.assert_called_once_with(broker, self.state)
+        apply.assert_called_once_with(broker, self.state)
+
     def test_dry_run_cannot_mark_real_survivors_as_protected(self):
         broker = FakeBroker()
         trade = trader.open_trade(broker, self.settings, self.state, intent(), 100_000.0)
@@ -431,6 +623,27 @@ class TraderPathsTests(unittest.TestCase):
         trader.apply_breakeven(broker, self.state)
 
         self.assertEqual(broker.stops_moved, [])
+        self.assertTrue(trade.breakeven_done)
+
+    def test_sell_survivor_with_no_stop_is_not_mistaken_for_protected(self):
+        broker = FakeBroker(_positions=[
+            FakePos(ticket=402, direction=-1, stop=0.0, take_profit=3976.0),
+            FakePos(ticket=403, direction=-1, stop=0.0, take_profit=3968.0),
+        ])
+        trade = ManagedTrade(
+            plan_id="M15@sell-no-stop", timeframe="M15", direction=-1,
+            entry=4000.0, stop=4016.0, risk=16.0, risk_cash=400.0,
+            targets=[3984.0, 3976.0, 3968.0], legs=[0.08, 0.08, 0.09],
+            position_tickets=[401, 402, 403],
+            tp1_position_ticket=401,
+            exit_mode="be_33_33_34",
+        )
+        self.state.trades[trade.plan_id] = trade
+
+        trader.apply_breakeven(broker, self.state)
+
+        self.assertEqual(sorted(broker.stops_moved),
+                         [(402, trade.entry), (403, trade.entry)])
         self.assertTrue(trade.breakeven_done)
 
     def test_startup_reconciliation_moves_survivors_after_offline_tp1(self):
@@ -509,6 +722,53 @@ class TraderPathsTests(unittest.TestCase):
         self.assertEqual(
             sorted(ticket for ticket, _ in broker.stops_moved),
             sorted(survivors),
+        )
+
+    def test_startup_recovers_crash_tickets_before_failed_bar_loading(self):
+        class FailingBarsBroker(FakeBroker):
+            requests = 0
+
+            def account(self):
+                return {
+                    "login": 1, "server": "test",
+                    "balance": 100_000.0, "equity": 100_000.0,
+                }
+
+            def bars(self, timeframe, count):
+                raise MT5Error("price history unavailable")
+
+            def take_requests(self):
+                return 0
+
+        trade = ManagedTrade(
+            plan_id="M15@startup-crash", timeframe="M15", direction=1,
+            entry=4000.0, stop=3984.0, risk=16.0, risk_cash=400.0,
+            targets=[4016.0, 4024.0, 4032.0], legs=[0.08, 0.08, 0.09],
+            market_order_tickets=[201, 202, 203],
+            tp1_market_order_ticket=201, exit_mode="be_33_33_34",
+        )
+        self.state.trades[trade.plan_id] = trade
+        broker = FailingBarsBroker(
+            _positions=[
+                FakePos(ticket=302, stop=3984.0, take_profit=4024.0),
+                FakePos(ticket=303, stop=3984.0, take_profit=4032.0),
+            ],
+            filled_orders={201: 301, 202: 302, 203: 303},
+        )
+        config_ = SimpleNamespace(
+            timeframes=("M15",), history_bars=300, initial_balance=100_000.0,
+        )
+
+        with mock.patch.object(
+                run, "_bind_and_anchor",
+                return_value=(broker.tick(), broker.account())):
+            with self.assertRaisesRegex(MT5Error, "price history unavailable"):
+                run.reconcile_startup(broker, self.state, config_)
+
+        self.assertEqual(trade.tp1_position_ticket, 301)
+        self.assertEqual(
+            sorted(broker.stops_moved),
+            [(302, trade.entry), (303, trade.entry)],
         )
 
     def test_all_rejected_breakeven_moves_leave_the_trade_retryable(self):
@@ -595,6 +855,30 @@ class TraderPathsTests(unittest.TestCase):
         self.assertEqual(finished, [])
         self.assertFalse(trade.closed)
         self.assertEqual(self.state.day_realised, 0.0)
+
+    def test_partial_market_history_cannot_close_the_whole_setup(self):
+        trade = ManagedTrade(
+            plan_id="M15@partial-history", timeframe="M15", direction=1,
+            entry=4000.0, stop=3984.0, risk=16.0, risk_cash=400.0,
+            targets=[4016.0, 4024.0, 4032.0], legs=[0.08, 0.08, 0.09],
+            position_tickets=[301], market_order_tickets=[202, 203],
+            tp1_position_ticket=301, exit_mode="be_33_33_34",
+            filled_at="2026-07-27 12:00:00",
+        )
+        self.state.trades[trade.plan_id] = trade
+        broker = FakeBroker(deals=[
+            {
+                "position": 301, "profit": 100.0, "commission": -1.0,
+                "swap": 0.0, "net": 99.0,
+            },
+        ])
+
+        finished = trader.reconcile_closed(broker, self.state)
+
+        self.assertEqual(finished, [])
+        self.assertFalse(trade.closed)
+        self.assertEqual(self.state.day_realised, 0.0)
+
     def test_r_is_scored_after_commission_and_swap(self):
         """Was: only `deal.profit` counted, so every live R read better than the
         money in the account — the exact number used to judge the edge."""
@@ -967,6 +1251,22 @@ class WriteSpacingTests(unittest.TestCase):
         broker.close(FakePos(ticket=1), "timeout")
 
         self.assertEqual(order, ["pace", "tick", "send"] * 2)
+
+    def test_broker_allows_a_sell_be_stop_when_the_position_has_no_sl(self):
+        broker = self._broker(dry_run=False)
+        broker._spec = GOLD
+        broker._mt = SimpleNamespace(TRADE_ACTION_SLTP=6)
+        sent = []
+        broker._pace = lambda: None
+        broker._send = lambda request, what: sent.append(request) or {}
+        position = FakePos(
+            ticket=77, direction=-1, stop=0.0, take_profit=3968.0,
+        )
+
+        broker.move_stop(position, 4000.0)
+
+        self.assertEqual(sent[0]["position"], 77)
+        self.assertEqual(sent[0]["sl"], 4000.0)
 
     def test_the_stamp_is_taken_when_the_request_leaves_not_when_it_returns(self):
         """A slow `order_send` must not stretch the gap: the broker rates when

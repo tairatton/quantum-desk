@@ -28,6 +28,11 @@ class ManagedTrade:
     legs: list[float]
     position_tickets: list[int] = field(default_factory=list)
     pending_tickets: list[int] = field(default_factory=list)
+    # Market order ids awaiting an authoritative order -> position mapping from
+    # deal history. They are saved after each accepted leg so a hard power loss
+    # during placement can be recovered without guessing from price/comment.
+    market_order_tickets: list[int] = field(default_factory=list)
+    tp1_market_order_ticket: int | None = None
     # TP1 identity is persisted separately from list order. Pending fills can
     # become visible to MT5 history out of order, so "first position ticket" is
     # not a safe long-term definition of the TP1 leg.
@@ -75,6 +80,10 @@ class BotState:
     trades: dict[str, ManagedTrade] = field(default_factory=dict)
 
     # -- persistence ------------------------------------------------------
+    def disable_persistence(self) -> None:
+        """Keep mutations in memory only, used by dry-run execution."""
+        self._persistence_enabled = False
+
     @classmethod
     def load(cls, path: Path) -> "BotState":
         """Read state, ignoring fields this version no longer knows about.
@@ -98,12 +107,22 @@ class BotState:
                 known_payload["exit_mode"] = (
                     "be_33_33_34" if len(known_payload.get("legs", ())) >= 3
                     else "fixed_tp3")
+            # A short-lived release could mark a market trade closed when MT5
+            # accepted its orders but positions_get() had not exposed the
+            # resulting positions yet. An unresolved order id is proof that
+            # reconciliation still has work to do, so reopen that record on
+            # load and let deal history settle it.
+            if (known_payload.get("closed")
+                    and known_payload.get("market_order_tickets")):
+                known_payload["closed"] = False
             trades[key] = ManagedTrade(**known_payload)
         known = {spec.name for spec in fields(cls)} - {"trades"}
         return cls(**{key: value for key, value in raw.items() if key in known},
                    trades=trades)
 
     def save(self, path: Path) -> None:
+        if not getattr(self, "_persistence_enabled", True):
+            return
         payload = asdict(self)
         path.parent.mkdir(parents=True, exist_ok=True)
         temporary = path.with_name(f"{path.name}.tmp")

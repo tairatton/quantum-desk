@@ -12,8 +12,6 @@ if not __package__:
         sys.path.insert(0, str(PROJECT_ROOT))
 
 from bot.code import run
-from bot.code.instance_lock import LiveInstanceLock
-from bot.code.settings import BOT_DIR
 from xau.mt5_source import MT5Error
 
 
@@ -40,18 +38,8 @@ def _run_live() -> int:
 
 
 def main() -> int:
-    """Start one live trading process; refuse accidental duplicate instances."""
-    instance_lock = LiveInstanceLock(BOT_DIR / ".live.lock")
-    if not instance_lock.acquire():
-        print("\n" + run.status_line(
-            "STATUS",
-            "BLOCKED | Another Quantum Desk LIVE process is already running",
-            "error"))
-        return 2
-    try:
-        return _run_live()
-    finally:
-        instance_lock.release()
+    """Start live trading; the shared execution layer enforces one instance."""
+    return _run_live()
 
 
 if __name__ == "__main__":

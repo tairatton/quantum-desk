@@ -159,7 +159,19 @@ def open_trade(broker: Broker, settings: Settings, state: BotState, intent: Inte
                          if tag not in {"fixedtp3", "be33"}) + (mode_tag,)
             comment = f"{intent.timeframe} TP{tp_number} {'|'.join(tags)}"
             if intent.action == "market":
-                broker.market_entry(intent.direction, volume, intent.stop, target, comment)
+                result = broker.market_entry(
+                    intent.direction, volume, intent.stop, target, comment,
+                )
+                order_ticket = int(result.get("order") or 0)
+                if order_ticket:
+                    trade.market_order_tickets.append(order_ticket)
+                    if index == 1 and actual_exit_mode == "be_33_33_34":
+                        trade.tp1_market_order_ticket = order_ticket
+                    # Persist each accepted leg immediately. The final broker
+                    # position lookup below is still authoritative, but a hard
+                    # power loss before `finally` now leaves enough identity for
+                    # startup deal-history recovery.
+                    state.save(STATE_PATH)
             else:
                 result = broker.limit_entry(intent.direction, volume, intent.entry,
                                             intent.stop, target, expiry, comment)
@@ -168,6 +180,7 @@ def open_trade(broker: Broker, settings: Settings, state: BotState, intent: Inte
                     trade.pending_tickets.append(ticket)
                     if index == 1 and actual_exit_mode == "be_33_33_34":
                         trade.tp1_pending_ticket = ticket
+                    state.save(STATE_PATH)
             placed = index
     except MT5Error as error:
         journal.write(JOURNAL_PATH, "leg_rejected", plan_id=trade.plan_id,
@@ -196,11 +209,19 @@ def open_trade(broker: Broker, settings: Settings, state: BotState, intent: Inte
                 ))
                 if _position_target_index(trade, tp1) == 0:
                     trade.tp1_position_ticket = tp1.ticket
+            # Every accepted market leg is visible, so no history recovery is
+            # outstanding. If visibility lags, retain the order ids for startup.
+            if len(opened) >= placed:
+                trade.market_order_tickets.clear()
             if trade.position_tickets:
                 state.count_trading_day()
-        if not trade.position_tickets and not trade.pending_tickets:
+        if (not trade.position_tickets and not trade.pending_tickets
+                and not trade.market_order_tickets):
             # Nothing is live, so nothing needs managing. It stays in `trades` as
-            # a closed record, which also stops the plan being retried.
+            # a closed record, which also stops the plan being retried. Accepted
+            # market order ids are live uncertainty, not "nothing": MT5 can make
+            # the order visible in deal history a moment before its position is
+            # returned by positions_get().
             trade.closed = True
         state.save(STATE_PATH)
 
@@ -222,6 +243,10 @@ def open_trade(broker: Broker, settings: Settings, state: BotState, intent: Inte
               f"orders={trade.pending_tickets} volumes={list(sizing.legs)} "
               f"entry={intent.entry} sl={intent.stop} targets={targets} "
               f"expires={expiry_text} risk_cash={trade.risk_cash:.2f}")
+    elif trade.market_order_tickets:
+        print(f"[MARKET_SYNC_WAIT] plan={intent.plan_id} "
+              f"orders={trade.market_order_tickets} "
+              "reason='orders accepted; waiting for MT5 position visibility'")
     else:
         print(f"[ORDER_NOT_OPENED] plan={intent.plan_id} reason='no live ticket returned'")
     return trade
@@ -240,13 +265,55 @@ def sync_fills(broker: Broker, state: BotState,
         for trade in state.open_trades()
         for ticket in trade.pending_tickets
     ]
+    market_order_tickets = [
+        ticket
+        for trade in state.open_trades()
+        for ticket in trade.market_order_tickets
+    ]
     missing_tickets = [ticket for ticket in pending_tickets if ticket not in live_orders]
-    filled_by_order = broker.filled_order_positions(missing_tickets)
+    history_tickets = list(dict.fromkeys(missing_tickets + market_order_tickets))
+    filled_by_order = broker.filled_order_positions(history_tickets)
     finished_states = broker.finished_order_states(missing_tickets)
     terminal_states = {"CANCELED", "REJECTED", "EXPIRED"}
     changed = False
 
     for trade in state.open_trades():
+        original_market = list(trade.market_order_tickets)
+        recovered_market = [
+            ticket for ticket in original_market if ticket in filled_by_order
+        ]
+        for order_ticket in recovered_market:
+            position_ticket = filled_by_order[order_ticket]
+            if position_ticket not in trade.position_tickets:
+                trade.position_tickets.append(position_ticket)
+            if order_ticket == trade.tp1_market_order_ticket:
+                trade.tp1_position_ticket = position_ticket
+        trade.market_order_tickets = [
+            ticket for ticket in original_market if ticket not in filled_by_order
+        ]
+        unresolved_market = list(trade.market_order_tickets)
+        if recovered_market:
+            changed = True
+            trade.filled_at = trade.filled_at or str(broker.tick()["server_time"])
+            if not trade.fill_bar_time:
+                trade.fill_bar_time = _fill_bar_time(frames, trade, broker)
+            state.count_trading_day()
+            recovered_positions = [
+                filled_by_order[ticket] for ticket in recovered_market
+            ]
+            journal.write(
+                JOURNAL_PATH, "market_fill_recovered",
+                plan_id=trade.plan_id, order_tickets=recovered_market,
+                position_tickets=recovered_positions,
+                fill_bar_time=trade.fill_bar_time,
+            )
+            print(f"[MARKET_FILL_RECOVERED] plan={trade.plan_id} "
+                  f"orders={recovered_market} positions={recovered_positions}")
+        if unresolved_market:
+            print(f"[MARKET_SYNC_WAIT] plan={trade.plan_id} "
+                  f"orders={unresolved_market} "
+                  "reason='waiting for MT5 deal history'")
+
         if not trade.pending_tickets:
             continue
         original = list(trade.pending_tickets)
@@ -290,7 +357,8 @@ def sync_fills(broker: Broker, state: BotState,
             print(f"[PENDING_SYNC_WAIT] plan={trade.plan_id} orders={unresolved_orders} "
                   "reason='waiting for MT5 order/deal history'")
 
-        if not trade.pending_tickets and not trade.position_tickets:
+        if (not trade.pending_tickets and not trade.position_tickets
+                and not trade.market_order_tickets):
             trade.closed = True
             changed = True
 
@@ -333,7 +401,21 @@ def apply_breakeven(broker: Broker, state: BotState) -> None:
     for trade in state.open_trades():
         if trade.exit_mode != "be_33_33_34" or len(trade.position_tickets) < 2:
             continue
-        tp1_ticket = trade.tp1_position_ticket or trade.position_tickets[0]
+        if trade.tp1_position_ticket is not None:
+            tp1_ticket = trade.tp1_position_ticket
+        elif (trade.tp1_market_order_ticket is not None
+              or trade.tp1_pending_ticket is not None):
+            # New records know which exact order belongs to TP1. If that order's
+            # deal has not appeared in history yet (or the order was canceled),
+            # guessing that the first mapped TP2/TP3 position is TP1 can move a
+            # survivor's stop without TP1 ever being banked. Wait for the
+            # authoritative order -> position mapping instead.
+            continue
+        else:
+            # Legacy state predates explicit TP1 identity. Its original contract
+            # stored market legs in TP order, so list order is the only recovery
+            # information available.
+            tp1_ticket = trade.position_tickets[0]
         if tp1_ticket in open_positions:
             continue
         survivors = [
@@ -348,8 +430,14 @@ def apply_breakeven(broker: Broker, state: BotState) -> None:
         rejected = []
         already_protected = []
         for position in survivors:
-            improves = (desired_stop > position.stop if trade.direction == 1
-                        else desired_stop < position.stop)
+            # MT5 uses 0.0 for "no stop". For a SELL, the normal comparison
+            # (entry < stop) is false against zero and used to misclassify a
+            # completely unprotected survivor as already beyond break-even.
+            improves = (
+                not position.stop
+                or (desired_stop > position.stop if trade.direction == 1
+                    else desired_stop < position.stop)
+            )
             if improves:
                 try:
                     broker.move_stop(position, desired_stop)
@@ -513,7 +601,8 @@ def cancel_stale(broker: Broker, state: BotState, intent: Intent) -> None:
                       f"reason={str(error)!r} scope='stale_pending'")
                 remaining.append(ticket)
     trade.pending_tickets[:] = remaining
-    if not trade.pending_tickets and not trade.position_tickets:
+    if (not trade.pending_tickets and not trade.position_tickets
+            and not trade.market_order_tickets):
         trade.closed = True
     if remaining:
         print(f"[PENDING_CANCEL_INCOMPLETE] plan={trade.plan_id} tickets={remaining} "
@@ -531,6 +620,15 @@ def reconcile_closed(broker: Broker, state: BotState) -> list[dict]:
     finished = []
     for trade in state.open_trades():
         if trade.dry_run or not trade.position_tickets:
+            continue
+        # A partial history response can map TP1 before the survivor market
+        # orders. If TP1 is already gone, its closing deal is enough to make the
+        # mapped subset look finished, but it is not enough to score and close
+        # the whole setup while survivor order ids are still unresolved.
+        if trade.market_order_tickets:
+            print(f"[RECONCILE_WAIT] plan={trade.plan_id} "
+                  f"market_orders={trade.market_order_tickets} "
+                  "reason='market ticket reconciliation is incomplete'")
             continue
         if any(ticket in open_tickets for ticket in trade.position_tickets):
             continue

@@ -81,3 +81,7 @@
 {"at": "2026-07-30T06:58:46", "event": "breakeven", "plan_id": "M30@2026-07-29 22:30:00", "tickets": [507634850, 507634905], "stop": 4044.77}
 {"at": "2026-07-30T07:00:26", "event": "heartbeat", "mode": "LIVE", "server_time": "2026-07-30 03:00:25", "positions": 2, "pending_orders": 0, "floating_pnl": 123.53, "entry_capacity": "YES | capacity only | setups 1/2 | risk 0.00/0.80% | allowed side BUY only"}
 {"at": "2026-07-30T07:04:44", "event": "status_checked", "mode": "DRY-RUN", "login": 1514115848, "server": "FTMO-Demo"}
+{"at": "2026-07-30T07:15:23", "event": "heartbeat", "mode": "LIVE", "server_time": "2026-07-30 03:15:22", "positions": 2, "pending_orders": 0, "floating_pnl": 118.76, "entry_capacity": "YES | capacity only | setups 1/2 | risk 0.00/0.80% | allowed side BUY only"}
+{"at": "2026-07-30T07:28:50", "event": "status_checked", "mode": "DRY-RUN", "login": 1514115848, "server": "FTMO-Demo"}
+{"at": "2026-07-30T07:30:24", "event": "heartbeat", "mode": "LIVE", "server_time": "2026-07-30 03:30:22", "positions": 2, "pending_orders": 0, "floating_pnl": 97.76, "entry_capacity": "YES | capacity only | setups 1/2 | risk 0.00/0.80% | allowed side BUY only"}
+{"at": "2026-07-30T07:30:52", "event": "status_checked", "mode": "DRY-RUN", "login": 1514115848, "server": "FTMO-Demo"}

@@ -501,7 +501,13 @@ class Broker:
 
     def move_stop(self, position: Position, stop: float) -> dict:
         """Only ever called to tighten. Widening a stop is not implemented."""
-        improves = stop > position.stop if position.direction == 1 else stop < position.stop
+        # MT5 encodes a missing SL as zero. Any real stop is an improvement from
+        # no protection, including a SELL stop whose numeric price is > 0.
+        improves = (
+            not position.stop
+            or (stop > position.stop if position.direction == 1
+                else stop < position.stop)
+        )
         if not improves:
             raise MT5Error(f"refusing to widen stop on #{position.ticket}: "
                            f"{position.stop} -> {stop}")
