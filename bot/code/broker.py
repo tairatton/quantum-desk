@@ -295,7 +295,12 @@ class Broker:
 
     def positions(self) -> list[Position]:
         self._requests += 1
-        raw = self.mt.positions_get(symbol=self.spec.name) or ()
+        raw = self.mt.positions_get(symbol=self.spec.name)
+        if raw is None:
+            code, desc = self.mt.last_error()
+            raise MT5Error(
+                f"positions_get({self.spec.name}) failed: ({code}) {desc}"
+            )
         return [Position(
             ticket=p.ticket, symbol=p.symbol,
             direction=1 if p.type == self.mt.POSITION_TYPE_BUY else -1,
@@ -308,7 +313,12 @@ class Broker:
 
     def pending_orders(self) -> list[dict]:
         self._requests += 1
-        raw = self.mt.orders_get(symbol=self.spec.name) or ()
+        raw = self.mt.orders_get(symbol=self.spec.name)
+        if raw is None:
+            code, desc = self.mt.last_error()
+            raise MT5Error(
+                f"orders_get({self.spec.name}) failed: ({code}) {desc}"
+            )
         type_names = {
             self.mt.ORDER_TYPE_BUY_LIMIT: "BUY_LIMIT",
             self.mt.ORDER_TYPE_SELL_LIMIT: "SELL_LIMIT",
@@ -347,7 +357,12 @@ class Broker:
         until = datetime.now() + timedelta(days=1)
         start = since or (until - timedelta(days=30))
         self._requests += 1
-        deals = self.mt.history_deals_get(start, until) or ()
+        deals = self.mt.history_deals_get(start, until)
+        if deals is None:
+            code, desc = self.mt.last_error()
+            raise MT5Error(
+                f"history_deals_get(order mapping) failed: ({code}) {desc}"
+            )
         return {
             int(deal.order): int(deal.position_id)
             for deal in deals
@@ -365,7 +380,12 @@ class Broker:
         until = datetime.now() + timedelta(days=1)
         start = since or (until - timedelta(days=30))
         self._requests += 1
-        orders = self.mt.history_orders_get(start, until) or ()
+        orders = self.mt.history_orders_get(start, until)
+        if orders is None:
+            code, desc = self.mt.last_error()
+            raise MT5Error(
+                f"history_orders_get(states) failed: ({code}) {desc}"
+            )
         state_names = {
             self.mt.ORDER_STATE_FILLED: "FILLED",
             self.mt.ORDER_STATE_CANCELED: "CANCELED",
@@ -393,12 +413,20 @@ class Broker:
         """
         until = datetime.now() + timedelta(days=1)
         self._requests += 1
-        deals = self.mt.history_deals_get(since, until) or ()
+        deals = self.mt.history_deals_get(since, until)
+        if deals is None:
+            code, desc = self.mt.last_error()
+            raise MT5Error(
+                f"history_deals_get(closed deals) failed: ({code}) {desc}"
+            )
         return [{"ticket": d.ticket, "order": d.order, "position": d.position_id,
                  "volume": float(d.volume),
                  "price": float(d.price), "profit": float(d.profit),
                  "commission": float(d.commission), "swap": float(d.swap),
-                 "net": float(d.profit) + float(d.commission) + float(d.swap),
+                 "fee": float(getattr(d, "fee", 0.0) or 0.0),
+                 "net": (float(d.profit) + float(d.commission)
+                         + float(d.swap)
+                         + float(getattr(d, "fee", 0.0) or 0.0)),
                  "comment": d.comment, "entry": d.entry,
                  "time": datetime.fromtimestamp(d.time, tz=timezone.utc).replace(tzinfo=None)}
                 for d in deals if d.magic == self.magic and d.symbol == self.spec.name]
@@ -511,8 +539,10 @@ class Broker:
                 else stop < position.stop)
         )
         if not improves:
-            raise MT5Error(f"refusing to widen stop on #{position.ticket}: "
-                           f"{position.stop} -> {stop}")
+            raise OrderRejected(
+                f"refusing to widen stop on #{position.ticket}: "
+                f"{position.stop} -> {stop}"
+            )
         self._pace()
         return self._send({
             "action": self.mt.TRADE_ACTION_SLTP, "symbol": self.spec.name,

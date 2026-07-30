@@ -23,7 +23,7 @@ from xau import config
 from xau.mt5_source import MT5Error
 
 from . import journal, signals
-from .broker import Broker, Position
+from .broker import Broker, OrderRejected, Position
 from .settings import JOURNAL_PATH, STATE_PATH, Settings
 from .signals import Intent
 from .sizing import SizingError, size_plan
@@ -231,7 +231,7 @@ def open_trade(broker: Broker, settings: Settings, state: BotState, intent: Inte
                         trade.tp1_pending_ticket = ticket
                     state.save(STATE_PATH)
             placed = index
-    except MT5Error as error:
+    except OrderRejected as error:
         journal.write(JOURNAL_PATH, "leg_rejected", plan_id=trade.plan_id,
                       placed=placed, of=len(sizing.legs), reason=str(error))
         print(f"[ORDER_REJECTED] plan={trade.plan_id} leg={placed + 1} "
@@ -429,8 +429,8 @@ def _fill_bar_time(frames: dict[str, pd.DataFrame] | None, trade: ManagedTrade,
     return str(broker.tick()["server_time"])
 
 
-def apply_breakeven(broker: Broker, state: BotState) -> None:
-    """Move each survivor to its cost-covered broker fill once TP1 is banked.
+def apply_breakeven(broker: Broker, state: BotState) -> set[int]:
+    """Move survivors to cost-covered fills and return live position tickets.
 
     All legs share one stop, so if the TP1 leg is gone while later legs are still
     open, TP1 must have been taken rather than stopped out.
@@ -440,13 +440,15 @@ def apply_breakeven(broker: Broker, state: BotState) -> None:
     protect, and moving that single stop to entry would exit at break-even a
     trade the measured policy carries all the way to TP3.
     """
+    open_positions = {position.ticket: position for position in broker.positions()}
     # A dry-run Broker reports the account's real positions but simulates every
     # write. Marking those positions protected would corrupt durable live state
-    # even though no modification reached MT5.
+    # even though no modification reached MT5. Still return their tickets: the
+    # fast management loop uses this snapshot to decide whether a trade closed,
+    # and an empty result would make live positions look finished.
     if broker.dry_run:
-        return
+        return set(open_positions)
 
-    open_positions = {position.ticket: position for position in broker.positions()}
     for trade in state.open_trades():
         if trade.exit_mode != "be_33_33_34" or len(trade.position_tickets) < 2:
             continue
@@ -498,7 +500,7 @@ def apply_breakeven(broker: Broker, state: BotState) -> None:
             if improves:
                 try:
                     broker.move_stop(position, desired_stop)
-                except MT5Error as error:
+                except OrderRejected as error:
                     journal.write(JOURNAL_PATH, "breakeven_rejected",
                                   ticket=position.ticket, reason=str(error))
                     print(f"[STOP_REJECTED] ticket={position.ticket} "
@@ -539,6 +541,7 @@ def apply_breakeven(broker: Broker, state: BotState) -> None:
         else:
             print(f"[STOP_CONFIRMED] plan={trade.plan_id} mode=NET_BREAK_EVEN "
                   f"stops={desired_stops} positions={already_protected}")
+    return set(open_positions)
 
 
 def _orphan_timeframe(comment: str, frames: dict[str, pd.DataFrame]) -> str | None:
@@ -594,7 +597,7 @@ def enforce_orphan_timeout(broker: Broker, state: BotState,
         # next pass tries again, and the other orphans still get their close.
         try:
             broker.close(position, "timeout 120 bars")
-        except MT5Error as error:
+        except OrderRejected as error:
             journal.write(JOURNAL_PATH, "orphan_timeout_rejected",
                           ticket=position.ticket, reason=str(error))
             print(f"[CLOSE_REJECTED] ticket={position.ticket} "
@@ -627,7 +630,7 @@ def enforce_timeout(broker: Broker, state: BotState, frames: dict[str, pd.DataFr
             # timeout pass unattempted, even though each could still close.
             try:
                 broker.close(position, "timeout 120 bars")
-            except MT5Error as error:
+            except OrderRejected as error:
                 journal.write(JOURNAL_PATH, "timeout_close_rejected",
                               ticket=position.ticket, reason=str(error))
                 print(f"[CLOSE_REJECTED] ticket={position.ticket} "
@@ -654,7 +657,7 @@ def cancel_stale(broker: Broker, state: BotState, intent: Intent) -> None:
             # order unowned until it filled or the orphan path eventually saw it.
             try:
                 broker.cancel(ticket, intent.status)
-            except MT5Error as error:
+            except OrderRejected as error:
                 journal.write(JOURNAL_PATH, "cancel_rejected",
                               ticket=ticket, reason=str(error))
                 print(f"[CANCEL_REJECTED] ticket={ticket} "
@@ -705,7 +708,10 @@ def reconcile_closed(broker: Broker, state: BotState) -> list[dict]:
                   "reason='position disappeared but deal history is not available yet'")
             continue
         profit = sum(deal["net"] for deal in deals)
-        costs = sum(deal["commission"] + deal["swap"] for deal in deals)
+        costs = sum(
+            deal["commission"] + deal["swap"] + deal.get("fee", 0.0)
+            for deal in deals
+        )
         r_value = profit / trade.risk_cash if trade.risk_cash else None
         trade.closed = True
         state.day_realised += profit
@@ -735,7 +741,7 @@ def flatten_all(broker: Broker, state: BotState, reason: str) -> None:
         # while every later order and position was still exposed.
         try:
             broker.cancel(ticket, reason)
-        except MT5Error as error:
+        except OrderRejected as error:
             refused.append(ticket)
             journal.write(JOURNAL_PATH, "flatten_rejected",
                           ticket=ticket, reason=str(error))
@@ -744,7 +750,7 @@ def flatten_all(broker: Broker, state: BotState, reason: str) -> None:
     for position in broker.positions():
         try:
             broker.close(position, reason)
-        except MT5Error as error:
+        except OrderRejected as error:
             refused.append(position.ticket)
             journal.write(JOURNAL_PATH, "flatten_rejected",
                           ticket=position.ticket, reason=str(error))
@@ -769,10 +775,11 @@ def prune(state: BotState, keep: int = 200) -> None:
 
 def describe(position: Position) -> str:
     swap = float(getattr(position, "swap", 0.0))
-    net = position.profit + swap
+    gross_plus_swap = position.profit + swap
     return (f"ticket={position.ticket} side={'BUY' if position.direction == 1 else 'SELL'} "
             f"volume={position.volume:g} entry={position.price_open} "
             f"sl={position.stop} tp={position.take_profit} "
-            f"gross={position.profit:+.2f} swap={swap:+.2f} net={net:+.2f} "
+            f"gross={position.profit:+.2f} swap={swap:+.2f} "
+            f"gross_plus_swap={gross_plus_swap:+.2f} "
             f"opened={position.opened_at:%Y-%m-%d %H:%M:%S} "
             f"comment={position.comment!r}")

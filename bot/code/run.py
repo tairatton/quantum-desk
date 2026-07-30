@@ -261,6 +261,12 @@ def floating_pnl(positions) -> float:
     )
 
 
+def checkpoint_state(broker: Broker, state: BotState) -> None:
+    """Persist terminal request usage together with the latest durable state."""
+    state.day_requests += broker.take_requests()
+    state.save(STATE_PATH)
+
+
 def print_exposure(positions, orders, *, label: str = "EXPOSURE") -> None:
     floating = floating_pnl(positions)
     print(f"[{label}] open_positions={len(positions)} pending_orders={len(orders)} "
@@ -516,9 +522,22 @@ def sleep_and_manage_split(broker: Broker, state: BotState, config_,
         )
         if unresolved:
             trader.sync_fills(broker, state)
-        trader.apply_breakeven(broker, state)
-        state.day_requests += broker.take_requests()
-        state.save(STATE_PATH)
+        live_tickets = trader.apply_breakeven(broker, state)
+        finished_candidate = any(
+            trade.position_tickets
+            and not trade.pending_tickets
+            and not trade.market_order_tickets
+            and not any(ticket in live_tickets
+                        for ticket in trade.position_tickets)
+            for trade in state.open_trades()
+            if trade.exit_mode == "be_33_33_34"
+        )
+        if finished_candidate:
+            # Both survivors can hit their stops between signal bars. Score and
+            # release the setup slot now instead of leaving stale exposure until
+            # the next M15/M30 pass.
+            trader.reconcile_closed(broker, state)
+        checkpoint_state(broker, state)
 
 
 PANEL_WIDTH = 100
@@ -712,7 +731,8 @@ def print_status(broker: Broker, state: BotState, config_) -> None:
                    f"{position.price_open} | SL {position.stop} | TP {position.take_profit} | "
                    f"Gross {position.profit:+.2f} | "
                    f"Swap {float(getattr(position, 'swap', 0.0)):+.2f} | "
-                   f"Net {position.profit + float(getattr(position, 'swap', 0.0)):+.2f}")
+                   f"Gross+Swap "
+                   f"{position.profit + float(getattr(position, 'swap', 0.0)):+.2f}")
         if trade:
             _panel_row("Managed by",
                        f"{trade.plan_id} | {trade.exit_mode or 'legacy'} | "
@@ -808,8 +828,7 @@ def reconcile_startup(broker: Broker, state: BotState, config_) -> None:
     # A pending TP1 may only become identifiable after sync_fills maps its order
     # ticket to the resulting position ticket, so check once more after sync.
     trader.apply_breakeven(broker, state)
-    state.day_requests += broker.take_requests()
-    state.save(STATE_PATH)
+    checkpoint_state(broker, state)
     journal.write(
         JOURNAL_PATH, "startup_sync",
         login=account["login"], server=account["server"],
@@ -939,8 +958,7 @@ def pass_once(broker: Broker, state: BotState, config_) -> None:
         trader.open_trade(broker, config_, state, intent, risk_basis)
 
     trader.prune(state)
-    state.day_requests += broker.take_requests()
-    state.save(STATE_PATH)
+    checkpoint_state(broker, state)
 
 
 def _seconds_to_next_close(server_time, timeframes) -> float:
@@ -1020,6 +1038,7 @@ def loop(broker: Broker, state: BotState, config_) -> None:
         except OrderRejected as error:
             # A broker refusal used to be called a lost connection, which spent
             # every pass reconnecting while the rejected ticket stayed exposed.
+            checkpoint_state(broker, state)
             print(status_line("ORDER_REJECTED", str(error), "warn"))
             journal.write(JOURNAL_PATH, "order_rejected", reason=str(error))
             continue
@@ -1028,6 +1047,7 @@ def loop(broker: Broker, state: BotState, config_) -> None:
             # connectivity. What stops is observation, BE moves, timeouts and new
             # entries. Reinitialize MT5 with bounded backoff, then reconcile state
             # before normal scanning resumes; never resend an existing order.
+            checkpoint_state(broker, state)
             delay = min(
                 config_.reconnect_initial_seconds * (2 ** min(reconnect_failures, 10)),
                 config_.reconnect_max_seconds,
@@ -1057,6 +1077,7 @@ def loop(broker: Broker, state: BotState, config_) -> None:
             try:
                 pass_once(broker, state, config_)
             except MT5Error as sync_error:
+                checkpoint_state(broker, state)
                 print(status_line(
                     "RECONCILE_WAIT",
                     f"reconnected but first sync is incomplete: {sync_error}",

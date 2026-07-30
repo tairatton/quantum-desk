@@ -212,6 +212,8 @@ class Settings:
             errors.append("reconnect_max_seconds must be >= reconnect_initial_seconds")
         if self.write_spacing_seconds < 0:
             errors.append("write_spacing_seconds must be >= 0")
+        if self.split_management_poll_seconds <= 0:
+            errors.append("split_management_poll_seconds must be > 0")
         if self.max_requests_per_day < 1:
             errors.append("max_requests_per_day must be >= 1")
         if self.news_minutes_before < 0 or self.news_minutes_after < 0:
