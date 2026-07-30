@@ -27,7 +27,7 @@
   "max_consecutive_losses": 3,
   "stop_at_target": true,
 
-  "_comment_exit": "Capital tier is anchored to the account's initial balance, not live balance/equity: below 30,000 uses one leg to fixed TP3; 30,000 or above requires three executable 33/33/34 legs and moves survivors to break-even only after TP1 is confirmed closed. The active policy never flips while an account is running.",
+  "_comment_exit": "Capital tier is anchored to the account's initial balance, not live balance/equity: below 30,000 uses one leg to fixed TP3; 30,000 or above requires three executable 33/33/34 legs and, only after TP1 is confirmed closed, moves each survivor to its actual broker fill plus commission, slippage, and cumulative negative swap. The stop is refreshed while survivors remain open; positive swap never loosens it. The active policy never flips while an account is running.",
   "exit_mode": "capital_tier",
   "split_exit_min_balance": 30000.0,
 

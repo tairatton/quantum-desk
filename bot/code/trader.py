@@ -14,6 +14,7 @@ still exactly what the plan asked for.
 """
 from __future__ import annotations
 
+import math
 from datetime import timedelta
 
 import pandas as pd
@@ -47,6 +48,54 @@ def _position_target_index(trade: ManagedTrade, position: Position) -> int:
         range(len(trade.targets)),
         key=lambda index: abs(position.take_profit - trade.targets[index]),
     )
+
+
+def _breakeven_cost_buffer(broker: Broker, position: Position | None = None) -> float:
+    """Price distance needed to cover costs and current negative swap.
+
+    The technique lab already charges commission and stop slippage that are
+    absent from bar data. Live break-even must use the same cost model;
+    otherwise a stop at the fill price still closes net-negative after fees.
+    Spread is not added here: a BUY position's actual ``price_open`` is the ask
+    and its stop executes against bid (vice versa for SELL), so the fill-to-exit
+    price difference already contains the spread.
+    """
+    symbol_key = getattr(broker, "symbol_key", "XAUUSD").upper()
+    costs = config.cost_cfg(symbol_key)
+    value_per_point = float(broker.spec.value_per_point or 0.0)
+    commission_price = (
+        float(costs.get("commission_per_lot", 0.0)) / value_per_point
+        if value_per_point > 0 else 0.0
+    )
+    try:
+        source_point = 10 ** -int(config.symbol_cfg(symbol_key)["decimals"])
+    except KeyError:
+        source_point = float(broker.spec.point)
+    slippage_price = float(costs.get("slippage_points", 0.0)) * source_point
+    negative_swap_price = 0.0
+    if position is not None and position.volume > 0 and value_per_point > 0:
+        # POSITION_SWAP is cumulative cash in the account currency. Positive
+        # swap is deliberately ignored: a future rate change must never loosen
+        # a stop that has already been tightened.
+        negative_swap_cash = max(0.0, -float(getattr(position, "swap", 0.0)))
+        negative_swap_price = (
+            negative_swap_cash / (value_per_point * position.volume)
+        )
+    return max(0.0, commission_price + slippage_price + negative_swap_price)
+
+
+def breakeven_stop(broker: Broker, position: Position) -> float:
+    """Cost-covered break-even based on this leg's authoritative broker fill."""
+    raw = (
+        position.price_open
+        + position.direction * _breakeven_cost_buffer(broker, position)
+    )
+    scale = 10 ** broker.spec.digits
+    # Round away from the losing side. Built-in round() can round a BUY stop
+    # down (or a SELL stop up), silently discarding the last cost-covering tick.
+    if position.direction == 1:
+        return math.ceil(raw * scale - 1e-9) / scale
+    return math.floor(raw * scale + 1e-9) / scale
 
 
 def _check_exit_mode(exit_mode: str, sizing, intent: Intent) -> str | None:
@@ -381,7 +430,7 @@ def _fill_bar_time(frames: dict[str, pd.DataFrame] | None, trade: ManagedTrade,
 
 
 def apply_breakeven(broker: Broker, state: BotState) -> None:
-    """Move the stop to entry once TP1 is banked.
+    """Move each survivor to its cost-covered broker fill once TP1 is banked.
 
     All legs share one stop, so if the TP1 leg is gone while later legs are still
     open, TP1 must have been taken rather than stopped out.
@@ -425,11 +474,19 @@ def apply_breakeven(broker: Broker, state: BotState) -> None:
         ]
         if not survivors:
             continue
-        desired_stop = round(trade.entry, broker.spec.digits)
         moved = []
         rejected = []
         already_protected = []
+        desired_stops = {}
+        cost_buffers = {}
+        swaps = {}
         for position in survivors:
+            desired_stop = breakeven_stop(broker, position)
+            desired_stops[position.ticket] = desired_stop
+            cost_buffers[position.ticket] = round(
+                _breakeven_cost_buffer(broker, position), broker.spec.digits,
+            )
+            swaps[position.ticket] = float(getattr(position, "swap", 0.0))
             # MT5 uses 0.0 for "no stop". For a SELL, the normal comparison
             # (entry < stop) is false against zero and used to misclassify a
             # completely unprotected survivor as already beyond break-even.
@@ -472,13 +529,16 @@ def apply_breakeven(broker: Broker, state: BotState) -> None:
                       tickets=[position.ticket for position in survivors],
                       moved_tickets=[position.ticket for position in moved],
                       already_protected=already_protected,
-                      stop=desired_stop)
+                      stops=desired_stops,
+                      cost_buffers=cost_buffers,
+                      swaps=swaps)
         if moved:
-            print(f"[STOP_MOVED] plan={trade.plan_id} mode=BREAK_EVEN stop={desired_stop} "
+            print(f"[STOP_MOVED] plan={trade.plan_id} mode=NET_BREAK_EVEN "
+                  f"stops={desired_stops} "
                   f"positions={[position.ticket for position in moved]}")
         else:
-            print(f"[STOP_CONFIRMED] plan={trade.plan_id} mode=BREAK_EVEN "
-                  f"stop={desired_stop} positions={already_protected}")
+            print(f"[STOP_CONFIRMED] plan={trade.plan_id} mode=NET_BREAK_EVEN "
+                  f"stops={desired_stops} positions={already_protected}")
 
 
 def _orphan_timeframe(comment: str, frames: dict[str, pd.DataFrame]) -> str | None:
@@ -708,8 +768,11 @@ def prune(state: BotState, keep: int = 200) -> None:
 
 
 def describe(position: Position) -> str:
+    swap = float(getattr(position, "swap", 0.0))
+    net = position.profit + swap
     return (f"ticket={position.ticket} side={'BUY' if position.direction == 1 else 'SELL'} "
             f"volume={position.volume:g} entry={position.price_open} "
             f"sl={position.stop} tp={position.take_profit} "
-            f"pnl={position.profit:+.2f} opened={position.opened_at:%Y-%m-%d %H:%M:%S} "
+            f"gross={position.profit:+.2f} swap={swap:+.2f} net={net:+.2f} "
+            f"opened={position.opened_at:%Y-%m-%d %H:%M:%S} "
             f"comment={position.comment!r}")

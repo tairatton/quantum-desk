@@ -74,6 +74,7 @@ class Position:
     stop: float
     take_profit: float
     profit: float
+    swap: float
     comment: str
     opened_at: datetime
 
@@ -300,6 +301,7 @@ class Broker:
             direction=1 if p.type == self.mt.POSITION_TYPE_BUY else -1,
             volume=float(p.volume), price_open=float(p.price_open),
             stop=float(p.sl), take_profit=float(p.tp), profit=float(p.profit),
+            swap=float(p.swap),
             comment=p.comment,
             opened_at=datetime.fromtimestamp(p.time, tz=timezone.utc).replace(tzinfo=None),
         ) for p in raw if p.magic == self.magic]

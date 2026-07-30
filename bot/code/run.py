@@ -253,8 +253,16 @@ def describe_order(order: dict) -> str:
             f"expires {expiry_text} comment={order.get('comment', '')!r}")
 
 
+def floating_pnl(positions) -> float:
+    """Open P/L including cumulative swap reported separately by MT5."""
+    return sum(
+        position.profit + float(getattr(position, "swap", 0.0))
+        for position in positions
+    )
+
+
 def print_exposure(positions, orders, *, label: str = "EXPOSURE") -> None:
-    floating = sum(position.profit for position in positions)
+    floating = floating_pnl(positions)
     print(f"[{label}] open_positions={len(positions)} pending_orders={len(orders)} "
           f"floating_pnl={floating:+.2f}")
     if not positions:
@@ -310,10 +318,9 @@ def active_setup_count(state: BotState, positions, orders) -> int:
 
 
 def needs_split_management(state: BotState) -> bool:
-    """Whether a split trade still needs ticket sync or its BE transition."""
+    """Whether a split trade needs ticket sync, BE, or swap-buffer refresh."""
     return any(
         trade.exit_mode == "be_33_33_34"
-        and not trade.breakeven_done
         and (
             len(trade.position_tickets) >= 2
             or bool(trade.pending_tickets)
@@ -340,7 +347,8 @@ def _target_name(trade, target: float) -> str:
     return min(choices, key=lambda item: abs(item[0] - reward_r))[1]
 
 
-def position_health(position, state: BotState, quote: dict) -> str:
+def position_health(position, state: BotState, quote: dict,
+                    broker: Broker | None = None) -> str:
     """Explain what owns a position and how far price is from its exits."""
     trade = _trade_for_ticket(state, position.ticket)
     side = "BUY" if position.direction == 1 else "SELL"
@@ -371,8 +379,36 @@ def position_health(position, state: BotState, quote: dict) -> str:
                    else position.stop > trade.stop + price_tolerance)
         if widened:
             flags.append("SL_WIDER_THAN_PLAN")
-        if abs(position.stop - trade.entry) <= max(risk * 1e-6, 1e-9):
-            flags.append("SL_AT_BE")
+        if trade.breakeven_done:
+            fill_tolerance = max(risk * 1e-6, 1e-9)
+            worse_than_fill = (
+                position.stop < position.price_open - fill_tolerance
+                if trade.direction == 1
+                else position.stop > position.price_open + fill_tolerance
+            )
+            at_fill = abs(position.stop - position.price_open) <= fill_tolerance
+            desired_net_stop = (
+                trader.breakeven_stop(broker, position)
+                if broker is not None else position.price_open
+            )
+            below_net = (
+                position.stop < desired_net_stop - fill_tolerance
+                if trade.direction == 1
+                else position.stop > desired_net_stop + fill_tolerance
+            )
+            if worse_than_fill:
+                # A historical bug moved split survivors to the signal entry,
+                # which can be materially worse than their market fill.
+                flags.append("BE_STOP_BELOW_FILL")
+            elif below_net:
+                # Commission, slippage or newly accrued negative swap is not
+                # fully covered yet. The fast management loop will tighten it.
+                flags.append("BE_STOP_BELOW_NET")
+            elif at_fill:
+                # Gross price break-even still loses commission.
+                flags.append("SL_AT_GROSS_BE")
+            else:
+                flags.append("SL_AT_NET_BE")
     status = ",".join(flags) if flags else "PROTECTED"
     role = _target_name(trade, position.take_profit)
     return (
@@ -471,10 +507,15 @@ def sleep_and_manage_split(broker: Broker, state: BotState, config_,
         remaining -= interval
         if remaining <= 0 or not fast or budget_near_limit:
             continue
-        # A pending fill or a market order whose position visibility lagged
-        # cannot be managed until its order ticket is mapped. Reconcile tickets
-        # in the same fast loop that watches for TP1, then move survivors.
-        trader.sync_fills(broker, state)
+        # Ticket history is only needed while an order is unresolved. Once BE
+        # is active, this loop remains alive to refresh negative swap but can do
+        # that with one positions_get request.
+        unresolved = any(
+            trade.pending_tickets or trade.market_order_tickets
+            for trade in state.open_trades()
+        )
+        if unresolved:
+            trader.sync_fills(broker, state)
         trader.apply_breakeven(broker, state)
         state.day_requests += broker.take_requests()
         state.save(STATE_PATH)
@@ -652,7 +693,7 @@ def print_status(broker: Broker, state: BotState, config_) -> None:
         _panel_row("News warning", calendar.error, _Ansi.YELLOW)
 
     _panel_section("Exposure")
-    floating = sum(position.profit for position in positions)
+    floating = floating_pnl(positions)
     _panel_row("Summary", f"Positions {len(positions)}    Pending {len(orders)}    "
                f"Floating P/L {floating:+,.2f}")
     _, capacity = entry_capacity(
@@ -669,7 +710,9 @@ def print_status(broker: Broker, state: BotState, config_) -> None:
         _panel_row(f"Position #{position.ticket}",
                    f"{'BUY' if position.direction == 1 else 'SELL'} {position.volume:g} @ "
                    f"{position.price_open} | SL {position.stop} | TP {position.take_profit} | "
-                   f"P/L {position.profit:+.2f}")
+                   f"Gross {position.profit:+.2f} | "
+                   f"Swap {float(getattr(position, 'swap', 0.0)):+.2f} | "
+                   f"Net {position.profit + float(getattr(position, 'swap', 0.0)):+.2f}")
         if trade:
             _panel_row("Managed by",
                        f"{trade.plan_id} | {trade.exit_mode or 'legacy'} | "
@@ -694,7 +737,8 @@ def print_status(broker: Broker, state: BotState, config_) -> None:
     _panel_border("=")
     print_management_alerts(state, positions, orders)
     for position in positions:
-        print(f"[POSITION_HEALTH] {position_health(position, state, quote)}")
+        print(f"[POSITION_HEALTH] "
+              f"{position_health(position, state, quote, broker)}")
     for order in orders:
         print(f"[PENDING_HEALTH] {pending_health(order, state, now)}")
     print(f"[ENTRY_CAPACITY] {capacity}")
@@ -754,6 +798,10 @@ def reconcile_startup(broker: Broker, state: BotState, config_) -> None:
         # channel is unavailable.
         trader.sync_fills(broker, state)
         trader.apply_breakeven(broker, state)
+    # Positions may have hit TP/SL while the process was down. Score them before
+    # loading chart bars so startup capacity and loss-streak state are correct
+    # immediately, even if the price-history channel is unavailable.
+    trader.reconcile_closed(broker, state)
     frames = {timeframe: broker.bars(timeframe, config_.history_bars)
               for timeframe in config_.timeframes}
     trader.sync_fills(broker, state, frames)
@@ -929,7 +977,7 @@ def loop(broker: Broker, state: BotState, config_) -> None:
             next_check = server_time + timedelta(seconds=sleep_seconds)
             positions = broker.positions()
             orders = broker.pending_orders()
-            floating = sum(position.profit for position in positions)
+            floating = floating_pnl(positions)
             exposure_level = "ok" if not positions and not orders else "live"
             # A frozen feed produced heartbeats that looked entirely normal while
             # the bot could not see a bar close at all. Say so instead.
@@ -947,7 +995,8 @@ def loop(broker: Broker, state: BotState, config_) -> None:
             print(status_line("HEARTBEAT", heartbeat, exposure_level), flush=True)
             for position in positions:
                 print(f"[POSITION] {trader.describe(position)}")
-                print(f"[POSITION_HEALTH] {position_health(position, state, quote)}")
+                print(f"[POSITION_HEALTH] "
+                      f"{position_health(position, state, quote, broker)}")
             for order in orders:
                 print(f"[PENDING] {describe_order(order)}")
                 print(f"[PENDING_HEALTH] {pending_health(order, state, server_time)}")

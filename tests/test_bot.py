@@ -7,7 +7,9 @@ how much to risk and whether a trade is allowed at all.
 from __future__ import annotations
 
 import sys
+import tempfile
 import unittest
+from unittest import mock
 from dataclasses import dataclass, replace
 from datetime import date, timedelta
 from pathlib import Path
@@ -461,12 +463,35 @@ class StateTests(unittest.TestCase):
                 {"login": 456, "server": "FTMO-Demo", "balance": 50_000})
 
     def test_atomic_save_leaves_no_temporary_file(self):
-        import tempfile
-
         with tempfile.TemporaryDirectory() as folder:
             path = Path(folder) / "state.json"
             BotState(initial_balance=50_000).save(path)
             self.assertTrue(path.exists())
+            self.assertFalse(path.with_name("state.json.tmp").exists())
+            self.assertEqual(BotState.load(path).initial_balance, 50_000)
+
+    def test_atomic_save_retries_a_transient_windows_file_lock(self):
+        from bot.code import state as state_module
+
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "state.json"
+            real_replace = state_module.os.replace
+            attempts = 0
+
+            def temporarily_locked(source, destination):
+                nonlocal attempts
+                attempts += 1
+                if attempts < 3:
+                    raise PermissionError(5, "Access is denied", str(destination))
+                real_replace(source, destination)
+
+            with mock.patch.object(state_module.os, "replace",
+                                   side_effect=temporarily_locked), \
+                    mock.patch.object(state_module.time, "sleep") as sleep:
+                BotState(initial_balance=50_000).save(path)
+
+            self.assertEqual(attempts, 3)
+            self.assertEqual(sleep.call_count, 2)
             self.assertFalse(path.with_name("state.json.tmp").exists())
             self.assertEqual(BotState.load(path).initial_balance, 50_000)
 

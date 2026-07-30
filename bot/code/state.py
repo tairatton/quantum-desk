@@ -9,9 +9,13 @@ from __future__ import annotations
 
 import json
 import os
+import time
 from dataclasses import asdict, dataclass, field, fields
 from datetime import date
 from pathlib import Path
+
+
+_REPLACE_RETRY_DELAYS = (0.02, 0.05, 0.10, 0.20, 0.40, 0.80)
 
 
 @dataclass
@@ -130,7 +134,20 @@ class BotState:
             json.dump(payload, handle, indent=2, ensure_ascii=False)
             handle.flush()
             os.fsync(handle.fileno())
-        os.replace(temporary, path)
+        # On Windows, indexers, antivirus and editor file watchers can briefly
+        # open the destination without FILE_SHARE_DELETE.  MoveFileEx (which
+        # backs os.replace) then raises WinError 5 even though the fully-fsynced
+        # temporary snapshot is ready.  A short bounded retry preserves the
+        # atomic-write contract without letting a transient reader crash the
+        # live process immediately after an order was accepted.
+        for delay in (*_REPLACE_RETRY_DELAYS, None):
+            try:
+                os.replace(temporary, path)
+                break
+            except PermissionError:
+                if delay is None:
+                    raise
+                time.sleep(delay)
 
     def bind_account(self, account: dict) -> bool:
         """Bind legacy/fresh state to one login, or fail closed on a mismatch.

@@ -162,7 +162,10 @@ class Settings:
     # touching a setting. Naming the exit makes that a decision instead.
     #
     #   fixed_tp3       one leg, closed at TP3 (2R). What the study selected.
-    #   be_33_33_34     three legs 33/33/34, stop to entry once TP1 banks.
+    #   be_33_33_34     three legs 33/33/34; after TP1, each survivor moves to
+    #                   its actual broker fill plus estimated costs/slippage
+    #                   and any cumulative negative swap. The stop is refreshed
+    #                   while the position remains open.
     #                   Refuses the trade when the balance cannot split.
     #   capital_tier    fixed_tp3 below `split_exit_min_balance`, otherwise
     #                   be_33_33_34. The caller must pass the initial balance,

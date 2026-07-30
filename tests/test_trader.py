@@ -88,6 +88,7 @@ class FakePos:
     stop: float = 3984.0
     take_profit: float = 4016.0
     profit: float = 0.0
+    swap: float = 0.0
     symbol: str = "XAUUSDm"
     comment: str = ""
     opened_at: datetime = datetime(2026, 7, 27, 12, 0)
@@ -98,6 +99,7 @@ class FakeBroker:
     """Records writes instead of sending them."""
     dry_run: bool = False
     spec: SymbolSpec = GOLD
+    symbol_key: str = "XAUUSD"
     server_time: datetime = datetime(2026, 7, 27, 12, 0)
     _positions: list = field(default_factory=list)
     _orders: list = field(default_factory=list)
@@ -318,7 +320,7 @@ class TraderPathsTests(unittest.TestCase):
         self.assertEqual(trade.market_order_tickets, [])
         self.assertEqual(trade.tp1_position_ticket, 301)
         self.assertEqual(sorted(broker.stops_moved),
-                         [(302, trade.entry), (303, trade.entry)])
+                         [(302, 4000.12), (303, 4000.12)])
         self.assertTrue(trade.breakeven_done)
 
     def test_a_rejected_second_leg_keeps_the_first_under_management(self):
@@ -389,7 +391,7 @@ class TraderPathsTests(unittest.TestCase):
         ]
         trader.apply_breakeven(broker, self.state)
 
-        self.assertIn((tp2_position, trade.entry), broker.stops_moved)
+        self.assertIn((tp2_position, 4000.12), broker.stops_moved)
         self.assertTrue(trade.breakeven_done)
 
     def test_unresolved_real_tp1_identity_never_uses_tp2_as_a_fallback(self):
@@ -439,7 +441,7 @@ class TraderPathsTests(unittest.TestCase):
         trader.apply_breakeven(broker, self.state)
         self.assertEqual(
             sorted(broker.stops_moved),
-            [(302, trade.entry), (303, trade.entry)],
+            [(302, 4000.12), (303, 4000.12)],
         )
         self.assertTrue(trade.breakeven_done)
     def test_missing_pending_order_waits_when_mt5_history_is_not_ready(self):
@@ -483,8 +485,67 @@ class TraderPathsTests(unittest.TestCase):
         broker._positions = [p for p in broker._positions if p.ticket != first]
         trader.apply_breakeven(broker, self.state)
         self.assertEqual(sorted(ticket for ticket, _ in broker.stops_moved), sorted(rest))
-        self.assertTrue(all(stop == trade.entry for _, stop in broker.stops_moved))
+        self.assertTrue(all(stop == 4000.12 for _, stop in broker.stops_moved))
         self.assertTrue(trade.breakeven_done)
+
+    def test_breakeven_uses_each_market_leg_actual_fill_not_signal_entry(self):
+        broker = FakeBroker()
+        trade = trader.open_trade(broker, self.settings, self.state, intent(), 100_000.0)
+        first, second, third = trade.position_tickets
+        broker._positions = [
+            position for position in broker._positions if position.ticket != first
+        ]
+        broker._positions[0].price_open = 4002.03
+        broker._positions[1].price_open = 4002.08
+
+        trader.apply_breakeven(broker, self.state)
+
+        self.assertEqual(
+            broker.stops_moved,
+            [(second, 4002.15), (third, 4002.20)],
+        )
+        self.assertTrue(trade.breakeven_done)
+
+    def test_negative_swap_tightens_an_already_completed_breakeven(self):
+        broker = FakeBroker()
+        trade = trader.open_trade(broker, self.settings, self.state, intent(), 100_000.0)
+        first, second, third = trade.position_tickets
+        broker._positions = [
+            position for position in broker._positions if position.ticket != first
+        ]
+        trader.apply_breakeven(broker, self.state)
+        self.assertEqual(
+            broker.stops_moved,
+            [(second, 4000.12), (third, 4000.12)],
+        )
+
+        # MT5 reports swap as cumulative cash. $1.60 on 0.08 lot is a $0.20
+        # price cost; $2.70 on 0.09 lot is $0.30.
+        broker._positions[0].swap = -1.60
+        broker._positions[1].swap = -2.70
+        trader.apply_breakeven(broker, self.state)
+
+        self.assertEqual(
+            broker.stops_moved[-2:],
+            [(second, 4000.32), (third, 4000.42)],
+        )
+        self.assertTrue(trade.breakeven_done)
+
+    def test_positive_swap_never_loosens_a_cost_covered_stop(self):
+        broker = FakeBroker()
+        trade = trader.open_trade(broker, self.settings, self.state, intent(), 100_000.0)
+        first, *_ = trade.position_tickets
+        broker._positions = [
+            position for position in broker._positions if position.ticket != first
+        ]
+        trader.apply_breakeven(broker, self.state)
+        original_moves = list(broker.stops_moved)
+
+        for position in broker._positions:
+            position.swap = 10.0
+        trader.apply_breakeven(broker, self.state)
+
+        self.assertEqual(broker.stops_moved, original_moves)
 
     def test_one_rejected_breakeven_move_does_not_abort_the_other_survivor(self):
         """The first refusal escaped the loop, so the other survivor kept its
@@ -501,7 +562,7 @@ class TraderPathsTests(unittest.TestCase):
         first, rejected, accepted = trade.position_tickets
         broker._positions = [position for position in broker._positions if position.ticket != first]
         trader.apply_breakeven(broker, self.state)
-        self.assertEqual(broker.stops_moved, [(accepted, trade.entry)])
+        self.assertEqual(broker.stops_moved, [(accepted, 4000.12)])
         self.assertFalse(trade.breakeven_done)
 
     def test_partial_breakeven_is_retried_until_every_survivor_is_protected(self):
@@ -521,13 +582,13 @@ class TraderPathsTests(unittest.TestCase):
 
         trader.apply_breakeven(broker, self.state)
         self.assertFalse(trade.breakeven_done)
-        self.assertEqual(broker.stops_moved, [(accepted, trade.entry)])
+        self.assertEqual(broker.stops_moved, [(accepted, 4000.12)])
 
         trader.apply_breakeven(broker, self.state)
         self.assertTrue(trade.breakeven_done)
         self.assertEqual(
             broker.stops_moved,
-            [(accepted, trade.entry), (retried, trade.entry)],
+            [(accepted, 4000.12), (retried, 4000.12)],
         )
 
     def test_a_stale_done_flag_is_repaired_when_a_survivor_is_not_at_be(self):
@@ -593,6 +654,34 @@ class TraderPathsTests(unittest.TestCase):
         sync.assert_called_once_with(broker, self.state)
         apply.assert_called_once_with(broker, self.state)
 
+    def test_fast_split_wait_refreshes_swap_without_ticket_history_requests(self):
+        trade = ManagedTrade(
+            plan_id="M15@swap-refresh", timeframe="M15", direction=1,
+            entry=4000.0, stop=3984.0, risk=16.0, risk_cash=400.0,
+            targets=[4016.0, 4024.0, 4032.0], legs=[0.08, 0.08, 0.09],
+            position_tickets=[101, 102, 103], tp1_position_ticket=101,
+            breakeven_done=True, exit_mode="be_33_33_34",
+        )
+        self.state.trades[trade.plan_id] = trade
+        broker = FakeBroker()
+        broker.requests = 0
+        broker.take_requests = lambda: 0
+        config_ = SimpleNamespace(
+            split_management_poll_seconds=1,
+            max_requests_per_day=2_000,
+        )
+
+        with tempfile.TemporaryDirectory() as folder, \
+                mock.patch.object(run, "STATE_PATH",
+                                  Path(folder) / "state.json"), \
+                mock.patch.object(run.time, "sleep"), \
+                mock.patch.object(trader, "sync_fills") as sync, \
+                mock.patch.object(trader, "apply_breakeven") as apply:
+            run.sleep_and_manage_split(broker, self.state, config_, 2)
+
+        sync.assert_not_called()
+        apply.assert_called_once_with(broker, self.state)
+
     def test_dry_run_cannot_mark_real_survivors_as_protected(self):
         broker = FakeBroker()
         trade = trader.open_trade(broker, self.settings, self.state, intent(), 100_000.0)
@@ -607,10 +696,10 @@ class TraderPathsTests(unittest.TestCase):
         self.assertEqual(broker.stops_moved, [])
         self.assertFalse(trade.breakeven_done)
 
-    def test_be_comparison_uses_the_price_precision_sent_to_the_broker(self):
+    def test_be_comparison_uses_the_cost_covered_price_sent_to_the_broker(self):
         broker = FakeBroker(_positions=[
-            FakePos(ticket=102, stop=4000.0),
-            FakePos(ticket=103, stop=4000.0),
+            FakePos(ticket=102, stop=4000.12),
+            FakePos(ticket=103, stop=4000.12),
         ])
         trade = ManagedTrade(
             plan_id="M15@rounded", timeframe="M15", direction=1,
@@ -643,7 +732,7 @@ class TraderPathsTests(unittest.TestCase):
         trader.apply_breakeven(broker, self.state)
 
         self.assertEqual(sorted(broker.stops_moved),
-                         [(402, trade.entry), (403, trade.entry)])
+                         [(402, 3999.88), (403, 3999.88)])
         self.assertTrue(trade.breakeven_done)
 
     def test_startup_reconciliation_moves_survivors_after_offline_tp1(self):
@@ -686,6 +775,52 @@ class TraderPathsTests(unittest.TestCase):
             sorted(survivors),
         )
         self.assertTrue(trade.breakeven_done)
+
+    def test_startup_scores_positions_that_closed_while_bot_was_offline(self):
+        class StartupBroker(FakeBroker):
+            requests = 0
+
+            def account(self):
+                return {
+                    "login": 1, "server": "test",
+                    "balance": 100_050.0, "equity": 100_050.0,
+                }
+
+            def bars(self, timeframe, count):
+                return bars(count)
+
+            def take_requests(self):
+                return 0
+
+        broker = StartupBroker()
+        trade = trader.open_trade(
+            broker, self.settings, self.state, intent(), 100_000.0,
+        )
+        broker._positions = []
+        broker.deals = [
+            {
+                "position": ticket, "profit": 20.0, "commission": -1.0,
+                "swap": -0.5, "net": 18.5,
+            }
+            for ticket in trade.position_tickets
+        ]
+        config_ = SimpleNamespace(
+            timeframes=("M15",), history_bars=300, initial_balance=100_000.0,
+        )
+
+        with mock.patch.object(
+                run, "_bind_and_anchor",
+                return_value=(broker.tick(), broker.account())), \
+                mock.patch.object(run, "STATE_PATH",
+                                  Path(self.tmp.name) / "startup-state.json"), \
+                mock.patch.object(run, "JOURNAL_PATH",
+                                  Path(self.tmp.name) / "startup-journal.jsonl"):
+            run.reconcile_startup(broker, self.state, config_)
+
+        self.assertTrue(trade.closed)
+        self.assertAlmostEqual(self.state.day_realised, 55.5)
+        self.assertEqual(run.active_setup_count(
+            self.state, broker.positions(), broker.pending_orders()), 0)
 
     def test_startup_protects_known_survivors_even_if_bar_loading_fails(self):
         class FailingBarsBroker(FakeBroker):
@@ -768,7 +903,7 @@ class TraderPathsTests(unittest.TestCase):
         self.assertEqual(trade.tp1_position_ticket, 301)
         self.assertEqual(
             sorted(broker.stops_moved),
-            [(302, trade.entry), (303, trade.entry)],
+            [(302, 4000.12), (303, 4000.12)],
         )
 
     def test_all_rejected_breakeven_moves_leave_the_trade_retryable(self):
@@ -990,6 +1125,49 @@ class TerminalNotificationTests(unittest.TestCase):
              "server_time": datetime(2026, 7, 28)})
         self.assertIn("MISSING_SL", health)
         self.assertIn("MISSING_TP", health)
+
+    def test_floating_pnl_includes_negative_swap(self):
+        positions = [
+            FakePos(ticket=710, profit=12.50, swap=-1.25),
+            FakePos(ticket=711, profit=-2.00, swap=-0.50),
+        ]
+        self.assertEqual(run.floating_pnl(positions), 8.75)
+
+    def test_position_health_rejects_signal_entry_as_fill_breakeven(self):
+        state = BotState(initial_balance=50_000.0)
+        trade = ManagedTrade(
+            plan_id="M15@bad-be", timeframe="M15", direction=1,
+            entry=4088.77, stop=4062.34, risk=26.43, risk_cash=200.0,
+            targets=[4115.20, 4128.41, 4141.63], legs=[0.03, 0.02, 0.03],
+            position_tickets=[801, 802, 803], tp1_position_ticket=801,
+            breakeven_done=True, exit_mode="be_33_33_34",
+        )
+        state.trades[trade.plan_id] = trade
+
+        bad = run.position_health(
+            FakePos(ticket=802, price_open=4091.30, stop=4088.77),
+            state,
+            {"bid": 4103.0, "ask": 4103.4,
+             "server_time": datetime(2026, 7, 30)},
+        )
+        repaired = run.position_health(
+            FakePos(ticket=803, price_open=4091.27, stop=4091.39),
+            state,
+            {"bid": 4103.0, "ask": 4103.4,
+             "server_time": datetime(2026, 7, 30)},
+        )
+        stale_after_swap = run.position_health(
+            FakePos(ticket=802, volume=0.02, price_open=4091.30,
+                    stop=4091.42, swap=-0.40),
+            state,
+            {"bid": 4103.0, "ask": 4103.4,
+             "server_time": datetime(2026, 7, 30)},
+            FakeBroker(),
+        )
+
+        self.assertIn("BE_STOP_BELOW_FILL", bad)
+        self.assertIn("SL_AT_NET_BE", repaired)
+        self.assertIn("BE_STOP_BELOW_NET", stale_after_swap)
 
     def test_entry_capacity_reports_risk_room_and_allowed_side(self):
         settings = replace(Settings(), exit_mode="fixed_tp3")
@@ -1512,9 +1690,9 @@ class ExitModeTests(unittest.TestCase):
         threshold_broker._positions = threshold_broker._positions[1:]
         trader.apply_breakeven(threshold_broker, threshold_state)
         self.assertEqual(len(threshold_broker.stops_moved), 2)
-        self.assertTrue(all(stop == threshold.entry
+        self.assertTrue(all(stop == 4000.12
                             for _, stop in threshold_broker.stops_moved))
-        self.assertFalse(run.needs_split_management(threshold_state))
+        self.assertTrue(run.needs_split_management(threshold_state))
 
     def test_capital_tier_never_flips_when_live_balance_crosses_threshold(self):
         settings = replace(Settings(), exit_mode="capital_tier",
