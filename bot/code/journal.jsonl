@@ -157,3 +157,16 @@
 {"at": "2026-07-30T21:50:04", "event": "startup_sync", "login": 1514115848, "server": "FTMO-Demo", "managed_trades": 0, "position_tickets": [], "pending_tickets": [], "market_order_tickets": []}
 {"at": "2026-07-30T21:50:05", "event": "bot_started", "mode": "LIVE", "login": 1514115848, "server": "FTMO-Demo", "symbol": "XAUUSD", "timeframes": ["M15", "M30"]}
 {"at": "2026-07-30T21:50:05", "event": "heartbeat", "mode": "LIVE", "server_time": "2026-07-30 17:50:03", "positions": 0, "pending_orders": 0, "floating_pnl": 0, "entry_capacity": "YES | capacity only | setups 0/2 | risk 0.00/0.80% | allowed side BUY/SELL"}
+{"at": "2026-07-31T19:54:25", "event": "status_checked", "mode": "DRY-RUN", "login": 1514115848, "server": "FTMO-Demo"}
+{"at": "2026-07-31T19:55:59", "event": "startup_sync", "login": 1514115848, "server": "FTMO-Demo", "managed_trades": 0, "position_tickets": [], "pending_tickets": [], "market_order_tickets": []}
+{"at": "2026-07-31T20:00:19", "event": "startup_sync", "login": 1514115848, "server": "FTMO-Demo", "managed_trades": 0, "position_tickets": [], "pending_tickets": [], "market_order_tickets": []}
+{"at": "2026-07-31T20:01:30", "event": "startup_sync", "login": 1514115848, "server": "FTMO-Demo", "managed_trades": 0, "position_tickets": [], "pending_tickets": [], "market_order_tickets": []}
+{"at": "2026-07-31T20:09:13", "event": "startup_sync", "login": 1514115848, "server": "FTMO-Demo", "managed_trades": 0, "position_tickets": [], "pending_tickets": [], "market_order_tickets": []}
+{"at": "2026-07-31T20:11:35", "event": "startup_sync", "login": 1514115848, "server": "FTMO-Demo", "managed_trades": 0, "position_tickets": [], "pending_tickets": [], "market_order_tickets": []}
+{"at": "2026-07-31T20:13:33", "event": "startup_sync", "login": 1514115848, "server": "FTMO-Demo", "managed_trades": 0, "position_tickets": [], "pending_tickets": [], "market_order_tickets": []}
+{"at": "2026-07-31T20:26:25", "event": "startup_sync", "login": 1514115848, "server": "FTMO-Demo", "managed_trades": 0, "position_tickets": [], "pending_tickets": [], "market_order_tickets": []}
+{"at": "2026-07-31T21:39:57", "event": "startup_sync", "login": 1514115848, "server": "FTMO-Demo", "managed_trades": 0, "position_tickets": [], "pending_tickets": [], "market_order_tickets": []}
+{"at": "2026-07-31T21:40:00", "event": "entry_blocked", "plan_id": "M15@2026-07-31 17:15:00", "reason": "already managing 3 active setup(s)", "after_conversion": false}
+{"at": "2026-07-31T21:56:00", "event": "orphan_setup_recovered", "plan_id": "M15@recovered-2026-07-31 17:22:24", "timeframe": "M15", "direction": -1, "position_tickets": [509416446, 509416480, 509416503], "risk_cash": 194.8}
+{"at": "2026-07-31T21:56:11", "event": "status_checked", "mode": "DRY-RUN", "login": 1514115848, "server": "FTMO-Demo"}
+{"at": "2026-07-31T22:01:13", "event": "status_checked", "mode": "DRY-RUN", "login": 1514115848, "server": "FTMO-Demo"}

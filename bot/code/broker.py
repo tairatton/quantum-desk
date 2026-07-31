@@ -201,9 +201,15 @@ class Broker:
         info = self.mt.account_info()
         if info is None:
             raise MT5Error("account_info() returned nothing.")
+        margin_mode = int(getattr(info, "margin_mode", -1))
+        hedging_mode = int(getattr(
+            self.mt, "ACCOUNT_MARGIN_MODE_RETAIL_HEDGING", 2
+        ))
         return {"login": info.login, "server": info.server, "currency": info.currency,
                 "balance": float(info.balance), "equity": float(info.equity),
-                "margin_free": float(info.margin_free)}
+                "margin_free": float(info.margin_free),
+                "margin_mode": margin_mode,
+                "is_hedging": margin_mode == hedging_mode}
 
     def tick(self) -> dict:
         self._requests += 1
@@ -346,10 +352,12 @@ class Broker:
 
     def filled_order_positions(self, order_tickets: list[int],
                                since: datetime | None = None) -> dict[int, int]:
-        """Map filled pending-order tickets to their MT5 position identifiers.
+        """Map order/deal recovery tickets to their MT5 position identifiers.
 
-        Order tickets and position tickets are not guaranteed to be equal. The
-        deal history is the authoritative bridge between the two identifiers.
+        Market execution can return a deal ticket without a usable order ticket,
+        while pending execution starts from an order ticket. Neither identifier
+        is guaranteed to equal the resulting position ticket, so deal history is
+        the authoritative bridge for both forms.
         """
         wanted = {int(ticket) for ticket in order_tickets}
         if not wanted:
@@ -363,13 +371,52 @@ class Broker:
             raise MT5Error(
                 f"history_deals_get(order mapping) failed: ({code}) {desc}"
             )
-        return {
-            int(deal.order): int(deal.position_id)
-            for deal in deals
-            if deal.magic == self.magic and deal.symbol == self.spec.name
-            and int(getattr(deal, "order", 0) or 0) in wanted
-            and int(getattr(deal, "position_id", 0) or 0)
-        }
+        mapped = {}
+        for deal in deals:
+            if deal.magic != self.magic or deal.symbol != self.spec.name:
+                continue
+            position_ticket = int(getattr(deal, "position_id", 0) or 0)
+            if not position_ticket:
+                continue
+            order_ticket = int(getattr(deal, "order", 0) or 0)
+            deal_ticket = int(getattr(deal, "ticket", 0) or 0)
+            if order_ticket in wanted:
+                mapped[order_ticket] = position_ticket
+            if deal_ticket in wanted:
+                mapped[deal_ticket] = position_ticket
+        return mapped
+
+    def account_cashflow_since(self, since_server: datetime) -> float:
+        """Net balance-changing cash flow since a broker-server timestamp.
+
+        This intentionally includes every symbol and magic number. FTMO's
+        daily-loss reference belongs to the whole account, so commissions,
+        swaps, deposits and any non-bot trade must be reflected when a restart
+        reconstructs the balance recorded at 00:00 CE(S)T.
+        """
+        until = datetime.now() + timedelta(days=1)
+        start = since_server - timedelta(days=1)
+        self._requests += 1
+        deals = self.mt.history_deals_get(start, until)
+        if deals is None:
+            code, desc = self.mt.last_error()
+            raise MT5Error(
+                f"history_deals_get(account cash flow) failed: ({code}) {desc}"
+            )
+        total = 0.0
+        for deal in deals:
+            deal_time = datetime.fromtimestamp(
+                deal.time, tz=timezone.utc,
+            ).replace(tzinfo=None)
+            if deal_time < since_server:
+                continue
+            total += (
+                float(getattr(deal, "profit", 0.0) or 0.0)
+                + float(getattr(deal, "commission", 0.0) or 0.0)
+                + float(getattr(deal, "swap", 0.0) or 0.0)
+                + float(getattr(deal, "fee", 0.0) or 0.0)
+            )
+        return total
 
     def finished_order_states(self, order_tickets: list[int],
                               since: datetime | None = None) -> dict[int, str]:
@@ -399,7 +446,7 @@ class Broker:
             and int(order.ticket) in wanted
         }
     def closed_deals(self, since: datetime) -> list[dict]:
-        """Deals in a window, with the full cost of each one.
+        """Deals in a window, with cost and entry/exit classification.
 
         `deal.profit` is the price result only: MT5 reports commission and swap
         as separate fields. Scoring on profit alone would flatter every live R
@@ -419,6 +466,11 @@ class Broker:
             raise MT5Error(
                 f"history_deals_get(closed deals) failed: ({code}) {desc}"
             )
+        exit_entries = {
+            int(getattr(self.mt, "DEAL_ENTRY_OUT", 1)),
+            int(getattr(self.mt, "DEAL_ENTRY_INOUT", 2)),
+            int(getattr(self.mt, "DEAL_ENTRY_OUT_BY", 3)),
+        }
         return [{"ticket": d.ticket, "order": d.order, "position": d.position_id,
                  "volume": float(d.volume),
                  "price": float(d.price), "profit": float(d.profit),
@@ -428,6 +480,7 @@ class Broker:
                          + float(d.swap)
                          + float(getattr(d, "fee", 0.0) or 0.0)),
                  "comment": d.comment, "entry": d.entry,
+                 "is_exit": int(d.entry) in exit_entries,
                  "time": datetime.fromtimestamp(d.time, tz=timezone.utc).replace(tzinfo=None)}
                 for d in deals if d.magic == self.magic and d.symbol == self.spec.name]
 
@@ -470,7 +523,8 @@ class Broker:
         print(f"[ORDER_SUBMITTED] action={what!r} ticket={result.order or result.deal} "
               f"price={float(result.price or 0):.{self.spec.digits}f}")
         return {"dry_run": False, "retcode": result.retcode,
-                "order": result.order, "deal": result.deal, "price": result.price}
+                "order": result.order, "deal": result.deal, "price": result.price,
+                "volume": float(getattr(result, "volume", 0.0) or 0.0)}
 
     def _volume(self, volume: float) -> float:
         """Round to the symbol's own step, not a hard-coded two decimals.
@@ -484,14 +538,23 @@ class Broker:
         return round(volume, decimals)
 
     def market_entry(self, direction: int, volume: float, stop: float,
-                     take_profit: float, comment: str) -> dict:
+                     take_profit: float, comment: str,
+                     worst_price: float | None = None) -> dict:
         self._pace()
         quote = self.tick()
+        price = quote["ask"] if direction == 1 else quote["bid"]
+        if worst_price is not None and (
+                (direction == 1 and price > worst_price)
+                or (direction == -1 and price < worst_price)):
+            raise OrderRejected(
+                f"market price {price:.{self.spec.digits}f} passed the per-leg "
+                f"limit {worst_price:.{self.spec.digits}f}"
+            )
         return self._send({
             "action": self.mt.TRADE_ACTION_DEAL, "symbol": self.spec.name,
             "volume": self._volume(volume),
             "type": self.mt.ORDER_TYPE_BUY if direction == 1 else self.mt.ORDER_TYPE_SELL,
-            "price": quote["ask"] if direction == 1 else quote["bid"],
+            "price": price,
             "sl": round(stop, self.spec.digits), "tp": round(take_profit, self.spec.digits),
             "deviation": self.deviation, "magic": self.magic, "comment": comment[:31],
             "type_time": self.mt.ORDER_TIME_GTC, "type_filling": self.spec.filling,

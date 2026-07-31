@@ -29,32 +29,53 @@ class Verdict:
 ALLOWED = Verdict(True, "ok")
 
 
+def daily_loss_floor(settings: Settings, state: BotState,
+                     fallback_balance: float = 0.0) -> float:
+    """FTMO 2-Step floor: midnight balance minus a fixed initial-capital amount."""
+    reference = float(state.day_start_balance or 0.0)
+    initial = float(state.initial_balance or settings.initial_balance
+                    or fallback_balance or 0.0)
+    if reference <= 0 or initial <= 0:
+        return 0.0
+    return reference - initial * settings.daily_loss_percent / 100.0
+
+
+def internal_daily_floor(settings: Settings, state: BotState,
+                         initial_balance: float) -> float:
+    """Internal stop on the same fixed initial-capital basis as position risk."""
+    reference = float(state.day_start_balance or 0.0)
+    if reference <= 0 or initial_balance <= 0:
+        return 0.0
+    return reference - initial_balance * settings.internal_daily_stop_percent / 100.0
+
+
+def max_loss_floor(settings: Settings, state: BotState,
+                   fallback_balance: float = 0.0) -> float:
+    initial = float(state.initial_balance or settings.initial_balance
+                    or fallback_balance or 0.0)
+    return initial * (1 - settings.max_loss_percent / 100.0)
+
+
 def account_health(settings: Settings, state: BotState, equity: float,
                    balance: float) -> Verdict:
     """FTMO objectives first, then the tighter internal stops."""
     if state.halted_forever:
         return Verdict(False, f"halted: {state.halted_reason}", fatal=True)
 
-    initial = state.initial_balance or balance
-    max_loss_floor = initial * (1 - settings.max_loss_percent / 100)
-    if equity <= max_loss_floor:
-        state.halt(f"max loss breached: equity {equity:.2f} <= {max_loss_floor:.2f}")
+    initial = state.initial_balance or settings.initial_balance or balance
+    hard_floor = max_loss_floor(settings, state, balance)
+    if equity <= hard_floor:
+        state.halt(f"max loss breached: equity {equity:.2f} <= {hard_floor:.2f}")
         return Verdict(False, state.halted_reason, fatal=True)
 
-    # FTMO compares against the higher of balance and equity at the day's open,
-    # not balance alone. Positions held overnight can put equity above balance,
-    # which tightens the real floor — so the reference has to be the same one the
-    # rule uses. `day_start_equity` is 0 on state written before it existed.
-    day_reference = max(state.day_start_balance, state.day_start_equity)
-    daily_floor = day_reference * (1 - settings.daily_loss_percent / 100)
-    if day_reference and equity <= daily_floor:
+    daily_floor = daily_loss_floor(settings, state, balance)
+    if daily_floor and equity <= daily_floor:
         state.pause_today()
         return Verdict(False, f"daily loss limit hit: equity {equity:.2f} "
                               f"<= {daily_floor:.2f}")
 
-    internal_floor = day_reference * (
-        1 - settings.internal_daily_stop_percent / 100)
-    if day_reference and equity <= internal_floor:
+    internal_floor = internal_daily_floor(settings, state, float(initial))
+    if internal_floor and equity <= internal_floor:
         state.pause_today()
         return Verdict(False, f"internal daily stop {settings.internal_daily_stop_percent:.2f}%"
                               f" hit at equity {equity:.2f}")
@@ -74,7 +95,7 @@ def account_health(settings: Settings, state: BotState, equity: float,
     if state.consecutive_losses >= settings.max_consecutive_losses:
         state.pause_today()
         return Verdict(False, f"{state.consecutive_losses} losses in a row; "
-                              f"standing down until the next server day")
+                              f"standing down until the next FTMO day")
     if state.is_paused_today:
         return Verdict(False, "paused for the rest of this trading day")
     return ALLOWED
@@ -116,6 +137,71 @@ def can_open(settings: Settings, state: BotState, open_risk: float,
     return ALLOWED
 
 
+def projected_internal_daily_risk(settings: Settings, state: BotState,
+                                  equity: float, initial_balance: float,
+                                  open_risk: float,
+                                  proposed_risk: float | None,
+                                  balance: float | None = None) -> Verdict:
+    """Refuse a setup whose stopped-out account would cross the internal day cap.
+
+    The ordinary health check reacts after equity has already fallen. Dynamic
+    risk can be 1%, so reaction alone would allow two setups to put 2% at risk
+    behind a 1.5% internal stop. This reserves the full stop risk of positions,
+    pending orders, and the proposed setup before sending anything.
+    """
+    if proposed_risk is None or initial_balance <= 0:
+        return ALLOWED
+    reserved = open_risk + proposed_risk
+    internal_floor = internal_daily_floor(settings, state, initial_balance)
+    if internal_floor:
+        # Use the exact same cash floor as account_health().  The daily stop is
+        # based on the start-of-day reference, while position risk is expressed
+        # as a percentage of initial capital.  Adding both percentages directly
+        # is unsafe when those two balances differ.
+        # Stop risk is measured from each entry price, so its matching base is
+        # closed balance. Equity would count a floating loss twice (once in
+        # equity and again in entry-to-stop risk), or let a floating winner fund
+        # another setup. Callers predating this argument retain their legacy
+        # equity calculation; production always supplies the current balance.
+        risk_anchor = equity if balance is None else balance
+        remaining_cash = max(0.0, risk_anchor - internal_floor)
+        remaining_risk = remaining_cash / initial_balance * 100.0
+    else:
+        # Legacy/unanchored state: retain the configured cap until the normal
+        # day anchor is written, rather than accidentally granting unlimited room.
+        remaining_risk = settings.internal_daily_stop_percent
+
+    if reserved > remaining_risk + 1e-9:
+        return Verdict(
+            False,
+            f"open risk {open_risk:.2f}% + next {proposed_risk:.2f}% = "
+            f"{reserved:.2f}% exceeds remaining internal daily room "
+            f"{remaining_risk:.2f}%",
+        )
+    return ALLOWED
+
+
+def projected_max_loss_risk(settings: Settings, state: BotState,
+                            initial_balance: float, open_risk: float,
+                            proposed_risk: float | None,
+                            balance: float) -> Verdict:
+    """Refuse an entry whose complete stop-out would cross the static 10% floor."""
+    if proposed_risk is None or initial_balance <= 0:
+        return ALLOWED
+    floor = max_loss_floor(settings, state, initial_balance)
+    remaining_cash = max(0.0, float(balance) - floor)
+    remaining_risk = remaining_cash / initial_balance * 100.0
+    reserved = open_risk + proposed_risk
+    if reserved > remaining_risk + 1e-9:
+        return Verdict(
+            False,
+            f"open risk {open_risk:.2f}% + next {proposed_risk:.2f}% = "
+            f"{reserved:.2f}% exceeds remaining maximum-loss room "
+            f"{remaining_risk:.2f}%",
+        )
+    return ALLOWED
+
+
 def margin_available(account: dict, margin_needed: float | None,
                      legs: int) -> Verdict:
     """Refuse a plan the account cannot actually carry.
@@ -151,22 +237,25 @@ def no_opposing_position(settings: Settings, positions, direction: int) -> Verdi
 
 
 def risk_per_idea(settings: Settings, spec, positions, direction: int,
-                  balance: float) -> Verdict:
+                  balance: float, proposed_risk: float | None = None,
+                  orders=()) -> Verdict:
     """Cap the risk carried by one trade idea.
 
     Two timeframes firing the same direction is one idea taken twice. FTMO
     reviews "risk per trade idea", so same-direction exposure is capped on its
     own, tighter than the overall open-risk cap.
     """
-    from .sizing import open_risk_percent   # local import keeps the cycle out
+    from .sizing import (open_risk_percent, pending_risk_percent)  # local import
 
     same_side = [p for p in positions if p.direction == direction]
-    if not same_side:
+    used = (open_risk_percent(spec, same_side, balance)
+            + pending_risk_percent(spec, orders, balance, direction=direction))
+    if used == 0:
         return ALLOWED
-    used = open_risk_percent(spec, same_side, balance)
-    if used + settings.risk_percent > settings.max_risk_per_idea_percent + 1e-9:
+    needs = settings.risk_percent if proposed_risk is None else proposed_risk
+    if used + needs > settings.max_risk_per_idea_percent + 1e-9:
         return Verdict(False, f"same-direction risk {used:.2f}% + "
-                              f"{settings.risk_percent:.2f}% exceeds the "
+                              f"{needs:.2f}% exceeds the "
                               f"{settings.max_risk_per_idea_percent:.2f}% per-idea cap")
     return ALLOWED
 
@@ -232,7 +321,7 @@ def progress(settings: Settings, state: BotState, equity: float) -> dict:
     """Where the account stands against each objective, for logging."""
     initial = state.initial_balance or equity
     gain = (equity - initial) / initial * 100 if initial else 0.0
-    day_reference = max(state.day_start_balance, state.day_start_equity)
+    day_reference = state.day_start_balance
     day_change = ((equity - day_reference) / day_reference * 100
                   if day_reference else 0.0)
     traded_days = len(state.trading_days)

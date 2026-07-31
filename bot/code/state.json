@@ -2,25 +2,28 @@
   "account_login": 1514115848,
   "account_server": "FTMO-Demo",
   "initial_balance": 50000.0,
+  "balance_high_water": 50435.5,
   "server_utc_offset": 3.0,
-  "day_key": "2026-07-30",
-  "day_start_balance": 50359.65,
-  "day_start_equity": 50484.0,
-  "day_realised": 124.35999999999999,
-  "day_requests": 786,
+  "day_key": "2026-07-31",
+  "day_start_balance": 50435.77,
+  "day_start_equity": 50349.4,
+  "day_realised": 0.0,
+  "day_requests": 0,
   "consecutive_losses": 0,
   "halted_forever": false,
   "halted_reason": "",
   "paused_until_day": "",
   "trading_days": [
     "2026-07-29",
-    "2026-07-30"
+    "2026-07-30",
+    "2026-07-31"
   ],
   "seen_plan_ids": [
     "M30@2026-07-28 15:00:00",
     "M15@2026-07-29 21:00:00",
     "M30@2026-07-29 22:30:00",
-    "M15@2026-07-30 16:30:00"
+    "M15@2026-07-30 16:30:00",
+    "M15@recovered-2026-07-31 17:22:24"
   ],
   "trades": {
     "M30@2026-07-28 15:00:00": {
@@ -55,6 +58,9 @@
       "fill_bar_time": "2026-07-28 15:00:00",
       "breakeven_done": true,
       "closed": true,
+      "conversion_released": false,
+      "converted_risk_pending": false,
+      "expected_market_volume": 0.0,
       "dry_run": false,
       "exit_mode": "be_33_33_34"
     },
@@ -90,6 +96,9 @@
       "fill_bar_time": "2026-07-29 21:30:00",
       "breakeven_done": true,
       "closed": true,
+      "conversion_released": false,
+      "converted_risk_pending": false,
+      "expected_market_volume": 0.0,
       "dry_run": false,
       "exit_mode": "be_33_33_34"
     },
@@ -125,6 +134,9 @@
       "fill_bar_time": "2026-07-29 22:30:00",
       "breakeven_done": true,
       "closed": true,
+      "conversion_released": false,
+      "converted_risk_pending": false,
+      "expected_market_volume": 0.0,
       "dry_run": false,
       "exit_mode": "be_33_33_34"
     },
@@ -160,6 +172,47 @@
       "fill_bar_time": "2026-07-30 17:04:58",
       "breakeven_done": true,
       "closed": true,
+      "conversion_released": false,
+      "converted_risk_pending": false,
+      "expected_market_volume": 0.0,
+      "dry_run": false,
+      "exit_mode": "be_33_33_34"
+    },
+    "M15@recovered-2026-07-31 17:22:24": {
+      "plan_id": "M15@recovered-2026-07-31 17:22:24",
+      "timeframe": "M15",
+      "direction": -1,
+      "entry": 4037.87,
+      "stop": 4057.35,
+      "risk": 19.480000000000018,
+      "risk_cash": 194.8,
+      "targets": [
+        4017.74,
+        4007.83,
+        3997.93
+      ],
+      "legs": [
+        0.03,
+        0.03,
+        0.04
+      ],
+      "position_tickets": [
+        509416446,
+        509416480,
+        509416503
+      ],
+      "pending_tickets": [],
+      "market_order_tickets": [],
+      "tp1_market_order_ticket": null,
+      "tp1_position_ticket": 509416446,
+      "tp1_pending_ticket": null,
+      "filled_at": "2026-07-31 17:22:24",
+      "fill_bar_time": "2026-07-31 17:22:24",
+      "breakeven_done": false,
+      "closed": false,
+      "conversion_released": false,
+      "converted_risk_pending": false,
+      "expected_market_volume": 0.0,
       "dry_run": false,
       "exit_mode": "be_33_33_34"
     }

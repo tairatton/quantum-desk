@@ -27,6 +27,15 @@ class Intent:
     signal_time: str
     bars_since_signal: int
     reason: str = ""
+    #: Bar whose close the trade is entered on. Equal to `signal_time` for an
+    #: ordinary immediate entry; later than it when the plan converted, which is
+    #: what the 120-bar timeout has to count from.
+    fill_bar_time: str = ""
+    #: True when the 50% retrace never came and `quantum.CONVERT_TO_MARKET_BARS`
+    #: elapsed, so this market entry replaces a limit order that is still working
+    #: at the broker. The order must be cancelled — and the cancel confirmed —
+    #: before the market order is sent, or the plan ends up double-sized.
+    converted: bool = False
 
     @property
     def side(self) -> str:
@@ -64,9 +73,17 @@ def read(frame: pd.DataFrame, timeframe: str) -> Intent | None:
         return Intent(action="limit", reason="waiting for the 50% retracement", **common)
     if plan["active"]:
         fresh = plan["entry_fill_index"] == last_index
-        return Intent(action="market" if fresh else WAIT,
-                      reason="filled on the bar that just closed" if fresh
-                             else "already running", **common)
+        converted = bool(plan.get("converted"))
+        if not fresh:
+            return Intent(action=WAIT, reason="already running", **common)
+        # A converted plan is still a market entry — same order type, same
+        # guardrails, same slippage check. Only the working limit it replaces
+        # makes it special, and that is what the flag is for.
+        return Intent(
+            action="market", converted=converted,
+            fill_bar_time=str(pd.Timestamp(data["time"].iloc[last_index])),
+            reason="retrace never came; taking it at market" if converted
+                   else "filled on the bar that just closed", **common)
     # Cancelled, expired, invalidated or resolved: nothing should still be working.
     return Intent(action="cancel", reason=plan["status"], **common)
 
@@ -95,3 +112,17 @@ def bars_since_moment(frame: pd.DataFrame, moment) -> int:
 
 TRADE_TIMEOUT_BARS = quantum.MAX_TRADE_BARS
 ENTRY_TIMEOUT_BARS = quantum.ENTRY_TIMEOUT
+
+
+def limit_life_bars() -> int:
+    """How long a working limit should live at the broker.
+
+    With conversion on, the strategy stops wanting the limit the moment it
+    converts, so the order is given exactly that life. The bot cancels it itself
+    on the conversion bar; the expiry only matters when the bot is not there to —
+    a crash, a dropped connection — and without it the order would sit unmanaged
+    for the full entry timeout and could still fill long after the plan moved on.
+    """
+    if quantum.CONVERT_TO_MARKET_BARS is None:
+        return ENTRY_TIMEOUT_BARS
+    return max(int(quantum.CONVERT_TO_MARKET_BARS), 1)

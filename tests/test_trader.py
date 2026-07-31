@@ -10,13 +10,14 @@ Each test names the defect it pins down, because these all started as real bugs.
 from __future__ import annotations
 
 import io
+import json
 import copy
 import sys
 import tempfile
 import unittest
 from contextlib import redirect_stdout
 from dataclasses import dataclass, field, replace
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
@@ -32,7 +33,8 @@ from bot.code.broker import Broker, OrderRejected, SymbolSpec  # noqa: E402
 from bot.code.instance_lock import LiveInstanceLock  # noqa: E402
 from bot.code.settings import Settings  # noqa: E402
 from bot.code.signals import Intent  # noqa: E402
-from bot.code.state import BotState, ManagedTrade  # noqa: E402
+from bot.code.state import (BotState, ManagedTrade, ftmo_day,
+                            ftmo_day_start_server)  # noqa: E402
 from xau.mt5_source import MT5Error  # noqa: E402
 
 GOLD = SymbolSpec(name="XAUUSDm", digits=3, point=0.001, volume_min=0.01,
@@ -143,7 +145,13 @@ class FakeBroker:
         if self.reject_leg is not None and len(self.sent) == self.reject_leg:
             raise OrderRejected(f"{what} rejected: retcode=10016 Invalid stops")
 
-    def market_entry(self, direction, volume, stop, take_profit, comment) -> dict:
+    def market_entry(self, direction, volume, stop, take_profit, comment,
+                     worst_price=None) -> dict:
+        price = self.tick()["ask"] if direction == 1 else self.tick()["bid"]
+        if worst_price is not None and (
+                (direction == 1 and price > worst_price)
+                or (direction == -1 and price < worst_price)):
+            raise OrderRejected("market price passed the per-leg limit")
         self._guard(f"market {volume}")
         ticket = self._ticket()
         self._positions.append(FakePos(ticket=ticket, direction=direction, volume=volume,
@@ -277,7 +285,8 @@ class TraderPathsTests(unittest.TestCase):
 
     def test_delayed_market_visibility_stays_open_until_history_recovers_it(self):
         class DelayedVisibilityBroker(FakeBroker):
-            def market_entry(self, direction, volume, stop, take_profit, comment):
+            def market_entry(self, direction, volume, stop, take_profit, comment,
+                             worst_price=None):
                 self._guard(f"market {volume}")
                 ticket = self._ticket()
                 # MT5 accepted the order, but positions_get() has not exposed
@@ -322,6 +331,95 @@ class TraderPathsTests(unittest.TestCase):
         self.assertEqual(sorted(broker.stops_moved),
                          [(302, 4000.12), (303, 4000.12)])
         self.assertTrue(trade.breakeven_done)
+
+    def test_deal_only_market_result_stays_managed_until_position_is_visible(self):
+        """Some market executions identify the fill by deal, not by order."""
+        class DealOnlyDelayedBroker(FakeBroker):
+            def market_entry(self, direction, volume, stop, take_profit, comment,
+                             worst_price=None):
+                self._guard(f"market {volume}")
+                deal_ticket = self._ticket()
+                position_ticket = deal_ticket + 1_000
+                # Deal history knows the mapping, but positions_get() is still
+                # lagging when open_trade performs its immediate readback.
+                self.filled_orders[deal_ticket] = position_ticket
+                return {"dry_run": False, "order": 0, "deal": deal_ticket}
+
+        broker = DealOnlyDelayedBroker()
+        with redirect_stdout(io.StringIO()):
+            trade = trader.open_trade(
+                broker, self.settings, self.state, intent(), 100_000.0,
+            )
+
+        recovery_tickets = list(trade.market_order_tickets)
+        self.assertEqual(len(recovery_tickets), 3)
+        self.assertFalse(trade.closed)
+
+        # Exercise the restart representation, not only the in-memory object.
+        restarted = BotState.load(Path(trader.STATE_PATH))
+        recovered = restarted.trades[trade.plan_id]
+        self.assertFalse(recovered.closed)
+        trader.sync_fills(broker, restarted)
+        self.assertEqual(recovered.market_order_tickets, [])
+        self.assertEqual(
+            recovered.position_tickets,
+            [broker.filled_orders[ticket] for ticket in recovery_tickets],
+        )
+        self.assertEqual(
+            recovered.tp1_position_ticket,
+            broker.filled_orders[recovery_tickets[0]],
+        )
+
+    def test_delayed_converted_fill_actualizes_risk_from_entry_deals(self):
+        """Visibility timing must not change the R denominator for one fill."""
+        class DelayedConvertedBroker(FakeBroker):
+            def market_entry(self, direction, volume, stop, take_profit, comment,
+                             worst_price=None):
+                self._guard(f"market {volume}")
+                deal_ticket = self._ticket()
+                position_ticket = deal_ticket + 1_000
+                executed_volume = volume / 2
+                self.filled_orders[deal_ticket] = position_ticket
+                self.deals.append({
+                    "ticket": deal_ticket, "order": deal_ticket,
+                    "position": position_ticket, "volume": executed_volume,
+                    "price": 4000.20, "is_exit": False,
+                    "profit": 0.0, "commission": 0.0, "swap": 0.0,
+                    "fee": 0.0, "net": 0.0,
+                })
+                return {"dry_run": False, "order": 0, "deal": deal_ticket,
+                        "volume": executed_volume}
+
+        broker = DelayedConvertedBroker()
+        converted = replace(intent(), converted=True)
+        with redirect_stdout(io.StringIO()):
+            trade = trader.open_trade(
+                broker, self.settings, self.state, converted, 100_000.0,
+            )
+        conservative = trade.risk_cash
+        self.assertTrue(trade.converted_risk_pending)
+        complete_deals = list(broker.deals)
+        broker.deals = complete_deals[:2]
+
+        restarted = BotState.load(Path(trader.STATE_PATH))
+        recovered = restarted.trades[trade.plan_id]
+        with redirect_stdout(io.StringIO()):
+            trader.sync_fills(broker, restarted)
+        self.assertTrue(recovered.converted_risk_pending)
+        self.assertEqual(recovered.risk_cash, conservative)
+
+        broker.deals = complete_deals
+        with redirect_stdout(io.StringIO()):
+            trader.sync_fills(broker, restarted)
+        expected = (sum(deal["volume"] for deal in complete_deals)
+                    * (converted.risk + 0.20) * GOLD.value_per_point)
+        self.assertAlmostEqual(recovered.risk_cash, expected, places=2)
+        self.assertLess(recovered.risk_cash, conservative)
+        self.assertFalse(recovered.converted_risk_pending)
+
+        events = [json.loads(line) for line in
+                  Path(trader.JOURNAL_PATH).read_text(encoding="utf-8").splitlines()]
+        self.assertEqual(events[-1]["event"], "risk_cash_actualized")
 
     def test_a_rejected_second_leg_keeps_the_first_under_management(self):
         """Was: the trade was only recorded after all three legs succeeded, so a
@@ -548,10 +646,10 @@ class TraderPathsTests(unittest.TestCase):
             [(second, 4000.12), (third, 4000.12)],
         )
 
-        # MT5 reports swap as cumulative cash. $1.60 on 0.08 lot is a $0.20
-        # price cost; $2.70 on 0.09 lot is $0.30.
-        broker._positions[0].swap = -1.60
-        broker._positions[1].swap = -2.70
+        # MT5 reports swap as cumulative cash. Derive it from the actual lots:
+        # market entries are deliberately sized for their worst permitted fill.
+        broker._positions[0].swap = -0.20 * 100 * broker._positions[0].volume
+        broker._positions[1].swap = -0.30 * 100 * broker._positions[1].volume
         trader.apply_breakeven(broker, self.state)
 
         self.assertEqual(
@@ -1111,6 +1209,25 @@ class TraderPathsTests(unittest.TestCase):
         self.assertFalse(trade.closed)
         self.assertEqual(self.state.day_realised, 0.0)
 
+    def test_an_opening_deal_does_not_masquerade_as_a_closed_position(self):
+        """Deal history can lead positions_get while a fresh fill is publishing."""
+        broker = FakeBroker()
+        trade = trader.open_trade(broker, self.settings, self.state, intent(), 100_000.0)
+        broker._positions = []
+        broker.deals = [
+            {
+                "position": ticket, "profit": 0.0, "commission": -1.0,
+                "swap": 0.0, "net": -1.0, "is_exit": False,
+            }
+            for ticket in trade.position_tickets
+        ]
+
+        finished = trader.reconcile_closed(broker, self.state)
+
+        self.assertEqual(finished, [])
+        self.assertFalse(trade.closed)
+        self.assertEqual(self.state.day_realised, 0.0)
+
     def test_partial_market_history_cannot_close_the_whole_setup(self):
         trade = ManagedTrade(
             plan_id="M15@partial-history", timeframe="M15", direction=1,
@@ -1133,6 +1250,81 @@ class TraderPathsTests(unittest.TestCase):
         self.assertEqual(finished, [])
         self.assertFalse(trade.closed)
         self.assertEqual(self.state.day_realised, 0.0)
+
+    def test_partial_exit_history_cannot_score_a_fully_mapped_setup(self):
+        broker = FakeBroker()
+        trade = trader.open_trade(broker, self.settings, self.state, intent(), 100_000.0)
+        broker._positions = []
+        broker.deals = [
+            {
+                "position": ticket, "volume": volume,
+                "profit": 10.0, "commission": -1.0,
+                "swap": 0.0, "net": 9.0, "is_exit": True,
+            }
+            for ticket, volume in zip(trade.position_tickets[:2], trade.legs[:2])
+        ]
+
+        finished = trader.reconcile_closed(broker, self.state)
+
+        self.assertEqual(finished, [])
+        self.assertFalse(trade.closed)
+        self.assertEqual(self.state.day_realised, 0.0)
+
+    def test_partial_exit_volume_cannot_score_a_position_early(self):
+        broker = FakeBroker()
+        trade = trader.open_trade(broker, self.settings, self.state, intent(), 100_000.0)
+        broker._positions = []
+        opening_deals = [
+            {
+                "position": ticket, "volume": volume,
+                "profit": 0.0, "commission": -1.0,
+                "swap": 0.0, "net": -1.0, "is_exit": False,
+            }
+            for ticket, volume in zip(trade.position_tickets, trade.legs)
+        ]
+        exit_deals = [
+            {
+                "position": ticket,
+                "volume": volume / 2 if index == 0 else volume,
+                "profit": 10.0, "commission": -1.0,
+                "swap": 0.0, "net": 9.0, "is_exit": True,
+            }
+            for index, (ticket, volume) in enumerate(
+                zip(trade.position_tickets, trade.legs)
+            )
+        ]
+        broker.deals = opening_deals + exit_deals
+
+        finished = trader.reconcile_closed(broker, self.state)
+
+        self.assertEqual(finished, [])
+        self.assertFalse(trade.closed)
+        self.assertEqual(self.state.day_realised, 0.0)
+
+    def test_complete_exit_scores_opening_and_closing_costs(self):
+        broker = FakeBroker()
+        trade = trader.open_trade(broker, self.settings, self.state, intent(), 100_000.0)
+        broker._positions = []
+        broker.deals = []
+        for ticket, volume in zip(trade.position_tickets, trade.legs):
+            broker.deals.extend((
+                {
+                    "position": ticket, "volume": volume,
+                    "profit": 0.0, "commission": -1.0,
+                    "swap": 0.0, "net": -1.0, "is_exit": False,
+                },
+                {
+                    "position": ticket, "volume": volume,
+                    "profit": 10.0, "commission": -1.0,
+                    "swap": 0.0, "net": 9.0, "is_exit": True,
+                },
+            ))
+
+        finished = trader.reconcile_closed(broker, self.state)
+
+        self.assertEqual(len(finished), 1)
+        self.assertEqual(finished[0]["profit"], 24.0)
+        self.assertEqual(finished[0]["costs"], -6.0)
 
     def test_r_is_scored_after_commission_swap_and_fee(self):
         """Was: only `deal.profit` counted, so every live R read better than the
@@ -1478,6 +1670,40 @@ class OrphanTimeoutTests(unittest.TestCase):
                                       self.frames)
         self.assertEqual(broker.closed, [])
 
+    def test_a_complete_three_leg_bot_setup_is_recovered_into_state(self):
+        broker = FakeBroker(_positions=[
+            FakePos(ticket=501, direction=-1, volume=0.03, price_open=4037.87,
+                    stop=4057.35, take_profit=4017.74,
+                    comment="M15 TP1 quantum|be33", opened_at=self.recent),
+            FakePos(ticket=502, direction=-1, volume=0.03, price_open=4037.87,
+                    stop=4057.35, take_profit=4007.83,
+                    comment="M15 TP2 quantum|be33", opened_at=self.recent),
+            FakePos(ticket=503, direction=-1, volume=0.04, price_open=4037.87,
+                    stop=4057.35, take_profit=3997.93,
+                    comment="M15 TP3 quantum|be33", opened_at=self.recent),
+        ])
+        state = BotState(initial_balance=50_000.0)
+        state.roll_day(date(2026, 7, 31), 50_000.0, 50_000.0)
+
+        recovered = trader.recover_orphan_setups(broker, state)
+
+        self.assertEqual(len(recovered), 1)
+        self.assertEqual(recovered[0].position_tickets, [501, 502, 503])
+        self.assertEqual(recovered[0].tp1_position_ticket, 501)
+        self.assertAlmostEqual(recovered[0].risk_cash, 194.80)
+
+    def test_an_incomplete_or_ambiguous_setup_is_not_recovered(self):
+        broker = FakeBroker(_positions=[
+            FakePos(ticket=501, comment="M15 TP1 quantum|be33"),
+            FakePos(ticket=503, comment="M15 TP3 quantum|be33"),
+        ])
+        self.assertEqual(
+            trader.recover_orphan_setups(
+                broker, BotState(initial_balance=50_000.0),
+            ),
+            [],
+        )
+
     def test_a_managed_position_is_left_to_enforce_timeout(self):
         """Both paths firing would send two closes for one position, and the
         second would be a close on a ticket that no longer exists."""
@@ -1591,6 +1817,8 @@ class BrokerReadFailureTests(unittest.TestCase):
              lambda broker: broker.finished_order_states([101])),
             ("closed deals",
              lambda broker: broker.closed_deals(datetime(2026, 7, 30))),
+            ("account cash flow",
+             lambda broker: broker.account_cashflow_since(datetime(2026, 7, 30))),
         )
         for name, operation in cases:
             with self.subTest(name=name):
@@ -1608,6 +1836,52 @@ class BrokerReadFailureTests(unittest.TestCase):
             broker.closed_deals(datetime(2026, 7, 30)),
             [],
         )
+        self.assertEqual(
+            broker.account_cashflow_since(datetime(2026, 7, 30)),
+            0.0,
+        )
+
+    def test_account_cashflow_reconstructs_midnight_balance_across_all_magic(self):
+        before = SimpleNamespace(
+            time=int(datetime(2026, 7, 31, 0, 59, tzinfo=timezone.utc).timestamp()),
+            profit=100.0, commission=-1.0, swap=0.0, fee=0.0,
+        )
+        after_bot = SimpleNamespace(
+            time=int(datetime(2026, 7, 31, 1, 1, tzinfo=timezone.utc).timestamp()),
+            profit=50.0, commission=-2.0, swap=-0.5, fee=-0.25,
+        )
+        after_other = SimpleNamespace(
+            time=int(datetime(2026, 7, 31, 2, 0, tzinfo=timezone.utc).timestamp()),
+            profit=-20.0, commission=-1.0, swap=0.0, fee=0.0,
+        )
+        broker = self.broker((before, after_bot, after_other))
+
+        result = broker.account_cashflow_since(datetime(2026, 7, 31, 1, 0))
+
+        self.assertEqual(result, 26.25)
+
+    def test_account_reports_whether_mt5_uses_hedging_positions(self):
+        broker = self.broker(())
+        broker._mt.ACCOUNT_MARGIN_MODE_RETAIL_HEDGING = 2
+        account = SimpleNamespace(
+            login=1, server="test", currency="USD", balance=50_000.0,
+            equity=50_000.0, margin_free=49_000.0, margin_mode=2,
+        )
+        broker._mt.account_info = mock.Mock(return_value=account)
+        self.assertTrue(broker.account()["is_hedging"])
+
+        account.margin_mode = 0
+        result = broker.account()
+        self.assertFalse(result["is_hedging"])
+        self.assertEqual(result["margin_mode"], 0)
+
+    def test_deal_ticket_can_recover_its_position_without_an_order_ticket(self):
+        deal = SimpleNamespace(
+            ticket=701, order=0, position_id=901, magic=1, symbol=GOLD.name,
+        )
+        broker = self.broker((deal,))
+
+        self.assertEqual(broker.filled_order_positions([701]), {701: 901})
 
     def test_closed_deal_net_includes_the_mt5_fee_field(self):
         deal = SimpleNamespace(
@@ -1623,6 +1897,21 @@ class BrokerReadFailureTests(unittest.TestCase):
         self.assertEqual(len(result), 1)
         self.assertEqual(result[0]["fee"], -0.25)
         self.assertEqual(result[0]["net"], 8.25)
+        self.assertTrue(result[0]["is_exit"])
+
+    def test_opening_deal_is_classified_separately_from_an_exit(self):
+        deal = SimpleNamespace(
+            ticket=1, order=2, position_id=3, volume=0.01, price=4000.0,
+            profit=0.0, commission=-1.0, swap=0.0, fee=0.0,
+            comment="test", entry=0, time=1_775_000_000,
+            magic=1, symbol=GOLD.name,
+        )
+        broker = self.broker((deal,))
+
+        result = broker.closed_deals(datetime(2026, 7, 30))
+
+        self.assertEqual(len(result), 1)
+        self.assertFalse(result[0]["is_exit"])
 
 
 class WriteSpacingTests(unittest.TestCase):
@@ -1682,6 +1971,27 @@ class WriteSpacingTests(unittest.TestCase):
         broker.close(FakePos(ticket=1), "timeout")
 
         self.assertEqual(order, ["pace", "tick", "send"] * 2)
+
+    def test_market_entry_rejects_a_quote_past_the_per_leg_price_limit(self):
+        broker = self._broker(dry_run=False, write_spacing_seconds=2.0)
+        broker._spec = GOLD
+        broker._mt = SimpleNamespace(TRADE_ACTION_DEAL=1, ORDER_TYPE_BUY=0,
+                                     ORDER_TYPE_SELL=1, ORDER_TIME_GTC=0)
+        broker._pace = lambda: None
+        broker._send = mock.Mock(return_value={})
+
+        cases = (
+            (1, {"ask": 3300.01, "bid": 3299.50}, 3300.00),
+            (-1, {"ask": 3300.50, "bid": 3299.99}, 3300.00),
+        )
+        for direction, quote, worst_price in cases:
+            with self.subTest(direction=direction):
+                broker.tick = lambda quote=quote: quote
+                with self.assertRaisesRegex(OrderRejected, "per-leg limit"):
+                    broker.market_entry(direction, 0.01, 3290.0, 3320.0,
+                                        "M15 TP3", worst_price=worst_price)
+
+        broker._send.assert_not_called()
 
     def test_broker_allows_a_sell_be_stop_when_the_position_has_no_sl(self):
         broker = self._broker(dry_run=False)
@@ -1784,7 +2094,7 @@ class DailyRulesTests(unittest.TestCase):
     def setUp(self):
         self.settings = Settings()
 
-    def test_a_loss_streak_clears_on_the_next_server_day(self):
+    def test_a_loss_streak_clears_on_the_next_ftmo_day(self):
         """Was: `roll_day` never reset the streak and only a win could clear it,
         so a day ending on the third loss paused the bot permanently."""
         state = BotState(initial_balance=100_000.0)
@@ -1797,16 +2107,32 @@ class DailyRulesTests(unittest.TestCase):
         self.assertTrue(guardrails.account_health(self.settings, state,
                                                   100_000.0, 100_000.0))
 
-    def test_daily_floor_uses_the_higher_of_balance_and_equity(self):
-        """FTMO measures from whichever was higher at the day's open, and holding
-        a winner overnight puts equity above balance."""
+    def test_daily_floor_is_midnight_balance_minus_fixed_initial_amount(self):
         state = BotState(initial_balance=100_000.0)
-        state.roll_day(date(2026, 6, 1), 100_000.0, 104_000.0)
+        state.roll_day(date(2026, 6, 1), 102_000.0, 104_000.0)
         self.assertEqual(state.day_start_equity, 104_000.0)
-        # 5% of 104,000 is 98,800 — a floor 200 above the balance-only one.
-        verdict = guardrails.account_health(self.settings, state, 98_700.0, 100_000.0)
-        self.assertFalse(verdict)
-        self.assertIn("daily loss limit", verdict.reason)
+        self.assertEqual(guardrails.daily_loss_floor(self.settings, state), 97_000.0)
+
+    def test_ftmo_day_does_not_roll_at_broker_midnight_in_summer(self):
+        self.assertEqual(
+            ftmo_day(datetime(2026, 7, 31, 0, 30), 3), date(2026, 7, 30),
+        )
+        self.assertEqual(
+            ftmo_day(datetime(2026, 7, 31, 1, 0), 3), date(2026, 7, 31),
+        )
+        self.assertEqual(
+            ftmo_day_start_server(datetime(2026, 7, 31, 12, 0), 3),
+            datetime(2026, 7, 31, 1, 0),
+        )
+
+    def test_ftmo_day_does_not_roll_at_broker_midnight_in_winter(self):
+        self.assertEqual(
+            ftmo_day(datetime(2026, 1, 31, 0, 30), 2), date(2026, 1, 30),
+        )
+        self.assertEqual(
+            ftmo_day_start_server(datetime(2026, 1, 31, 12, 0), 2),
+            datetime(2026, 1, 31, 1, 0),
+        )
 
     def test_trading_stops_once_the_target_and_the_four_days_are_both_in(self):
         """Was: `progress()` computed `objectives_met` and nothing read it, so the
@@ -1860,6 +2186,28 @@ class DailyRulesTests(unittest.TestCase):
             state = BotState.load(path)
         self.assertEqual(state.initial_balance, 25_000.0)
         self.assertIn("M15@x", state.trades)
+
+    def test_a_netting_account_is_blocked_before_state_is_bound(self):
+        class NettingBroker:
+            def tick(self):
+                return {"server_time": datetime(2026, 7, 31, 12, 0)}
+
+            def account(self):
+                return {
+                    "login": 99, "server": "test", "currency": "USD",
+                    "balance": 50_000.0, "equity": 50_000.0,
+                    "margin_free": 50_000.0, "margin_mode": 0,
+                    "is_hedging": False,
+                }
+
+        state = BotState()
+        with tempfile.TemporaryDirectory() as folder, \
+                mock.patch.object(run, "JOURNAL_PATH",
+                                  Path(folder) / "journal.jsonl"):
+            with self.assertRaisesRegex(SystemExit, "requires a hedging account"):
+                run._bind_and_anchor(NettingBroker(), state, self.settings)
+
+        self.assertIsNone(state.account_login)
 
 
 class ExitModeTests(unittest.TestCase):
@@ -2203,6 +2551,294 @@ class MarketHoursTests(unittest.TestCase):
         self.assertIsNone(market_hours.observed_week_end(None))
         self.assertIsNone(market_hours.observed_week_end(
             pd.DataFrame({"time": [pd.Timestamp("2026-05-04")]})))
+
+class ConvertToMarketTests(unittest.TestCase):
+    """Releasing a working limit so the plan can be re-sent at market.
+
+    The expensive failure here is double size: a cancel and a fill can cross on
+    the wire, and sending the market order anyway leaves two positions on one
+    plan. Every test below is a way that can happen.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        base = Path(self.tmp.name)
+        self._patched = {}
+        for name, value in (("JOURNAL_PATH", base / "journal.jsonl"),
+                            ("STATE_PATH", base / "state.json")):
+            self._patched[name] = getattr(trader, name)
+            setattr(trader, name, value)
+        self.state = BotState(initial_balance=50_000.0)
+        self.state.roll_day(date(2026, 6, 1), 50_000.0, 50_000.0)
+
+    def tearDown(self):
+        for name, value in self._patched.items():
+            setattr(trader, name, value)
+        self.tmp.cleanup()
+
+    def _working_limit(self, broker: FakeBroker) -> Intent:
+        """A plan with one live limit order, as if placed on an earlier bar."""
+        result = broker.limit_entry(1, 0.05, 3990.0, 3974.0, 4006.0, None, "M15 TP1")
+        plan = intent(action="market")
+        plan = replace(plan, converted=True, bars_since_signal=2,
+                       fill_bar_time="2026-06-01 00:30:00")
+        self.state.trades[plan.plan_id] = ManagedTrade(
+            plan_id=plan.plan_id, timeframe="M15", direction=1, entry=3990.0,
+            stop=3974.0, risk=16.0, risk_cash=200.0, targets=[4006.0],
+            legs=[0.05], dry_run=False, exit_mode="be_33_33_34",
+            pending_tickets=[int(result["order"])],
+        )
+        return plan
+
+    def test_a_confirmed_cancel_clears_the_order_and_allows_the_market_send(self):
+        broker = FakeBroker()
+        plan = self._working_limit(broker)
+        with redirect_stdout(io.StringIO()):
+            self.assertTrue(trader.release_for_conversion(broker, self.state, plan))
+        self.assertEqual(len(broker.cancelled), 1)
+        self.assertEqual(broker.pending_orders(), [])
+        self.assertEqual(self.state.trades[plan.plan_id].pending_tickets, [])
+        self.assertTrue(self.state.trades[plan.plan_id].closed)
+        self.assertTrue(self.state.trades[plan.plan_id].conversion_released)
+        events = [json.loads(line) for line in
+                  Path(trader.JOURNAL_PATH).read_text(encoding="utf-8").splitlines()]
+        self.assertIn("limit_released_for_conversion",
+                      [event["event"] for event in events])
+        self.assertNotIn("converted_market_opened",
+                         [event["event"] for event in events])
+
+    def test_a_safely_expired_or_cancelled_order_can_still_convert(self):
+        for terminal_state in ("EXPIRED", "CANCELED", "REJECTED"):
+            with self.subTest(terminal_state=terminal_state):
+                broker = FakeBroker()
+                plan = self._working_limit(broker)
+                ticket = self.state.trades[plan.plan_id].pending_tickets[0]
+                broker._orders.clear()
+                broker.finished_orders[ticket] = terminal_state
+                with redirect_stdout(io.StringIO()):
+                    self.assertTrue(
+                        trader.release_for_conversion(broker, self.state, plan))
+                self.assertEqual(broker.cancelled, [])
+                self.state.trades.clear()
+
+    def test_a_disappeared_order_with_unknown_history_stays_blocked(self):
+        broker = FakeBroker()
+        plan = self._working_limit(broker)
+        broker._orders.clear()
+        with redirect_stdout(io.StringIO()):
+            self.assertFalse(trader.release_for_conversion(broker, self.state, plan))
+
+    def test_a_fill_before_the_initial_snapshot_stops_the_market_send(self):
+        """A fill between pass-level sync and release must not hide in `before`."""
+        broker = FakeBroker()
+        plan = self._working_limit(broker)
+        ticket = self.state.trades[plan.plan_id].pending_tickets[0]
+
+        # The order is already gone and its position already exists when release
+        # starts. A post-cancel position diff alone cannot detect this ordering.
+        broker.fill_order(ticket)
+        with redirect_stdout(io.StringIO()):
+            self.assertFalse(trader.release_for_conversion(broker, self.state, plan))
+
+        self.assertTrue(broker.positions())
+        self.assertEqual(self.state.trades[plan.plan_id].pending_tickets, [ticket])
+        self.assertFalse(self.state.trades[plan.plan_id].conversion_released)
+
+    def test_an_already_released_conversion_is_not_retried(self):
+        broker = FakeBroker()
+        plan = self._working_limit(broker)
+        with redirect_stdout(io.StringIO()):
+            self.assertTrue(trader.release_for_conversion(broker, self.state, plan))
+            self.assertFalse(trader.release_for_conversion(broker, self.state, plan))
+        self.assertEqual(len(broker.cancelled), 1)
+
+    def test_a_rejected_first_market_leg_is_not_retried_after_restart(self):
+        """Replacing the pending record must not erase the durable release marker."""
+        broker = FakeBroker()
+        plan = self._working_limit(broker)
+        with redirect_stdout(io.StringIO()):
+            self.assertTrue(trader.release_for_conversion(broker, self.state, plan))
+            # The working limit was the first recorded send; reject market leg 1.
+            broker.reject_leg = len(broker.sent) + 1
+            trade = trader.open_trade(
+                broker, replace(Settings(), exit_mode="be_33_33_34"),
+                self.state, plan, 50_000.0,
+            )
+
+        self.assertIsNotNone(trade)
+        self.assertTrue(trade.closed)
+        self.assertEqual(trade.position_tickets, [])
+        self.assertTrue(trade.conversion_released)
+
+        # Load the persisted state to model a process restart inside the same
+        # conversion bar. It must retain the one-attempt decision.
+        restarted = BotState.load(Path(trader.STATE_PATH))
+        self.assertTrue(restarted.trades[plan.plan_id].conversion_released)
+        with redirect_stdout(io.StringIO()):
+            self.assertFalse(trader.release_for_conversion(broker, restarted, plan))
+
+    def test_a_fill_landing_during_the_cancel_stops_the_market_send(self):
+        """The race this guard exists for: the retrace prints as we give up on it."""
+
+        class RacingBroker(FakeBroker):
+            def cancel(self, ticket, reason):
+                # The order filled a moment before the cancel reached the server.
+                self.fill_order(ticket)
+                raise OrderRejected("cancel rejected: retcode=10036 order already filled")
+
+        broker = RacingBroker()
+        plan = self._working_limit(broker)
+        before = len(broker.positions())
+        with redirect_stdout(io.StringIO()):
+            self.assertFalse(trader.release_for_conversion(broker, self.state, plan))
+        # The plan keeps its ticket so the normal fill-sync path still owns it.
+        self.assertEqual(len(broker.positions()), before + 1)
+        self.assertTrue(self.state.trades[plan.plan_id].pending_tickets)
+
+    def test_a_silent_fill_is_caught_even_when_the_cancel_reports_success(self):
+        """`order_send` returning done is not proof the order was not filled."""
+
+        class SilentFillBroker(FakeBroker):
+            def cancel(self, ticket, reason):
+                self.cancelled.append((ticket, reason))
+                self.fill_order(ticket)        # became a position, not a cancel
+                return {"dry_run": False}
+
+        broker = SilentFillBroker()
+        plan = self._working_limit(broker)
+        with redirect_stdout(io.StringIO()):
+            self.assertFalse(trader.release_for_conversion(broker, self.state, plan))
+
+    def test_a_fill_hidden_from_positions_is_caught_by_order_history(self):
+        """MT5 may publish FILLED before the resulting position is visible."""
+
+        class DelayedPositionBroker(FakeBroker):
+            def cancel(self, ticket, reason):
+                self.cancelled.append((ticket, reason))
+                self._orders = [order for order in self._orders
+                                if order["ticket"] != ticket]
+                self.finished_orders[ticket] = "FILLED"
+                return {"dry_run": False}
+
+        broker = DelayedPositionBroker()
+        plan = self._working_limit(broker)
+        with redirect_stdout(io.StringIO()):
+            self.assertFalse(trader.release_for_conversion(broker, self.state, plan))
+        self.assertEqual(broker.positions(), [])
+        self.assertTrue(self.state.trades[plan.plan_id].pending_tickets)
+
+    def test_an_order_still_working_after_the_cancel_stops_the_market_send(self):
+        class StubbornBroker(FakeBroker):
+            def cancel(self, ticket, reason):
+                self.cancelled.append((ticket, reason))
+                return {"dry_run": False}      # accepted, but the order stays live
+
+        broker = StubbornBroker()
+        plan = self._working_limit(broker)
+        with redirect_stdout(io.StringIO()):
+            self.assertFalse(trader.release_for_conversion(broker, self.state, plan))
+        self.assertTrue(broker.pending_orders())
+
+    def test_a_plan_that_already_holds_a_position_is_never_converted(self):
+        broker = FakeBroker()
+        plan = self._working_limit(broker)
+        self.state.trades[plan.plan_id].position_tickets.append(999)
+        with redirect_stdout(io.StringIO()):
+            self.assertFalse(trader.release_for_conversion(broker, self.state, plan))
+        self.assertEqual(broker.cancelled, [])
+
+    def test_a_plan_with_no_record_needs_no_release(self):
+        """After a restart the bot may see the conversion with nothing working."""
+        broker = FakeBroker()
+        with redirect_stdout(io.StringIO()):
+            self.assertTrue(trader.release_for_conversion(
+                broker, self.state, replace(intent(), converted=True)))
+
+    def test_a_missing_record_does_not_ignore_same_timeframe_broker_exposure(self):
+        """A reset state file must not turn an orphan limit into double risk."""
+        broker = FakeBroker()
+        broker.limit_entry(1, 0.05, 3990.0, 3974.0, 4006.0, None, "M15 TP1 be33")
+        with redirect_stdout(io.StringIO()):
+            self.assertFalse(trader.release_for_conversion(
+                broker, self.state, replace(intent(), converted=True)))
+
+    def test_a_missing_record_ignores_another_timeframes_order(self):
+        broker = FakeBroker()
+        broker.limit_entry(1, 0.05, 3990.0, 3974.0, 4006.0, None, "M30 TP1 be33")
+        with redirect_stdout(io.StringIO()):
+            self.assertTrue(trader.release_for_conversion(
+                broker, self.state, replace(intent(), converted=True)))
+
+    def test_the_timeout_counts_from_the_fill_bar_not_the_signal_bar(self):
+        """A converted plan fills bars later; anchoring to the signal retires it early."""
+        broker = FakeBroker()
+        plan = replace(intent(action="market"), converted=True, bars_since_signal=2,
+                       fill_bar_time="2026-06-01 00:30:00")
+        with redirect_stdout(io.StringIO()):
+            trade = trader.open_trade(broker, replace(Settings(), exit_mode="be_33_33_34"),
+                                      self.state, plan, 50_000.0)
+        self.assertIsNotNone(trade)
+        self.assertEqual(trade.fill_bar_time, "2026-06-01 00:30:00")
+
+    def test_a_converted_market_entry_is_sized_for_worst_allowed_fill(self):
+        class PriceLimitBroker(FakeBroker):
+            def __init__(self):
+                super().__init__()
+                self.worst_prices = []
+
+            def market_entry(self, direction, volume, stop, take_profit, comment,
+                             worst_price=None):
+                self.worst_prices.append(worst_price)
+                return super().market_entry(direction, volume, stop, take_profit,
+                                            comment, worst_price=worst_price)
+
+        broker = PriceLimitBroker()
+        plan = replace(intent(action="market"), converted=True,
+                       fill_bar_time="2026-06-01 00:30:00")
+        settings = replace(Settings(), exit_mode="be_33_33_34")
+        with redirect_stdout(io.StringIO()):
+            trade = trader.open_trade(broker, settings, self.state, plan, 50_000.0)
+
+        worst_distance = trader.sizing_stop_distance(broker, settings, plan)
+        worst_cash = sum(trade.legs) * worst_distance * broker.spec.value_per_point
+        self.assertLessEqual(worst_cash, 50_000.0 * settings.risk_percent / 100)
+        self.assertTrue(broker.worst_prices)
+        self.assertTrue(all(price == 4002.4 for price in broker.worst_prices))
+        events = [json.loads(line) for line in
+                  Path(trader.JOURNAL_PATH).read_text(encoding="utf-8").splitlines()]
+        self.assertIn("converted_market_opened", [event["event"] for event in events])
+
+    def test_an_immediate_market_entry_is_also_sized_for_worst_allowed_fill(self):
+        broker = FakeBroker()
+        plan = intent(action="market")
+        settings = replace(Settings(), exit_mode="be_33_33_34")
+        with redirect_stdout(io.StringIO()):
+            trade = trader.open_trade(broker, settings, self.state, plan, 50_000.0)
+
+        worst_distance = trader.sizing_stop_distance(broker, settings, plan)
+        worst_cash = sum(trade.legs) * worst_distance * broker.spec.value_per_point
+        self.assertLessEqual(worst_cash, 50_000.0 * settings.risk_percent / 100)
+
+    def test_an_ordinary_market_entry_still_anchors_to_its_signal_bar(self):
+        broker = FakeBroker()
+        with redirect_stdout(io.StringIO()):
+            trade = trader.open_trade(broker, replace(Settings(), exit_mode="be_33_33_34"),
+                                      self.state, intent(action="market"), 50_000.0)
+        self.assertEqual(trade.fill_bar_time, "2026-06-01 00:00:00")
+
+    def test_a_limit_expires_when_the_plan_would_convert_not_bars_later(self):
+        """If the bot dies before converting, the order must not outlive the plan."""
+        from xau import quantum
+
+        original = quantum.CONVERT_TO_MARKET_BARS
+        try:
+            quantum.CONVERT_TO_MARKET_BARS = 2
+            self.assertEqual(signals.limit_life_bars(), 2)
+            quantum.CONVERT_TO_MARKET_BARS = None
+            self.assertEqual(signals.limit_life_bars(), signals.ENTRY_TIMEOUT_BARS)
+        finally:
+            quantum.CONVERT_TO_MARKET_BARS = original
+
 
 def replace_closures(settings, closures):
     from dataclasses import replace

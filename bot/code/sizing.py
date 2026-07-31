@@ -161,3 +161,27 @@ def open_risk_percent(spec: SymbolSpec, positions, balance: float) -> float:
             continue
         total += distance * spec.value_per_point * position.volume
     return total / balance * 100.0
+
+
+def pending_risk_percent(spec: SymbolSpec, orders, balance: float,
+                         direction: int | None = None) -> float:
+    """Stop risk carried by working entry orders, as percent of initial capital."""
+    if balance <= 0:
+        return 0.0
+    total = 0.0
+    for order in orders:
+        get = order.get if hasattr(order, "get") else lambda key, default=0: getattr(
+            order, key, default)
+        if direction is not None:
+            type_name = str(get("type_name", "")).upper()
+            order_direction = (1 if type_name.startswith("BUY") else
+                               -1 if type_name.startswith("SELL") else None)
+            if order_direction != direction:
+                continue
+        stop = float(get("stop", get("sl", 0.0)) or 0.0)
+        entry = float(get("price", get("price_open", 0.0)) or 0.0)
+        volume = float(get("volume", get("volume_current", 0.0)) or 0.0)
+        if stop == 0 or entry == 0:
+            return float("inf")
+        total += abs(entry - stop) * spec.value_per_point * volume
+    return total / balance * 100.0

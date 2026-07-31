@@ -553,6 +553,19 @@ class StateTests(unittest.TestCase):
         self.assertFalse(matches)
         self.assertIn("MISMATCH", message)
 
+    def test_status_rejects_netting_even_when_login_matches(self):
+        from bot.code.run import account_binding_status
+
+        state = BotState(account_login=456, account_server="FTMO-Demo",
+                         initial_balance=50_000)
+        matches, message = account_binding_status(state, {
+            "login": 456, "server": "FTMO-Demo", "balance": 50_000,
+            "margin_mode": 0, "is_hedging": False,
+        })
+        self.assertFalse(matches)
+        self.assertIn("UNSUPPORTED", message)
+        self.assertIn("hedging required", message)
+
 
 class ClockTests(unittest.TestCase):
     """The server-to-UTC offset cannot be measured while the market is closed."""
