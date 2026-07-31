@@ -15,6 +15,23 @@ from .indicators import atr, rsi
 FRACTAL_LENGTH = 11
 SETUP_WINDOW = 8
 ENTRY_TIMEOUT = 16
+# Bars to wait for the 50% retrace before taking the trade at market instead.
+# `None` restores the original behaviour: wait the full `ENTRY_TIMEOUT` and let
+# the plan expire unfilled.
+#
+# Waiting is adverse selection. A limit that never fills is a limit the price ran
+# away from, so the plans that expire are the strongest ones: measured over
+# 50,000 bars, the expired setups were worth +1.005R (M15) and +0.646R (M30) per
+# trade against the +0.011..+0.284R the filled ones actually earned. Converting
+# only the stragglers keeps the better fill price on the limits that do trigger,
+# which is why this beats entering at market every time (see
+# docs/ENTRY_TIMING_EXPERIMENT_2026-07-31.md).
+#
+# The floor is one bar, not zero: the signal bar creates the plan and the loop
+# moves on, so 0 and any negative value behave exactly like 1. A plan that should
+# be taken on its own bar is already handled — `_new_plan` marks it immediate
+# when the break is within 0.75 ATR and no limit is placed at all.
+CONVERT_TO_MARKET_BARS: int | None = 2
 MAX_TRADE_BARS = 120
 COOLDOWN = 2
 # Operational default requested for the dashboard: release an active plan when
@@ -169,12 +186,14 @@ def _features(df: pd.DataFrame, timeframe: str) -> pd.DataFrame:
     return d
 
 
-def _new_plan(d: pd.DataFrame, i: int, direction: int, break_level: float) -> dict:
-    close, a = float(d["close"].iloc[i]), float(d["atr"].iloc[i])
-    valid_break = break_level <= close if direction == 1 else break_level >= close
-    distance = abs(close - break_level) if valid_break else 0.0
-    immediate = not valid_break or distance <= a * .75
-    entry = close if immediate else close - direction * distance * .50
+def _stop_and_risk(d: pd.DataFrame, i: int, direction: int, entry: float) -> tuple[float, float]:
+    """Structure stop for `entry`, bounded by the ATR floor and ceiling.
+
+    Shared by `_new_plan` and `_convert_to_market` so a converted entry is priced
+    by exactly the same rule as an immediate one — the stop follows the entry,
+    which is what keeps 1R the same quantity in both cases.
+    """
+    a = float(d["atr"].iloc[i])
     structure = d["down_level"].iloc[i] if direction == 1 else d["up_level"].iloc[i]
     structure_valid = pd.notna(structure) and (structure < entry if direction == 1 else structure > entry)
     if not structure_valid:
@@ -182,14 +201,50 @@ def _new_plan(d: pd.DataFrame, i: int, direction: int, break_level: float) -> di
         structure = float(lookback["low"].min() if direction == 1 else lookback["high"].max())
     raw_stop = float(structure) - direction * a * ATR_BUFFER
     risk = min(max(abs(entry - raw_stop), a * MIN_STOP_ATR), a * MAX_STOP_ATR)
-    stop = entry - direction * risk
+    return entry - direction * risk, risk
+
+
+def _convert_to_market(plan: dict, d: pd.DataFrame, i: int) -> dict:
+    """Take a still-unfilled limit at this bar's close instead of waiting.
+
+    Re-prices stop and targets off the new entry. Mutates and returns `plan` so
+    the caller keeps its identity in `plans` — the plan is the same trade idea,
+    only the fill is different.
+    """
+    direction = plan["direction"]
+    entry = float(d["close"].iloc[i])
+    stop, risk = _stop_and_risk(d, i, direction, entry)
+    plan.update(
+        # What the plan looked like on its signal bar. Kept because anything
+        # reconstructing the decision as it was made — `ai_historical` builds an
+        # advisor payload that must not see later bars — would otherwise read
+        # these fields and get numbers derived from the conversion bar instead.
+        limit_entry=plan["entry"], limit_stop=plan["stop"], limit_risk=plan["risk"],
+        limit_targets=list(plan["targets"]),
+        entry=entry, stop=stop, risk=risk,
+        targets=[entry + direction * risk * rr for rr in RR_TARGETS],
+        pending=False, active=True, entry_fill_index=i,
+        converted=True,
+        status="BUY ACTIVE" if direction == 1 else "SELL ACTIVE",
+    )
+    return plan
+
+
+def _new_plan(d: pd.DataFrame, i: int, direction: int, break_level: float) -> dict:
+    close, a = float(d["close"].iloc[i]), float(d["atr"].iloc[i])
+    valid_break = break_level <= close if direction == 1 else break_level >= close
+    distance = abs(close - break_level) if valid_break else 0.0
+    immediate = not valid_break or distance <= a * .75
+    entry = close if immediate else close - direction * distance * .50
+    stop, risk = _stop_and_risk(d, i, direction, entry)
     return {
         "direction": direction, "side": "long" if direction == 1 else "short",
         "signal_index": i, "entry_fill_index": i if immediate else None,
         "entry": entry, "stop": stop, "risk": risk,
         "targets": [entry + direction * risk * rr for rr in RR_TARGETS],
         "resolved": [None, None, None], "pending": not immediate,
-        "active": immediate, "status": ("BUY ACTIVE" if direction == 1 else "SELL ACTIVE") if immediate
+        "active": immediate, "converted": False,
+        "status": ("BUY ACTIVE" if direction == 1 else "SELL ACTIVE") if immediate
                   else ("BUY WAIT ENTRY" if direction == 1 else "SELL WAIT ENTRY"),
     }
 
@@ -206,7 +261,7 @@ def analyse(df: pd.DataFrame, timeframe: str) -> dict:
     long_used = short_used = False
     last_end = -10_000
     counters = {"filled": 0, "expired": 0, "cancelled": 0, "timed_out": 0,
-                "invalidated": 0, "wins": [0, 0, 0], "losses": [0, 0, 0]}
+                "invalidated": 0, "converted": 0, "wins": [0, 0, 0], "losses": [0, 0, 0]}
 
     for i in range(55, len(d)):
         event = int(d["break_event"].iloc[i])
@@ -264,6 +319,14 @@ def analyse(df: pd.DataFrame, timeframe: str) -> dict:
                 current["pending"], current["active"] = False, True
                 current["entry_fill_index"] = i; current["status"] = "BUY ACTIVE" if direction == 1 else "SELL ACTIVE"
                 counters["filled"] += 1
+            elif (CONVERT_TO_MARKET_BARS is not None
+                    and i - current["signal_index"] >= CONVERT_TO_MARKET_BARS):
+                # The retrace has not come. Take it at market rather than let the
+                # plan expire — the opposite-structure cancel above still had its
+                # say first, so only the stragglers convert, never the reversals.
+                _convert_to_market(current, d, i)
+                counters["filled"] += 1
+                counters["converted"] += 1
             continue  # Pine does not resolve TP/SL on the fill candle
 
         stop_hit = low <= current["stop"] if direction == 1 else high >= current["stop"]

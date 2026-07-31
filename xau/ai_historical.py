@@ -40,6 +40,12 @@ def _payload_at_signal(result: dict, plan: dict, symbol: str, timeframe: str) ->
     direction = int(plan["direction"])
     action = "BUY" if direction == 1 else "SELL"
     immediate = plan["entry_fill_index"] == index
+    # A converted plan carries the entry it was *taken* at, which is priced off a
+    # bar this payload is not allowed to see. Reconstruct the limit it was still
+    # waiting on at the signal bar; `_convert_to_market` keeps those values.
+    if plan.get("converted"):
+        plan = plan | {"entry": plan["limit_entry"], "stop": plan["limit_stop"],
+                       "risk": plan["limit_risk"], "targets": plan["limit_targets"]}
     market_bias = "Bullish" if row["close"] > row["session_vwap"] else "Bearish"
     market_state = (
         "INST. BUYING" if row["close"] > row["session_vwap"] and row["cvd"] > 0

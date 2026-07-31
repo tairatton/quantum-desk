@@ -11,7 +11,7 @@ import tempfile
 import unittest
 from unittest import mock
 from dataclasses import dataclass, replace
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
 import numpy as np
@@ -227,6 +227,12 @@ class GuardrailTests(unittest.TestCase):
         self.assertAlmostEqual(report["target_progress"], 30.0, places=1)
         self.assertAlmostEqual(report["max_loss_room_percent"], 13.0, places=2)
 
+    def test_daily_room_is_measured_against_fixed_initial_capital(self):
+        self.state.day_start_balance = 60_000.0
+        report = guardrails.progress(self.settings, self.state, equity=59_000.0)
+        # Floor = 60,000 - 5,000; remaining $4,000 is 4% of initial.
+        self.assertEqual(report["daily_room_percent"], 4.0)
+
     def test_target_alone_does_not_meet_the_objectives(self):
         """FTMO's 2-Step also needs four trading days."""
         hit_target = guardrails.progress(self.settings, self.state, equity=111_000)
@@ -385,6 +391,19 @@ class NewsTests(unittest.TestCase):
         self.assertIsNotNone(before)
         self.assertEqual(before[0].title, "Non-Farm Employment Change")
         self.assertIsNone(after)
+
+    def test_expired_cache_is_not_usable_when_network_refresh_fails(self):
+        stale = self.news.Calendar(
+            self.calendar.events, datetime.now() - timedelta(hours=24), "cache",
+        )
+        failed = self.news.Calendar((), None, "none", "network unavailable")
+        with mock.patch.object(self.news, "from_cache", return_value=stale), \
+                mock.patch.object(self.news, "fetch", return_value=failed):
+            loaded = self.news.load(self.settings)
+
+        self.assertEqual(loaded.source, "stale-cache")
+        self.assertFalse(loaded.usable)
+        self.assertTrue(loaded.events)
 
 
 class StateTests(unittest.TestCase):
@@ -552,6 +571,19 @@ class StateTests(unittest.TestCase):
             state, {"login": 456, "server": "FTMO-Demo", "balance": 50_000})
         self.assertFalse(matches)
         self.assertIn("MISMATCH", message)
+
+    def test_status_rejects_netting_even_when_login_matches(self):
+        from bot.code.run import account_binding_status
+
+        state = BotState(account_login=456, account_server="FTMO-Demo",
+                         initial_balance=50_000)
+        matches, message = account_binding_status(state, {
+            "login": 456, "server": "FTMO-Demo", "balance": 50_000,
+            "margin_mode": 0, "is_hedging": False,
+        })
+        self.assertFalse(matches)
+        self.assertIn("UNSUPPORTED", message)
+        self.assertIn("hedging required", message)
 
 
 class ClockTests(unittest.TestCase):

@@ -1,12 +1,14 @@
 """Every tunable the bot has, in one place.
 
-The defaults are the production plan: gold only, M15 + M30, 0.40% risk per
-trade, and a capital-tier exit at 30,000. Override any field with an
-environment variable named `BOT_<FIELD>` or with `bot/code/settings.local.json`.
+Code defaults stay on the defensive static 0.40% plan. The checked-in local
+production profile enables the tested drawdown ladder for gold M15 + M30 and a
+capital-tier exit at 30,000. Override any field with an environment variable
+named `BOT_<FIELD>` or with `bot/code/settings.local.json`.
 """
 from __future__ import annotations
 
 import json
+import math
 import os
 from dataclasses import dataclass, field, fields
 from pathlib import Path
@@ -32,6 +34,19 @@ class Settings:
     risk_percent: float = 0.40           # per trade, of the initial balance
     max_open_risk_percent: float = 0.80  # sum of live risk across all positions
     max_concurrent_trades: int = 2
+    # Optional drawdown ladder. ``risk_percent`` remains the defensive floor;
+    # close to the realised balance high-water mark the bot may start faster,
+    # then automatically steps down as current equity draws down.
+    dynamic_risk_enabled: bool = False
+    dynamic_risk_max_percent: float = 1.00
+    dynamic_risk_dd1_percent: float = 0.50
+    dynamic_risk_tier2_percent: float = 0.75
+    dynamic_risk_dd2_percent: float = 1.00
+    dynamic_risk_tier3_percent: float = 0.50
+    dynamic_risk_dd3_percent: float = 1.50
+    # When a higher tier does not fit the remaining exposure/day room, try the
+    # next configured tier instead of wasting safe capacity or sizing arbitrarily.
+    dynamic_risk_fit_remaining: bool = False
 
     # --- FTMO objectives, 2-Step, as published on 2026-07-26 ---------------
     # 2-Step: max loss is STATIC from initial capital. The 1-Step product uses an
@@ -180,16 +195,51 @@ class Settings:
 
     def __post_init__(self) -> None:
         errors = []
+        finite_risk_fields = {
+            "risk_percent": self.risk_percent,
+            "dynamic_risk_max_percent": self.dynamic_risk_max_percent,
+            "dynamic_risk_tier2_percent": self.dynamic_risk_tier2_percent,
+            "dynamic_risk_tier3_percent": self.dynamic_risk_tier3_percent,
+            "dynamic_risk_dd1_percent": self.dynamic_risk_dd1_percent,
+            "dynamic_risk_dd2_percent": self.dynamic_risk_dd2_percent,
+            "dynamic_risk_dd3_percent": self.dynamic_risk_dd3_percent,
+            "max_open_risk_percent": self.max_open_risk_percent,
+            "max_risk_per_idea_percent": self.max_risk_per_idea_percent,
+            "internal_daily_stop_percent": self.internal_daily_stop_percent,
+            "daily_loss_percent": self.daily_loss_percent,
+            "max_loss_percent": self.max_loss_percent,
+            "profit_target_percent": self.profit_target_percent,
+        }
+        non_finite = [name for name, value in finite_risk_fields.items()
+                      if not math.isfinite(float(value))]
+        if non_finite:
+            errors.append("risk settings must be finite: " + ", ".join(non_finite))
         if not self.symbol.strip():
             errors.append("symbol must not be empty")
         if not self.timeframes:
             errors.append("timeframes must not be empty")
         if self.risk_percent <= 0:
             errors.append("risk_percent must be > 0")
-        if self.max_open_risk_percent < self.risk_percent:
-            errors.append("max_open_risk_percent must be >= risk_percent")
-        if self.max_risk_per_idea_percent < self.risk_percent:
-            errors.append("max_risk_per_idea_percent must be >= risk_percent")
+        peak_risk = (self.dynamic_risk_max_percent if self.dynamic_risk_enabled
+                     else self.risk_percent)
+        if self.max_open_risk_percent < peak_risk:
+            errors.append("max_open_risk_percent must be >= the maximum per-setup risk")
+        if self.max_risk_per_idea_percent < peak_risk:
+            errors.append("max_risk_per_idea_percent must be >= the maximum per-setup risk")
+        if self.dynamic_risk_enabled:
+            tiers = (self.dynamic_risk_max_percent,
+                     self.dynamic_risk_tier2_percent,
+                     self.dynamic_risk_tier3_percent,
+                     self.risk_percent)
+            if not all(value > 0 for value in tiers):
+                errors.append("dynamic risk tiers must be positive")
+            if not all(a >= b for a, b in zip(tiers, tiers[1:])):
+                errors.append("dynamic risk tiers must decrease toward risk_percent")
+            drawdowns = (self.dynamic_risk_dd1_percent,
+                         self.dynamic_risk_dd2_percent,
+                         self.dynamic_risk_dd3_percent)
+            if not (0 < drawdowns[0] < drawdowns[1] < drawdowns[2]):
+                errors.append("dynamic risk drawdown thresholds must increase")
         if not 0 < self.internal_daily_stop_percent <= self.daily_loss_percent:
             errors.append("internal_daily_stop_percent must be > 0 and <= daily_loss_percent")
         if self.daily_loss_percent <= 0 or self.max_loss_percent <= 0:

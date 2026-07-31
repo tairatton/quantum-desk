@@ -15,7 +15,8 @@ still exactly what the plan asked for.
 from __future__ import annotations
 
 import math
-from datetime import timedelta
+import re
+from datetime import datetime, timedelta
 
 import pandas as pd
 
@@ -27,11 +28,112 @@ from .broker import Broker, OrderRejected, Position
 from .settings import JOURNAL_PATH, STATE_PATH, Settings
 from .signals import Intent
 from .sizing import SizingError, size_plan
-from .state import BotState, ManagedTrade
+from .state import BotState, ManagedTrade, ftmo_day
+
+
+_RECOVERABLE_COMMENT = re.compile(
+    r"^(?P<timeframe>M\d+)\s+TP(?P<target>[123])\b.*\bbe33\b",
+    re.IGNORECASE,
+)
 
 
 def _timeframe_delta(timeframe: str) -> timedelta:
     return timedelta(seconds=config.TIMEFRAME_SECONDS[timeframe.upper()])
+
+
+def sizing_stop_distance(broker: Broker, settings: Settings, intent: Intent) -> float:
+    """Conservative stop distance used to size an order before its fill exists.
+
+    Market entries may legally be sent up to `max_entry_slippage_r` beyond the
+    bar close, and MT5 may fill another `deviation_points` past the requested
+    quote. Sizing them on the plan's original R would therefore exceed the cash
+    risk setting precisely when entry is worst. This applies to immediate and
+    converted market entries alike.
+    """
+    if intent.action != "market":
+        return intent.risk
+    allowed_adverse = intent.risk * settings.max_entry_slippage_r
+    execution_deviation = settings.deviation_points * broker.spec.point
+    return intent.risk + allowed_adverse + execution_deviation
+
+
+def _positions_risk_cash(broker: Broker, positions, stop: float | None = None) -> float:
+    """Cash the supplied fills can lose at the plan's original stop."""
+    total = 0.0
+    for position in positions:
+        stop_price = position.stop if stop is None else stop
+        distance = (position.price_open - stop_price) * position.direction
+        if distance > 0:
+            total += distance * broker.spec.value_per_point * position.volume
+    return total
+
+
+def _count_trading_moment(state: BotState, moment: datetime) -> None:
+    """Attribute an entry to its real FTMO day, not the restart day."""
+    if state.server_utc_offset is None:
+        state.count_trading_day()
+        return
+    key = ftmo_day(moment, state.server_utc_offset).isoformat()
+    if key not in state.trading_days:
+        state.trading_days.append(key)
+
+
+def _recovered_fill_moment(broker: Broker, position_tickets: list[int],
+                           frames: dict[str, pd.DataFrame] | None = None,
+                           timeframe: str = "") -> datetime:
+    """Best authoritative fill time for positions recovered through history."""
+    history_reader = getattr(broker, "filled_position_time", None)
+    moments = ([history_reader(ticket) for ticket in position_tickets]
+               if history_reader is not None else [])
+    moments = [moment for moment in moments if moment is not None]
+    frame = (frames or {}).get(timeframe)
+    if not moments and frame is not None and len(frame):
+        # Legacy/test adapters have no deal-time cache. The last closed bar was
+        # the pre-existing fallback and remains safer than an unrelated local
+        # wall-clock timestamp.
+        return pd.Timestamp(frame["time"].iloc[-1]).to_pydatetime()
+    if not moments:
+        live = {position.ticket: position for position in broker.positions()}
+        moments = [live[ticket].opened_at for ticket in position_tickets
+                   if ticket in live]
+    return min(moments) if moments else broker.tick()["server_time"]
+
+
+def _actualize_converted_risk_from_deals(broker: Broker, trade: ManagedTrade,
+                                         deals: list[dict]) -> bool:
+    """Replace conservative conversion risk once entry history is complete."""
+    if not trade.converted_risk_pending or not trade.position_tickets:
+        return False
+    wanted = set(trade.position_tickets)
+    entries = [
+        deal for deal in deals
+        if deal.get("position") in wanted and deal.get("is_exit") is False
+    ]
+    covered = {int(deal["position"]) for deal in entries}
+    if not wanted.issubset(covered):
+        return False
+    reported_volume = sum(float(deal.get("volume") or 0.0) for deal in entries)
+    if (trade.expected_market_volume > 0
+            and reported_volume + 1e-9 < trade.expected_market_volume):
+        return False
+    actual = sum(
+        max((float(deal["price"]) - trade.stop) * trade.direction, 0.0)
+        * broker.spec.value_per_point * float(deal.get("volume") or 0.0)
+        for deal in entries
+    )
+    if actual <= 0:
+        return False
+    previous = trade.risk_cash
+    trade.risk_cash = round(actual, 2)
+    trade.converted_risk_pending = False
+    journal.write(
+        JOURNAL_PATH, "risk_cash_actualized", plan_id=trade.plan_id,
+        previous_risk_cash=previous, risk_cash=trade.risk_cash,
+        position_tickets=trade.position_tickets,
+    )
+    print(f"[RISK_ACTUALIZED] plan={trade.plan_id} "
+          f"risk_cash={previous:.2f}->{trade.risk_cash:.2f}")
+    return True
 
 
 def _leg_targets(intent: Intent, leg_count: int, fallback_index: int) -> list[float]:
@@ -111,8 +213,260 @@ def _check_exit_mode(exit_mode: str, sizing, intent: Intent) -> str | None:
     return None
 
 
+def recover_orphan_setups(broker: Broker, state: BotState) -> list[ManagedTrade]:
+    """Adopt unmistakable live positions/pending orders missing from state.
+
+    A reset or stale state file must not leave live bot positions without TP1
+    break-even and timeout management. Position recovery requires all three
+    TP roles, a common plan stop, fills close in time, and entry dispersion no
+    larger than the configured market slippage envelope. Pending recovery can
+    safely retain a partial placement because every ticket still has its own
+    broker-side SL/TP/expiry; an absent TP1 is explicitly marked unknown so it
+    can never trigger a guessed break-even move.
+    """
+    positions = broker.positions()
+    managed = {
+        ticket for trade in state.open_trades()
+        for ticket in trade.position_tickets
+    }
+    candidates = []
+    for position in positions:
+        if position.ticket in managed:
+            continue
+        match = _RECOVERABLE_COMMENT.search(position.comment or "")
+        if match is None or position.stop <= 0 or position.take_profit <= 0:
+            continue
+        candidates.append((position, match.group("timeframe").upper(),
+                           int(match.group("target"))))
+
+    recovered = []
+    live_by_ticket = {position.ticket: position for position in positions}
+    unattached = []
+    for position, timeframe, target in candidates:
+        matches = []
+        for trade in state.open_trades():
+            if (trade.timeframe.upper() != timeframe
+                    or trade.direction != position.direction
+                    or trade.exit_mode != "be_33_33_34"
+                    or len(trade.targets) < target or trade.risk <= 0):
+                continue
+            price_tolerance = max(broker.spec.point * 2, trade.risk * 0.02)
+            if (abs(position.stop - trade.stop) > price_tolerance
+                    or abs(position.take_profit - trade.targets[target - 1])
+                    > price_tolerance
+                    or abs(position.price_open - trade.entry) > trade.risk * 0.20):
+                continue
+            role_already_live = any(
+                ticket in live_by_ticket
+                and abs(live_by_ticket[ticket].take_profit
+                        - trade.targets[target - 1]) <= price_tolerance
+                for ticket in trade.position_tickets
+            )
+            if not role_already_live:
+                matches.append(trade)
+        if len(matches) != 1:
+            unattached.append((position, timeframe, target))
+            continue
+        trade = matches[0]
+        trade.position_tickets.append(position.ticket)
+        if target == 1:
+            trade.tp1_position_ticket = position.ticket
+        trade.filled_at = trade.filled_at or str(position.opened_at)
+        trade.fill_bar_time = trade.fill_bar_time or str(position.opened_at)
+        _count_trading_moment(state, position.opened_at)
+        managed.add(position.ticket)
+        if trade not in recovered:
+            recovered.append(trade)
+        journal.write(
+            JOURNAL_PATH, "orphan_position_attached", plan_id=trade.plan_id,
+            ticket=position.ticket, role=target,
+        )
+        print(f"[ORPHAN_ATTACHED] plan={trade.plan_id} "
+              f"position={position.ticket} role=TP{target}")
+    candidates = unattached
+
+    groups: dict[tuple, list[tuple[Position, int]]] = {}
+    for position, timeframe, target in candidates:
+        key = (
+            timeframe, position.direction,
+            round(position.stop, broker.spec.digits),
+        )
+        groups.setdefault(key, []).append((position, target))
+
+    for key, legs in groups.items():
+        roles = [target for _, target in legs]
+        if len(legs) != 3 or sorted(roles) != [1, 2, 3]:
+            continue
+        timeframe, direction, stop = key
+        ordered = sorted(legs, key=lambda item: item[1])
+        opened_times = [position.opened_at for position, _ in ordered]
+        recovery_window = max(
+            10.0, float(getattr(broker, "write_spacing_seconds", 0.0)) * 4 + 5,
+        )
+        if (max(opened_times) - min(opened_times)).total_seconds() > recovery_window:
+            continue
+        entries = [position.price_open for position, _ in ordered]
+        risks = [(entry - stop) * direction for entry in entries]
+        if min(risks) <= 0 or max(entries) - min(entries) > min(risks) * 0.20:
+            continue
+        # TP1/TP2/TP3 must progress farther in the profitable direction. This
+        # rejects three unrelated tickets that merely reuse the same stop.
+        directed_targets = [position.take_profit * direction
+                            for position, _ in ordered]
+        if not directed_targets[0] < directed_targets[1] < directed_targets[2]:
+            continue
+        entry = sum(entries) / len(entries)
+        opened_at = max(opened_times)
+        risk = (entry - stop) * direction
+        position_tickets = [position.ticket for position, _ in ordered]
+        if any(ticket in managed for ticket in position_tickets):
+            continue
+        base_id = f"{timeframe}@recovered-{opened_at.isoformat(sep=' ')}"
+        plan_id = base_id
+        suffix = 2
+        while plan_id in state.trades:
+            plan_id = f"{base_id}-{suffix}"
+            suffix += 1
+        trade = ManagedTrade(
+            plan_id=plan_id, timeframe=timeframe, direction=direction,
+            entry=entry, stop=stop, risk=risk,
+            risk_cash=round(_positions_risk_cash(
+                broker, [position for position, _ in ordered], stop,
+            ), 2),
+            targets=[position.take_profit for position, _ in ordered],
+            legs=[position.volume for position, _ in ordered],
+            position_tickets=position_tickets,
+            tp1_position_ticket=ordered[0][0].ticket,
+            filled_at=str(opened_at), fill_bar_time=str(opened_at),
+            exit_mode="be_33_33_34", dry_run=False,
+        )
+        state.trades[plan_id] = trade
+        state.remember_plan(plan_id)
+        _count_trading_moment(state, opened_at)
+        managed.update(position_tickets)
+        recovered.append(trade)
+        journal.write(
+            JOURNAL_PATH, "orphan_setup_recovered", plan_id=plan_id,
+            timeframe=timeframe, direction=direction,
+            position_tickets=position_tickets, risk_cash=trade.risk_cash,
+        )
+        print(f"[ORPHAN_RECOVERED] plan={plan_id} "
+              f"positions={position_tickets} risk_cash={trade.risk_cash:.2f}")
+
+    managed_pending = {
+        ticket for trade in state.open_trades()
+        for ticket in trade.pending_tickets
+    }
+    pending_groups: dict[tuple, list[tuple[dict, int]]] = {}
+    for order in broker.pending_orders():
+        if order["ticket"] in managed_pending:
+            continue
+        match = _RECOVERABLE_COMMENT.search(str(order.get("comment", "")))
+        type_name = str(order.get("type_name", "")).upper()
+        direction = (1 if type_name.startswith("BUY") else
+                     -1 if type_name.startswith("SELL") else 0)
+        entry = float(order.get("price") or 0.0)
+        stop = float(order.get("stop") or 0.0)
+        target_price = float(order.get("take_profit") or 0.0)
+        if (match is None or not direction or entry <= 0 or stop <= 0
+                or target_price <= 0 or (entry - stop) * direction <= 0):
+            continue
+        timeframe = match.group("timeframe").upper()
+        role = int(match.group("target"))
+        matches = []
+        for trade in state.open_trades():
+            if (trade.timeframe.upper() != timeframe
+                    or trade.direction != direction
+                    or trade.exit_mode != "be_33_33_34"
+                    or len(trade.targets) < role or trade.risk <= 0):
+                continue
+            price_tolerance = max(broker.spec.point * 2, trade.risk * 0.02)
+            if (abs(entry - trade.entry) <= price_tolerance
+                    and abs(stop - trade.stop) <= price_tolerance
+                    and abs(target_price - trade.targets[role - 1])
+                    <= price_tolerance):
+                matches.append(trade)
+        if len(matches) == 1:
+            trade = matches[0]
+            trade.pending_tickets.append(order["ticket"])
+            if role == 1:
+                trade.tp1_pending_ticket = order["ticket"]
+            managed_pending.add(order["ticket"])
+            if trade not in recovered:
+                recovered.append(trade)
+            journal.write(
+                JOURNAL_PATH, "orphan_pending_attached", plan_id=trade.plan_id,
+                ticket=order["ticket"], role=role,
+            )
+            print(f"[ORPHAN_PENDING_ATTACHED] plan={trade.plan_id} "
+                  f"order={order['ticket']} role=TP{role}")
+            continue
+        key = (
+            timeframe, direction,
+            round(entry, broker.spec.digits), round(stop, broker.spec.digits),
+            order.get("expires_at"),
+        )
+        pending_groups.setdefault(key, []).append(
+            (order, role),
+        )
+
+    for key, legs in pending_groups.items():
+        roles = [role for _, role in legs]
+        if len(set(roles)) != len(roles) or not 1 <= len(legs) <= 3:
+            continue
+        timeframe, direction, entry, stop, expires_at = key
+        risk = (entry - stop) * direction
+        targets = [entry + direction * risk * reward for reward in (1.0, 1.5, 2.0)]
+        volumes = [0.0, 0.0, 0.0]
+        by_role = {}
+        for order, role in legs:
+            targets[role - 1] = float(order["take_profit"])
+            volumes[role - 1] = float(order["volume"])
+            by_role[role] = order
+        pending_tickets = [by_role[role]["ticket"] for role in sorted(by_role)]
+        if any(ticket in managed_pending for ticket in pending_tickets):
+            continue
+        stamp = (expires_at.isoformat(sep=" ") if expires_at is not None
+                 else f"tickets-{min(pending_tickets)}")
+        base_id = f"{timeframe}@recovered-pending-{stamp}"
+        plan_id = base_id
+        suffix = 2
+        while plan_id in state.trades:
+            plan_id = f"{base_id}-{suffix}"
+            suffix += 1
+        risk_cash = sum(
+            abs(float(order["price"]) - float(order["stop"]))
+            * broker.spec.value_per_point * float(order["volume"])
+            for order, _ in legs
+        )
+        trade = ManagedTrade(
+            plan_id=plan_id, timeframe=timeframe, direction=direction,
+            entry=entry, stop=stop, risk=risk, risk_cash=round(risk_cash, 2),
+            targets=targets, legs=volumes,
+            pending_tickets=pending_tickets,
+            tp1_pending_ticket=(by_role[1]["ticket"] if 1 in by_role else -1),
+            exit_mode="be_33_33_34", dry_run=False,
+        )
+        state.trades[plan_id] = trade
+        state.remember_plan(plan_id)
+        managed_pending.update(pending_tickets)
+        recovered.append(trade)
+        journal.write(
+            JOURNAL_PATH, "orphan_pending_recovered", plan_id=plan_id,
+            timeframe=timeframe, direction=direction,
+            pending_tickets=pending_tickets, roles=sorted(by_role),
+            risk_cash=trade.risk_cash,
+        )
+        print(f"[ORPHAN_PENDING_RECOVERED] plan={plan_id} "
+              f"orders={pending_tickets} roles={sorted(by_role)} "
+              f"risk_cash={trade.risk_cash:.2f}")
+    if recovered:
+        state.save(STATE_PATH)
+    return recovered
+
+
 def open_trade(broker: Broker, settings: Settings, state: BotState, intent: Intent,
-               balance: float) -> ManagedTrade | None:
+               balance: float, risk_percent: float | None = None) -> ManagedTrade | None:
     """Size the plan and place its legs. Returns None when nothing was sent."""
     # Never let current balance/equity flip the capital tier. `initial_balance`
     # is durable state captured on the first run; using it here as well as in the
@@ -121,11 +475,15 @@ def open_trade(broker: Broker, settings: Settings, state: BotState, intent: Inte
                   if settings.exit_mode == "capital_tier" else balance)
     exit_mode = settings.resolved_exit_mode(risk_basis)
     leg_weights = settings.leg_weights_for(risk_basis)
+    requested_risk = (settings.risk_percent if risk_percent is None
+                      else float(risk_percent))
     try:
-        sizing = size_plan(broker.spec, risk_basis, settings.risk_percent,
-                           intent.risk, leg_weights,
-                           rounding=settings.lot_rounding,
-                           max_overshoot=settings.max_risk_overshoot)
+        sizing = size_plan(broker.spec, risk_basis, requested_risk,
+                           sizing_stop_distance(broker, settings, intent), leg_weights,
+                           rounding=("down" if intent.action == "market"
+                                     else settings.lot_rounding),
+                           max_overshoot=(0.0 if intent.action == "market"
+                                          else settings.max_risk_overshoot))
     except SizingError as error:
         journal.write(JOURNAL_PATH, "sizing_rejected", plan_id=intent.plan_id,
                       reason=str(error))
@@ -138,6 +496,7 @@ def open_trade(broker: Broker, settings: Settings, state: BotState, intent: Inte
     # half-size position would read as a system with twice the edge it has.
     if sizing.risk_shortfall < 0.85:
         journal.write(JOURNAL_PATH, "risk_rounded_down", plan_id=intent.plan_id,
+                      requested_risk_percent=requested_risk,
                       intended=round(sizing.intended_risk_cash, 2),
                       actual=round(sizing.risk_cash, 2),
                       fraction=round(sizing.risk_shortfall, 3),
@@ -166,12 +525,23 @@ def open_trade(broker: Broker, settings: Settings, state: BotState, intent: Inte
         plan_id=intent.plan_id, timeframe=intent.timeframe, direction=intent.direction,
         entry=intent.entry, stop=intent.stop, risk=intent.risk,
         risk_cash=round(sizing.risk_cash, 2), targets=targets, legs=list(sizing.legs),
+        # A converted attempt has already released its limit before this record
+        # replaces the pending one. Preserve that fact before sending leg one:
+        # if the broker rejects the first leg (or the process dies here), a
+        # restart on the same closed bar must not treat the empty record as a
+        # fresh conversion and retry the plan.
+        conversion_released=intent.converted,
+        # Every market entry is initially sized at its worst permitted fill.
+        # Replace that conservative denominator with authoritative fill risk as
+        # soon as positions/deals are visible; the legacy field name is retained
+        # for state-file compatibility.
+        converted_risk_pending=intent.action == "market",
         dry_run=broker.dry_run, exit_mode=actual_exit_mode,
     )
 
     expiry = None
     if intent.action == "limit":
-        remaining = max(signals.ENTRY_TIMEOUT_BARS - intent.bars_since_signal, 1)
+        remaining = max(signals.limit_life_bars() - intent.bars_since_signal, 1)
         expiry = broker.tick()["server_time"] + remaining * _timeframe_delta(intent.timeframe)
 
     # What is live *before* the first leg goes out. This used to be assembled
@@ -208,14 +578,28 @@ def open_trade(broker: Broker, settings: Settings, state: BotState, intent: Inte
                          if tag not in {"fixedtp3", "be33"}) + (mode_tag,)
             comment = f"{intent.timeframe} TP{tp_number} {'|'.join(tags)}"
             if intent.action == "market":
+                worst_price = (intent.entry + intent.direction * intent.risk
+                               * settings.max_entry_slippage_r)
                 result = broker.market_entry(
                     intent.direction, volume, intent.stop, target, comment,
+                    worst_price=worst_price,
                 )
-                order_ticket = int(result.get("order") or 0)
-                if order_ticket:
-                    trade.market_order_tickets.append(order_ticket)
+                # A performed TRADE_ACTION_DEAL may expose only `deal`, while an
+                # accepted/placed request normally exposes `order`. Persist
+                # whichever authoritative identity MT5 supplied so delayed
+                # position visibility cannot turn a real fill into an orphan.
+                recovery_ticket = int(result.get("order") or result.get("deal") or 0)
+                if recovery_ticket:
+                    trade.market_order_tickets.append(recovery_ticket)
+                    # MqlTradeResult reports the executed volume. Prefer it so a
+                    # legitimate partial fill cannot leave risk reconciliation
+                    # waiting forever for volume the broker never opened.
+                    executed_volume = float(result.get("volume") or volume)
+                    trade.expected_market_volume = round(
+                        trade.expected_market_volume + executed_volume, 8
+                    )
                     if index == 1 and actual_exit_mode == "be_33_33_34":
-                        trade.tp1_market_order_ticket = order_ticket
+                        trade.tp1_market_order_ticket = recovery_ticket
                     # Persist each accepted leg immediately. The final broker
                     # position lookup below is still authoritative, but a hard
                     # power loss before `finally` now leaves enough identity for
@@ -241,7 +625,10 @@ def open_trade(broker: Broker, settings: Settings, state: BotState, intent: Inte
         # the exit machinery owns every live leg.
         if intent.action == "market":
             trade.filled_at = str(broker.tick()["server_time"])
-            trade.fill_bar_time = intent.signal_time
+            # A converted plan fills bars after its signal, and the 120-bar
+            # timeout counts from the fill. Anchoring it to the signal would
+            # retire the trade early by exactly the bars spent waiting.
+            trade.fill_bar_time = intent.fill_bar_time or intent.signal_time
             # Read the tickets back rather than trusting the order id to equal
             # the position id — brokers do not all agree on that.
             opened = [
@@ -252,6 +639,13 @@ def open_trade(broker: Broker, settings: Settings, state: BotState, intent: Inte
                 _position_target_index(trade, position), position.ticket,
             ))
             trade.position_tickets = [position.ticket for position in opened]
+            if (len(opened) >= placed
+                    and sum(position.volume for position in opened) + 1e-9
+                    >= trade.expected_market_volume):
+                actual_risk_cash = _positions_risk_cash(broker, opened, trade.stop)
+                if actual_risk_cash > 0:
+                    trade.risk_cash = round(actual_risk_cash, 2)
+                    trade.converted_risk_pending = False
             if opened and actual_exit_mode == "be_33_33_34":
                 tp1 = min(opened, key=lambda position: (
                     _position_target_index(trade, position), position.ticket,
@@ -259,7 +653,8 @@ def open_trade(broker: Broker, settings: Settings, state: BotState, intent: Inte
                 if _position_target_index(trade, tp1) == 0:
                     trade.tp1_position_ticket = tp1.ticket
             # Every accepted market leg is visible, so no history recovery is
-            # outstanding. If visibility lags, retain the order ids for startup.
+            # outstanding. If visibility lags, retain the order/deal ids for
+            # startup.
             if len(opened) >= placed:
                 trade.market_order_tickets.clear()
             if trade.position_tickets:
@@ -268,9 +663,9 @@ def open_trade(broker: Broker, settings: Settings, state: BotState, intent: Inte
                 and not trade.market_order_tickets):
             # Nothing is live, so nothing needs managing. It stays in `trades` as
             # a closed record, which also stops the plan being retried. Accepted
-            # market order ids are live uncertainty, not "nothing": MT5 can make
-            # the order visible in deal history a moment before its position is
-            # returned by positions_get().
+            # market recovery ids are live uncertainty, not "nothing": MT5 can
+            # make the transaction visible in history a moment before its
+            # position is returned by positions_get().
             trade.closed = True
         state.save(STATE_PATH)
 
@@ -279,19 +674,27 @@ def open_trade(broker: Broker, settings: Settings, state: BotState, intent: Inte
                   entry=intent.entry, stop=intent.stop, risk=intent.risk,
                   targets=targets, legs=list(sizing.legs), legs_placed=placed,
                   risk_cash=trade.risk_cash,
+                  requested_risk_percent=requested_risk,
                   single_leg=sizing.single_leg, exit_mode=actual_exit_mode,
+                  converted=intent.converted,
                   dry_run=broker.dry_run)
+    if intent.converted and placed:
+        event = ("converted_market_simulated" if broker.dry_run
+                 else "converted_market_opened")
+        journal.write(JOURNAL_PATH, event, plan_id=trade.plan_id,
+                      timeframe=intent.timeframe, legs_placed=placed)
     if trade.position_tickets:
         print(f"[POSITION_OPENED] plan={intent.plan_id} side={intent.side} "
               f"positions={trade.position_tickets} volumes={list(sizing.legs)} "
               f"entry={intent.entry} sl={intent.stop} targets={targets} "
-              f"risk_cash={trade.risk_cash:.2f}")
+              f"risk={requested_risk:.2f}% risk_cash={trade.risk_cash:.2f}")
     elif trade.pending_tickets:
         expiry_text = expiry.strftime("%Y-%m-%d %H:%M:%S") if expiry else "GTC"
         print(f"[PENDING_CREATED] plan={intent.plan_id} side={intent.side} "
               f"orders={trade.pending_tickets} volumes={list(sizing.legs)} "
               f"entry={intent.entry} sl={intent.stop} targets={targets} "
-              f"expires={expiry_text} risk_cash={trade.risk_cash:.2f}")
+              f"expires={expiry_text} risk={requested_risk:.2f}% "
+              f"risk_cash={trade.risk_cash:.2f}")
     elif trade.market_order_tickets:
         print(f"[MARKET_SYNC_WAIT] plan={intent.plan_id} "
               f"orders={trade.market_order_tickets} "
@@ -305,8 +708,8 @@ def sync_fills(broker: Broker, state: BotState,
                frames: dict[str, pd.DataFrame] | None = None) -> None:
     """Reconcile pending orders with their resulting MT5 position identifiers.
 
-    MT5 order tickets and position tickets are different identifiers on many
-    brokers. Deal history provides the authoritative order-to-position mapping.
+    MT5 order/deal tickets and position tickets are different identifiers on
+    many brokers. Deal history provides the authoritative mapping.
     """
     live_orders = {order["ticket"] for order in broker.pending_orders()}
     pending_tickets = [
@@ -343,13 +746,16 @@ def sync_fills(broker: Broker, state: BotState,
         unresolved_market = list(trade.market_order_tickets)
         if recovered_market:
             changed = True
-            trade.filled_at = trade.filled_at or str(broker.tick()["server_time"])
-            if not trade.fill_bar_time:
-                trade.fill_bar_time = _fill_bar_time(frames, trade, broker)
-            state.count_trading_day()
             recovered_positions = [
                 filled_by_order[ticket] for ticket in recovered_market
             ]
+            fill_moment = _recovered_fill_moment(
+                broker, recovered_positions, frames, trade.timeframe,
+            )
+            trade.filled_at = trade.filled_at or str(fill_moment)
+            if not trade.fill_bar_time:
+                trade.fill_bar_time = str(fill_moment)
+            _count_trading_moment(state, fill_moment)
             journal.write(
                 JOURNAL_PATH, "market_fill_recovered",
                 plan_id=trade.plan_id, order_tickets=recovered_market,
@@ -362,6 +768,14 @@ def sync_fills(broker: Broker, state: BotState,
             print(f"[MARKET_SYNC_WAIT] plan={trade.plan_id} "
                   f"orders={unresolved_market} "
                   "reason='waiting for MT5 deal history'")
+
+        if trade.converted_risk_pending and trade.position_tickets:
+            since = pd.Timestamp(
+                trade.filled_at or broker.tick()["server_time"]
+            ).to_pydatetime()
+            changed = (_actualize_converted_risk_from_deals(
+                broker, trade, broker.closed_deals(since - timedelta(days=2))
+            ) or changed)
 
         if not trade.pending_tickets:
             continue
@@ -385,10 +799,13 @@ def sync_fills(broker: Broker, state: BotState,
         changed = changed or trade.pending_tickets != original
 
         if filled_positions:
-            trade.filled_at = trade.filled_at or str(broker.tick()["server_time"])
+            fill_moment = _recovered_fill_moment(
+                broker, filled_positions, frames, trade.timeframe,
+            )
+            trade.filled_at = trade.filled_at or str(fill_moment)
             if not trade.fill_bar_time:
-                trade.fill_bar_time = _fill_bar_time(frames, trade, broker)
-            state.count_trading_day()
+                trade.fill_bar_time = str(fill_moment)
+            _count_trading_moment(state, fill_moment)
             journal.write(JOURNAL_PATH, "pending_filled", plan_id=trade.plan_id,
                           order_tickets=filled_orders,
                           position_tickets=filled_positions,
@@ -413,21 +830,6 @@ def sync_fills(broker: Broker, state: BotState,
 
     if changed:
         state.save(STATE_PATH)
-
-def _fill_bar_time(frames: dict[str, pd.DataFrame] | None, trade: ManagedTrade,
-                   broker: Broker) -> str:
-    """The closed bar the fill belongs to, which starts the 120-bar clock.
-
-    The strategy counts from the bar that filled, so the last closed bar on the
-    trade's own timeframe is the right anchor. Falling back to the raw server
-    time still beats leaving it unset: a timestamp `bars_since` cannot match
-    yields 0 bars, which merely delays the timeout instead of disabling it.
-    """
-    frame = (frames or {}).get(trade.timeframe)
-    if frame is not None and len(frame):
-        return str(pd.Timestamp(frame["time"].iloc[-1]))
-    return str(broker.tick()["server_time"])
-
 
 def apply_breakeven(broker: Broker, state: BotState) -> set[int]:
     """Move survivors to cost-covered fills and return live position tickets.
@@ -676,18 +1078,165 @@ def cancel_stale(broker: Broker, state: BotState, intent: Intent) -> None:
         print(f"[PENDING_CANCELLED] plan={trade.plan_id} reason={intent.status!r}")
 
 
+def release_for_conversion(broker: Broker, state: BotState, intent: Intent) -> bool:
+    """Clear the working limit so the plan can be re-sent at market.
+
+    Returns True only when it is *provably* safe to send: every working order for
+    this plan is gone and the plan holds no position. Anything else returns False
+    and the caller must send nothing.
+
+    The failure this exists to prevent is double size. A cancel and a fill can
+    cross on the wire — the retrace prints on the very bar the bot decides to give
+    up on it — and a market order sent on the assumption the cancel worked would
+    leave two positions on one plan, each sized for the whole risk budget. So the
+    broker is asked twice: once to cancel, and once afterwards to confirm that
+    nothing of this plan is live. A missed conversion costs one trade; an
+    unnoticed double fill costs twice the risk the account is allowed to carry.
+    """
+    trade = state.trades.get(intent.plan_id)
+    if trade is None:
+        # Usually this means the bot was offline while the limit would have been
+        # working, so there is genuinely nothing to release.  A lost/reset state
+        # file is indistinguishable locally, though, and may leave an orphan from
+        # this timeframe at MT5. Order comments start with the timeframe; refuse
+        # that ambiguous case and let the operator/startup reconciliation surface
+        # it instead of stacking a fresh full-risk market setup on top.
+        same_timeframe_orders = [
+            order["ticket"] for order in broker.pending_orders()
+            if str(order.get("comment", "")).upper().startswith(
+                f"{intent.timeframe.upper()} ")
+        ]
+        same_timeframe_positions = [
+            position.ticket for position in broker.positions()
+            if str(getattr(position, "comment", "")).upper().startswith(
+                f"{intent.timeframe.upper()} ")
+        ]
+        if same_timeframe_orders or same_timeframe_positions:
+            journal.write(
+                JOURNAL_PATH, "convert_aborted", plan_id=intent.plan_id,
+                reason="same-timeframe broker exposure has no state record",
+                orders=same_timeframe_orders, positions=same_timeframe_positions,
+            )
+            print(f"[CONVERT_ABORTED] plan={intent.plan_id} "
+                  f"orders={same_timeframe_orders} positions={same_timeframe_positions} "
+                  "reason='untracked same-timeframe exposure'")
+            return False
+        return True
+
+    if trade.conversion_released:
+        journal.write(JOURNAL_PATH, "convert_skipped", plan_id=intent.plan_id,
+                      reason="limit was already released for conversion")
+        print(f"[CONVERT_SKIPPED] plan={intent.plan_id} reason='already released'")
+        return False
+
+    if trade.position_tickets or trade.market_order_tickets:
+        journal.write(JOURNAL_PATH, "convert_skipped", plan_id=intent.plan_id,
+                      reason="plan already holds a position")
+        print(f"[CONVERT_SKIPPED] plan={intent.plan_id} reason='already filled'")
+        return False
+
+    # Snapshot before touching anything. A filled pending order does not keep its
+    # order ticket — MT5 issues a position ticket and only the deal history ties
+    # the two together — so "did one of my orders fill?" cannot be answered by
+    # comparing ticket sets. What can be answered, without any mapping, is
+    # "did a position appear that was not there a moment ago?"
+    before = {position.ticket for position in broker.positions()}
+    working = {order["ticket"] for order in broker.pending_orders()}
+    tracked = set(trade.pending_tickets)
+    disappeared = tracked - working
+    if disappeared:
+        # This is the race window that a post-cancel position diff cannot see:
+        # the order may have filled after the pass's sync, but before `before`
+        # was captured. Its position is then already part of `before`, so it
+        # would not "appear" below. Missing is therefore uncertainty, never
+        # proof of cancellation; leave the ticket owned for `sync_fills` to map
+        # through deal history on the next pass.
+        disappeared_states = broker.finished_order_states(sorted(disappeared))
+        safe_states = {"CANCELED", "EXPIRED", "REJECTED"}
+        unsafe_disappeared = {
+            ticket: disappeared_states.get(ticket) for ticket in disappeared
+            if disappeared_states.get(ticket) not in safe_states
+        }
+        if unsafe_disappeared:
+            journal.write(JOURNAL_PATH, "convert_aborted", plan_id=intent.plan_id,
+                          reason="pending order disappeared before cancel",
+                          states=unsafe_disappeared)
+            print(f"[CONVERT_ABORTED] plan={intent.plan_id} "
+                  f"states={unsafe_disappeared} "
+                  "reason='pending disappeared before cancel; awaiting history'")
+            return False
+
+    for ticket in list(trade.pending_tickets):
+        if ticket not in working:
+            continue
+        try:
+            broker.cancel(ticket, "converting to market")
+        except OrderRejected as error:
+            journal.write(JOURNAL_PATH, "convert_cancel_rejected",
+                          plan_id=intent.plan_id, ticket=ticket, reason=str(error))
+            print(f"[CONVERT_ABORTED] plan={intent.plan_id} ticket={ticket} "
+                  f"reason={str(error)!r}")
+            return False
+
+    # Re-read rather than trust the cancels. `order_send` returning done is not
+    # proof the order was cancelled rather than filled a millisecond earlier.
+    appeared = {position.ticket for position in broker.positions()} - before
+    if appeared:
+        journal.write(JOURNAL_PATH, "convert_aborted", plan_id=intent.plan_id,
+                      reason="position appeared while cancelling",
+                      tickets=sorted(appeared))
+        print(f"[CONVERT_ABORTED] plan={intent.plan_id} positions={sorted(appeared)} "
+              "reason='filled while cancelling'")
+        return False
+    still_working = {order["ticket"] for order in broker.pending_orders()}
+    if still_working & set(trade.pending_tickets):
+        journal.write(JOURNAL_PATH, "convert_aborted", plan_id=intent.plan_id,
+                      reason="order still working after cancel")
+        print(f"[CONVERT_ABORTED] plan={intent.plan_id} reason='order still working'")
+        return False
+
+    # Position visibility can lag behind the order leaving the live book.  Do
+    # not infer "cancelled" from those two observations; order history is the
+    # authoritative terminal state.  A history response that is incomplete is
+    # also not proof, so prefer missing one conversion to risking a double fill.
+    finished = broker.finished_order_states(sorted(tracked))
+    safe_states = {"CANCELED", "EXPIRED", "REJECTED"}
+    unsafe = {ticket: finished.get(ticket) for ticket in tracked
+              if finished.get(ticket) not in safe_states}
+    if unsafe:
+        journal.write(JOURNAL_PATH, "convert_aborted", plan_id=intent.plan_id,
+                      reason="cancel not confirmed by order history", states=unsafe)
+        print(f"[CONVERT_ABORTED] plan={intent.plan_id} states={unsafe} "
+              "reason='cancel not confirmed by history'")
+        return False
+
+    trade.pending_tickets.clear()
+    # The old limit record has no live exposure now. Marking it closed prevents
+    # a blocked market replacement from becoming an unprunable zombie; the
+    # successful market path immediately replaces this record in `open_trade`.
+    trade.closed = True
+    trade.conversion_released = True
+    state.save(STATE_PATH)
+    journal.write(JOURNAL_PATH, "limit_released_for_conversion",
+                  plan_id=intent.plan_id, timeframe=intent.timeframe)
+    print(f"[CONVERT] plan={intent.plan_id} reason='retrace never came' "
+          f"scope='limit cancelled, sending market'")
+    return True
+
+
 def reconcile_closed(broker: Broker, state: BotState) -> list[dict]:
     """Score finished trades in R and update the loss streak."""
     open_tickets = {position.ticket for position in broker.positions()}
     pending_tickets = {order["ticket"] for order in broker.pending_orders()}
     finished = []
-    for trade in state.open_trades():
+    current_day_outcomes = []
+    for sequence, trade in enumerate(state.open_trades()):
         if trade.dry_run or not trade.position_tickets:
             continue
         # A partial history response can map TP1 before the survivor market
         # orders. If TP1 is already gone, its closing deal is enough to make the
         # mapped subset look finished, but it is not enough to score and close
-        # the whole setup while survivor order ids are still unresolved.
+        # the whole setup while survivor recovery ids are still unresolved.
         if trade.market_order_tickets:
             print(f"[RECONCILE_WAIT] plan={trade.plan_id} "
                   f"market_orders={trade.market_order_tickets} "
@@ -698,27 +1247,104 @@ def reconcile_closed(broker: Broker, state: BotState) -> list[dict]:
         if any(ticket in pending_tickets for ticket in trade.pending_tickets):
             continue
         since = pd.Timestamp(trade.filled_at or broker.tick()["server_time"]).to_pydatetime()
-        deals = [deal for deal in broker.closed_deals(since - timedelta(days=2))
-                 if deal["position"] in trade.position_tickets]
+        position_deals = [
+            deal for deal in broker.closed_deals(since - timedelta(days=2))
+            if deal["position"] in trade.position_tickets
+        ]
+        risk_actualized = _actualize_converted_risk_from_deals(
+            broker, trade, position_deals
+        )
+        if risk_actualized:
+            state.save(STATE_PATH)
+        if trade.converted_risk_pending:
+            print(f"[RECONCILE_WAIT] plan={trade.plan_id} "
+                  "reason='converted entry deal history is incomplete'")
+            continue
+        deals = [
+            deal for deal in position_deals
+            # Legacy test/fake brokers predate the classification and only
+            # return closing deals here, so absence retains that contract.
+            if deal.get("is_exit", True)
+        ]
         # `net` is profit plus commission plus swap. Gold on M30 can be held for
         # 60 hours, so swap is not a rounding error, and R is the number that
         # decides whether this edge survived contact with a real broker.
         if not deals:
             print(f"[RECONCILE_WAIT] plan={trade.plan_id} "
-                  "reason='position disappeared but deal history is not available yet'")
+                  "reason='position disappeared but exit deal history is not available yet'")
             continue
-        profit = sum(deal["net"] for deal in deals)
+        exits_by_position = {
+            ticket: [deal for deal in deals if deal["position"] == ticket]
+            for ticket in trade.position_tickets
+        }
+        missing_exits = [ticket for ticket, exits in exits_by_position.items()
+                         if not exits]
+        if missing_exits:
+            print(f"[RECONCILE_WAIT] plan={trade.plan_id} "
+                  f"positions={missing_exits} "
+                  "reason='exit deal history is incomplete'")
+            continue
+        # A single position can close through multiple partial deals. When its
+        # opening deal is present, use that authoritative broker volume (rather
+        # than the planned leg list, which can differ after partial placement)
+        # and require the full exit before scoring.
+        incomplete_volumes = {}
+        for ticket in trade.position_tickets:
+            entry_rows = [deal for deal in position_deals
+                          if deal["position"] == ticket
+                          and not deal.get("is_exit", True)]
+            exit_rows = exits_by_position[ticket]
+            entry_volumes = [deal.get("volume") for deal in entry_rows]
+            exit_volumes = [deal.get("volume") for deal in exit_rows]
+            if (entry_volumes and exit_volumes
+                    and all(volume is not None for volume in entry_volumes)
+                    and all(volume is not None for volume in exit_volumes)):
+                expected = sum(float(volume) for volume in entry_volumes)
+                reported = sum(float(volume) for volume in exit_volumes)
+                if reported + 1e-9 < expected:
+                    incomplete_volumes[ticket] = round(reported, 8)
+        if incomplete_volumes:
+            print(f"[RECONCILE_WAIT] plan={trade.plan_id} "
+                  f"volumes={incomplete_volumes} "
+                  "reason='exit deal volume is incomplete'")
+            continue
+        # Once every exit is complete, score the entire position history. Entry
+        # deals carry opening commission/fees even though they carry no closing
+        # P/L; dropping them would flatter every live R.
+        profit = sum(deal["net"] for deal in position_deals)
         costs = sum(
             deal["commission"] + deal["swap"] + deal.get("fee", 0.0)
-            for deal in deals
+            for deal in position_deals
         )
         r_value = profit / trade.risk_cash if trade.risk_cash else None
         trade.closed = True
-        state.day_realised += profit
-        if profit < 0:
-            state.consecutive_losses += 1
-        elif profit > 0:
-            state.consecutive_losses = 0
+        # A process can be offline for several FTMO days. Deal history then
+        # contains old closures, and applying those outcomes after today's
+        # roll_day() would manufacture today's realised loss/loss streak from
+        # yesterday's trading. Production deals all carry broker-server time;
+        # legacy fake adapters without it retain the old current-day contract.
+        timed_deals = [deal for deal in position_deals
+                       if isinstance(deal.get("time"), datetime)]
+        timed_exits = [deal for deal in deals
+                       if isinstance(deal.get("time"), datetime)]
+        if timed_deals and state.server_utc_offset is not None:
+            today_profit = sum(
+                deal["net"] for deal in timed_deals
+                if ftmo_day(deal["time"], state.server_utc_offset).isoformat()
+                == state.day_key
+            )
+            state.day_realised += today_profit
+            latest_exit = max(deal["time"] for deal in timed_exits)
+            closes_today = (
+                ftmo_day(latest_exit, state.server_utc_offset).isoformat()
+                == state.day_key
+            )
+        else:
+            state.day_realised += profit
+            latest_exit = None
+            closes_today = True
+        if closes_today:
+            current_day_outcomes.append((latest_exit, sequence, profit))
         record = journal.write(JOURNAL_PATH, "trade_closed", plan_id=trade.plan_id,
                                timeframe=trade.timeframe, profit=round(profit, 2),
                                costs=round(costs, 2),
@@ -728,7 +1354,19 @@ def reconcile_closed(broker: Broker, state: BotState) -> list[dict]:
         scored = f" ({r_value:+.2f}R)" if r_value is not None else ""
         print(f"[POSITION_CLOSED] plan={trade.plan_id} net={profit:+.2f} "
               f"result={scored.strip() or 'n/a'} costs={costs:+.2f} "
-              f"consecutive_losses={state.consecutive_losses}")
+              f"closure_day={'current' if closes_today else 'historical'}")
+    # State dictionary order is creation order, not necessarily close order.
+    # Several trades can finish while the process is offline, so replay today's
+    # outcomes chronologically before deciding whether the loss streak pauses
+    # new entries.
+    current_day_outcomes.sort(key=lambda row: (
+        row[0] is None, row[0] or datetime.min, row[1],
+    ))
+    for _, _, profit in current_day_outcomes:
+        if profit < 0:
+            state.consecutive_losses += 1
+        elif profit > 0:
+            state.consecutive_losses = 0
     return finished
 
 

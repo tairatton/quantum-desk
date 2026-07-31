@@ -29,8 +29,9 @@ from . import (guardrails, journal, market_hours, news,
 from .broker import Broker, OrderRejected
 from .instance_lock import LiveInstanceLock
 from .settings import BOT_DIR, JOURNAL_PATH, KILL_SWITCH, STATE_PATH
-from .sizing import open_risk_percent
-from .state import BotState
+from .sizing import open_risk_percent, pending_risk_percent
+from . import dynamic_risk
+from .state import BotState, ftmo_day, ftmo_day_start_server
 
 LIVE_LOCK_PATH = BOT_DIR / ".live.lock"
 
@@ -144,7 +145,8 @@ def exit_mode_line(config_, initial_balance: float | None = None) -> str:
         return f"{label}    (could not check: {error})"
 
 
-def sizing_line(broker: Broker, config_, balance: float) -> str:
+def sizing_line(broker: Broker, config_, balance: float,
+                risk_percent: float | None = None) -> str:
     """What a typical trade will really be sized at, per traded timeframe.
 
     Broker lot steps can put actual risk above or below the requested percentage.
@@ -153,6 +155,7 @@ def sizing_line(broker: Broker, config_, balance: float) -> str:
     """
     from .sizing import SizingError, size_plan
 
+    requested = config_.risk_percent if risk_percent is None else risk_percent
     parts = []
     for timeframe in config_.timeframes:
         stop = _typical_stop(broker, config_, timeframe)
@@ -160,10 +163,16 @@ def sizing_line(broker: Broker, config_, balance: float) -> str:
             parts.append(f"{timeframe} ?")
             continue
         try:
-            s = size_plan(broker.spec, balance, config_.risk_percent, stop,
+            # Preview the conservative market path used by open_trade(). A
+            # plain stop distance with nearest rounding could display >1% even
+            # though execution now reserves slippage and always rounds down.
+            market_stop = (
+                stop * (1 + config_.max_entry_slippage_r)
+                + config_.deviation_points * broker.spec.point
+            )
+            s = size_plan(broker.spec, balance, requested, market_stop,
                           config_.leg_weights_for(balance),
-                          rounding=config_.lot_rounding,
-                          max_overshoot=config_.max_risk_overshoot)
+                          rounding="down", max_overshoot=0.0)
         except SizingError:
             parts.append(f"{timeframe} REFUSED (stop {stop:.2f})")
             continue
@@ -176,7 +185,7 @@ def sizing_line(broker: Broker, config_, balance: float) -> str:
         flag = ("" if s.risk_shortfall >= 0.85
                 else f" ({s.risk_shortfall:.0%} sized)")
         parts.append(f"{timeframe} {lots}lot={actual_pct:.2f}%{flag}")
-    asked = f"asked {config_.risk_percent:.2f}%"
+    asked = f"asked {requested:.2f}%"
     return f"{asked}   " + "   ".join(parts)
 
 
@@ -196,7 +205,8 @@ def _typical_stop(broker: Broker, config_, timeframe: str) -> float | None:
     return float(risks[len(risks) // 2])
 
 
-def _proposed_risk_percent(broker: Broker, config_, intent, balance: float) -> float | None:
+def _proposed_risk_percent(broker: Broker, config_, intent, balance: float,
+                           risk_percent: float | None = None) -> float | None:
     """Risk this plan will really carry, as a percent of the risk basis.
 
     None when the plan cannot be sized at all — the caller should let the sizing
@@ -207,25 +217,66 @@ def _proposed_risk_percent(broker: Broker, config_, intent, balance: float) -> f
     if balance <= 0:
         return None
     try:
-        sizing = size_plan(broker.spec, balance, config_.risk_percent, intent.risk,
-                           config_.leg_weights_for(balance), rounding=config_.lot_rounding,
-                           max_overshoot=config_.max_risk_overshoot)
+        requested = config_.risk_percent if risk_percent is None else risk_percent
+        sizing = size_plan(broker.spec, balance, requested,
+                           trader.sizing_stop_distance(broker, config_, intent),
+                           config_.leg_weights_for(balance),
+                           rounding=("down" if intent.action == "market"
+                                     else config_.lot_rounding),
+                           max_overshoot=(0.0 if intent.action == "market"
+                                          else config_.max_risk_overshoot))
     except SizingError:
         return None
     return sizing.risk_cash / balance * 100
 
 
-def _largest_leg(broker: Broker, config_, intent, balance: float) -> float:
+def _largest_leg(broker: Broker, config_, intent, balance: float,
+                 risk_percent: float | None = None) -> float:
     """Volume of the biggest leg, for the margin question. 0 if unsizeable."""
     from .sizing import SizingError, size_plan
 
     try:
-        return max(size_plan(broker.spec, balance, config_.risk_percent,
-                             intent.risk, config_.leg_weights_for(balance),
-                             rounding=config_.lot_rounding,
-                             max_overshoot=config_.max_risk_overshoot).legs)
+        requested = config_.risk_percent if risk_percent is None else risk_percent
+        return max(size_plan(broker.spec, balance, requested,
+                             trader.sizing_stop_distance(broker, config_, intent),
+                             config_.leg_weights_for(balance),
+                             rounding=("down" if intent.action == "market"
+                                       else config_.lot_rounding),
+                             max_overshoot=(0.0 if intent.action == "market"
+                                            else config_.max_risk_overshoot)).legs)
     except SizingError:
         return 0.0
+
+
+def _fit_dynamic_setup_risk(broker: Broker, config_, state: BotState, intent,
+                            risk_basis: float, equity: float, balance: float,
+                            positions, orders, live_risk: float,
+                            requested_risk: float) -> tuple[float, float | None]:
+    """Largest configured tier whose actual rounded risk fits every risk cap."""
+    original = _proposed_risk_percent(
+        broker, config_, intent, risk_basis, requested_risk)
+    if not (config_.dynamic_risk_enabled
+            and config_.dynamic_risk_fit_remaining):
+        return requested_risk, original
+
+    for candidate in dynamic_risk.fitting_tiers(config_, requested_risk):
+        proposed = _proposed_risk_percent(
+            broker, config_, intent, risk_basis, candidate)
+        if proposed is None:
+            continue
+        total_fits = live_risk + proposed <= (
+            config_.max_open_risk_percent + 1e-9)
+        daily_fits = guardrails.projected_internal_daily_risk(
+            config_, state, equity, risk_basis, live_risk, proposed,
+            balance=balance)
+        max_loss_fits = guardrails.projected_max_loss_risk(
+            config_, state, risk_basis, live_risk, proposed, balance)
+        idea_fits = guardrails.risk_per_idea(
+            config_, broker.spec, positions, intent.direction, risk_basis,
+            proposed_risk=proposed, orders=orders)
+        if total_fits and daily_fits and max_loss_fits and idea_fits:
+            return candidate, proposed
+    return requested_risk, original
 
 
 def _bar_hours(config_) -> float:
@@ -448,9 +499,14 @@ def pending_health(order: dict, state: BotState, now) -> str:
 
 def entry_capacity(config_, state: BotState, positions, orders, spec,
                    risk_basis: float, requests: int,
-                   entry_gate=None) -> tuple[bool, str]:
+                   entry_gate=None,
+                   setup_risk: float | None = None,
+                   equity: float | None = None,
+                   balance: float | None = None) -> tuple[bool, str]:
     """Capacity for another nominal-risk setup; signal checks still run later."""
-    open_risk = open_risk_percent(spec, positions, risk_basis)
+    open_risk = (open_risk_percent(spec, positions, risk_basis)
+                 + pending_risk_percent(spec, orders, risk_basis))
+    requested = config_.risk_percent if setup_risk is None else setup_risk
     active = active_setup_count(state, positions, orders)
     blockers = []
     if entry_gate is not None and not entry_gate:
@@ -458,7 +514,7 @@ def entry_capacity(config_, state: BotState, positions, orders, spec,
     if state.halted_forever:
         blockers.append(f"halted: {state.halted_reason}")
     if state.is_paused_today:
-        blockers.append("paused for this server day")
+        blockers.append("paused for this FTMO day")
     if state.consecutive_losses >= config_.max_consecutive_losses:
         blockers.append(f"loss streak {state.consecutive_losses}")
     if KILL_SWITCH.exists():
@@ -466,9 +522,36 @@ def entry_capacity(config_, state: BotState, positions, orders, spec,
     if active >= config_.max_concurrent_trades:
         blockers.append(f"setup slots {active}/{config_.max_concurrent_trades}")
     room = config_.max_open_risk_percent - open_risk
-    risk_is_conditional = room + 1e-9 < config_.risk_percent
+    capacity_risk = requested
+    fitted_capacity = False
+    if config_.dynamic_risk_enabled and config_.dynamic_risk_fit_remaining:
+        for candidate in dynamic_risk.fitting_tiers(config_, requested):
+            if candidate > room + 1e-9:
+                continue
+            if equity is not None and not guardrails.projected_internal_daily_risk(
+                    config_, state, equity, risk_basis, open_risk, candidate,
+                    balance=balance):
+                continue
+            if balance is not None and not guardrails.projected_max_loss_risk(
+                    config_, state, risk_basis, open_risk, candidate, balance):
+                continue
+            capacity_risk = candidate
+            fitted_capacity = candidate != requested
+            break
+    risk_is_conditional = room + 1e-9 < capacity_risk
     if requests >= config_.max_requests_per_day * 0.9:
         blockers.append(f"requests {requests}/{config_.max_requests_per_day}")
+    if equity is not None:
+        projected = guardrails.projected_internal_daily_risk(
+            config_, state, equity, risk_basis, open_risk, capacity_risk,
+            balance=balance)
+        if not projected:
+            blockers.append(projected.reason)
+    if balance is not None:
+        projected_max = guardrails.projected_max_loss_risk(
+            config_, state, risk_basis, open_risk, capacity_risk, balance)
+        if not projected_max:
+            blockers.append(projected_max.reason)
 
     allowed_side = "BUY/SELL"
     if positions and not config_.allow_opposing_positions:
@@ -482,12 +565,13 @@ def entry_capacity(config_, state: BotState, positions, orders, spec,
     if risk_is_conditional:
         return False, (
             f"CONDITIONAL | risk room {room:.2f}% < nominal "
-            f"{config_.risk_percent:.2f}% | a rounded setup may fit only if actual "
+            f"{requested:.2f}% | a rounded setup may fit only if actual "
             f"risk <= {room:.2f}% | allowed side {allowed_side}"
         )
     return True, (
         f"YES | capacity only | setups {active}/{config_.max_concurrent_trades} "
         f"| risk {open_risk:.2f}/{config_.max_open_risk_percent:.2f}% "
+        f"| next {'fit ' if fitted_capacity else ''}{capacity_risk:.2f}% nominal "
         f"| allowed side {allowed_side}"
     )
 
@@ -608,6 +692,11 @@ def _countdown(seconds: float) -> str:
 
 def account_binding_status(state: BotState, account: dict) -> tuple[bool, str]:
     """Explain whether the loaded state can safely manage this MT5 account."""
+    if account.get("is_hedging") is False:
+        return False, (
+            f"UNSUPPORTED | MT5 margin mode {account.get('margin_mode')} is "
+            "netting | hedging required"
+        )
     login, server = int(account.get("login") or 0), str(account.get("server") or "")
     if state.account_login is None:
         balance = float(account.get("balance") or 0.0)
@@ -631,7 +720,9 @@ def print_status(broker: Broker, state: BotState, config_) -> None:
     positions = broker.positions()
     orders = broker.pending_orders()
     risk_basis = state.initial_balance or account["balance"]
-    risk = open_risk_percent(broker.spec, positions, risk_basis)
+    decision = dynamic_risk.decide(config_, state, account["equity"])
+    risk = (open_risk_percent(broker.spec, positions, risk_basis)
+            + pending_risk_percent(broker.spec, orders, risk_basis))
     progress = guardrails.progress(config_, state, account["equity"])
 
     offset, source = resolve_offset(broker, state, config_)
@@ -647,13 +738,21 @@ def print_status(broker: Broker, state: BotState, config_) -> None:
         config_, now, news_windows, calendar.usable)
 
     mode = "DRY RUN" if broker.dry_run else "LIVE"
-    ready = "READY" if entry_window and not state.halted_forever else "GUARDED"
+    ready = ("READY" if account_matches and entry_window
+             and not state.halted_forever else "GUARDED")
     print()
     _panel_title("QUANTUM DESK | EXECUTION MONITOR", f"{mode} | {ready}")
 
     _panel_section("Account")
     _panel_row("Account", f"{account['login']} @ {account['server']} ({account['currency']})")
     _panel_row("State", binding, _Ansi.GREEN if account_matches else _Ansi.RED)
+    account_mode = (
+        "HEDGING" if account.get("is_hedging") is True
+        else "NETTING — UNSUPPORTED" if account.get("is_hedging") is False
+        else "UNKNOWN"
+    )
+    _panel_row("Position mode", account_mode,
+               _Ansi.GREEN if account.get("is_hedging") is True else _Ansi.RED)
     _panel_row("Balance", f"{account['balance']:,.2f}    Equity  {account['equity']:,.2f}    "
                f"Free margin  {account['margin_free']:,.2f}")
     _panel_row("Symbol", f"{broker.spec.name}    Digits {broker.spec.digits}    "
@@ -661,10 +760,15 @@ def print_status(broker: Broker, state: BotState, config_) -> None:
 
     _panel_section("Strategy and risk")
     _panel_row("Strategy", f"{config_.symbol}  {' + '.join(config_.timeframes)}    "
-               f"Risk/trade {config_.risk_percent:.2f}%    Cap {config_.max_open_risk_percent:.2f}%")
+               f"Risk/trade {decision.risk_percent:.2f}%    "
+               f"DD {decision.drawdown_percent:.2f}%    "
+               f"Cap {config_.max_open_risk_percent:.2f}%    "
+               f"Fit {'ON' if config_.dynamic_risk_fit_remaining else 'OFF'}")
     _panel_row("Exit", exit_mode_line(config_, risk_basis))
-    _panel_row("Sizing", sizing_line(broker, config_, risk_basis))
-    _panel_row("Open risk", f"{risk:.2f}% of {risk_basis:,.2f} risk basis")
+    _panel_row("Sizing", sizing_line(
+        broker, config_, risk_basis, decision.risk_percent))
+    _panel_row("Open risk", f"{risk:.2f}% of {risk_basis:,.2f} risk basis "
+               "(positions + pending)")
     _panel_row("Safety", f"Kill switch {'ACTIVE' if KILL_SWITCH.exists() else 'OFF'}    "
                f"Requests {state.day_requests + broker.requests}/{config_.max_requests_per_day}")
 
@@ -717,7 +821,9 @@ def print_status(broker: Broker, state: BotState, config_) -> None:
                f"Floating P/L {floating:+,.2f}")
     _, capacity = entry_capacity(
         config_, state, positions, orders, broker.spec, risk_basis,
-        state.day_requests + broker.requests, entry_window)
+        state.day_requests + broker.requests, entry_window,
+        setup_risk=decision.risk_percent, equity=account["equity"],
+        balance=account["balance"])
     if not account_matches:
         capacity = f"NO | {binding}"
     _panel_row("Can open more", capacity,
@@ -769,27 +875,59 @@ def _bind_and_anchor(broker: Broker, state: BotState, config_):
     quote = broker.tick()
     account = broker.account()
 
+    # The execution model needs separate position tickets for TP1/TP2/TP3 and
+    # for concurrent M15/M30 setups. A netting account merges same-symbol orders
+    # into one position, lets the last SL/TP overwrite the earlier legs, and
+    # makes every ticket-based management invariant below false. Real Broker
+    # instances always report this field; absence remains accepted for legacy
+    # test/dry adapters that predate account-mode reporting.
+    if account.get("is_hedging") is False:
+        reason = (
+            f"MT5 account margin mode {account.get('margin_mode')} is netting; "
+            "Quantum Desk requires a hedging account"
+        )
+        journal.write(JOURNAL_PATH, "account_mode_blocked", reason=reason,
+                      login=account.get("login"), server=account.get("server"))
+        print(status_line("ACCOUNT_MODE_BLOCKED", reason, "error"))
+        raise SystemExit(f"blocked: {reason}")
+
     try:
         newly_bound = state.bind_account(account)
     except ValueError as error:
         journal.write(JOURNAL_PATH, "account_mismatch", reason=str(error))
         print(status_line("ACCOUNT_MISMATCH", str(error), "error"))
         raise SystemExit(f"blocked: {error}") from error
+    dirty = newly_bound
     if newly_bound:
-        state.save(STATE_PATH)
         print(f"[ACCOUNT_BOUND] state -> {state.account_login}@{state.account_server}")
 
     if not state.initial_balance:
         state.initial_balance = config_.initial_balance or account["balance"]
+        dirty = True
         print(f"[INIT] initial balance anchored at {state.initial_balance:.2f}")
+    if state.observe_balance(account["balance"]):
+        dirty = True
     if newly_bound:
         journal.write(JOURNAL_PATH, "account_bound",
                       login=state.account_login, server=state.account_server,
                       initial_balance=state.initial_balance)
-    if state.roll_day(quote["server_time"].date(), account["balance"],
-                      account["equity"]):
+    offset, _ = resolve_offset(broker, state, config_)
+    evaluation_day = ftmo_day(quote["server_time"], offset)
+    day_balance = account["balance"]
+    if state.day_key != evaluation_day.isoformat():
+        cashflow_reader = getattr(broker, "account_cashflow_since", None)
+        if cashflow_reader is not None:
+            boundary = ftmo_day_start_server(quote["server_time"], offset)
+            day_balance -= cashflow_reader(boundary)
+    if state.roll_day(evaluation_day, day_balance, account["equity"]):
+        dirty = True
         print(f"[DAY] {state.day_key} opens at balance {state.day_start_balance:.2f} "
-              f"equity {state.day_start_equity:.2f} (loss floor uses the higher)")
+              f"current equity {state.day_start_equity:.2f} "
+              f"(reconstructed 00:00 CE(S)T balance reference)")
+    if dirty:
+        # Persist the high-water mark before any signal can use it. A crash must
+        # not restart a drawdown account at the 1% tier.
+        state.save(STATE_PATH)
     return quote, account
 
 
@@ -805,6 +943,7 @@ def reconcile_startup(broker: Broker, state: BotState, config_) -> None:
     signal evaluation or entries.
     """
     _, account = _bind_and_anchor(broker, state, config_)
+    trader.recover_orphan_setups(broker, state)
     # Protect already-mapped market positions before loading bars. A temporary
     # history/feed failure must not postpone a broker-side stop modification.
     trader.apply_breakeven(broker, state)
@@ -868,6 +1007,14 @@ def pass_once(broker: Broker, state: BotState, config_) -> None:
     trader.enforce_orphan_timeout(broker, state, frames)
     trader.reconcile_closed(broker, state)
 
+    # Reconciliation may have closed a winning or losing setup. Refresh before
+    # sizing: using the pre-reconciliation equity could select a risk tier that
+    # is too high after a loss. Persist a new closed-balance high-water before
+    # any new entry is considered.
+    account = broker.account()
+    if state.observe_balance(account["balance"]):
+        state.save(STATE_PATH)
+
     health = guardrails.account_health(config_, state, account["equity"], account["balance"])
     if not health:
         print(f"[GUARD] {health.reason}")
@@ -888,6 +1035,12 @@ def pass_once(broker: Broker, state: BotState, config_) -> None:
     # balance instead would quietly scale risk up with every winning week, so the
     # cap it was chosen to respect would no longer hold.
     risk_basis = state.initial_balance or account["balance"]
+    risk_decision = dynamic_risk.decide(config_, state, account["equity"])
+    setup_risk = risk_decision.risk_percent
+    if config_.dynamic_risk_enabled:
+        print(f"[DYNAMIC_RISK] dd={risk_decision.drawdown_percent:.2f}% "
+              f"risk={setup_risk:.2f}% "
+              f"high_water={risk_decision.high_water_balance:.2f}")
 
     # Loaded once per pass: the calendar is cached on disk and the feed is only
     # re-fetched when the cache goes stale.
@@ -912,38 +1065,95 @@ def pass_once(broker: Broker, state: BotState, config_) -> None:
             if known:
                 trader.cancel_stale(broker, state, intent)
             continue
-        if intent.action == signals.WAIT or known:
+        if intent.converted:
+            # The working limit belongs to this same plan, so `known` is true and
+            # the guard below would skip it. Release the order first; only a
+            # confirmed release lets this fall through to the entry path, which
+            # then re-checks every guardrail against the new stop distance.
+            if not trader.release_for_conversion(broker, state, intent):
+                continue
+        elif intent.action == signals.WAIT or known:
             continue
+
+        # A previous timeframe in this same pass may just have opened at market.
+        # Refresh before each candidate so commission, floating P/L, free margin,
+        # and a newly crossed dynamic-risk tier cannot remain stale for the next
+        # setup.
+        account = broker.account()
+        if state.observe_balance(account["balance"]):
+            state.save(STATE_PATH)
+        current_health = guardrails.account_health(
+            config_, state, account["equity"], account["balance"])
+        if not current_health:
+            print(f"[GUARD] {current_health.reason}")
+            if current_health.fatal:
+                trader.flatten_all(broker, state, current_health.reason[:31])
+                state.save(STATE_PATH)
+                raise SystemExit(f"halted: {current_health.reason}")
+            state.save(STATE_PATH)
+            return
+        refreshed_decision = dynamic_risk.decide(
+            config_, state, account["equity"])
+        if refreshed_decision.risk_percent != setup_risk:
+            print(f"[DYNAMIC_RISK_UPDATE] dd={refreshed_decision.drawdown_percent:.2f}% "
+                  f"risk={refreshed_decision.risk_percent:.2f}%")
+        setup_risk = refreshed_decision.risk_percent
 
         positions = broker.positions()
         orders = broker.pending_orders()
+        live_risk = (
+            open_risk_percent(broker.spec, positions, risk_basis)
+            + pending_risk_percent(broker.spec, orders, risk_basis)
+        )
         # Price this specific trade before asking whether it fits: the lot step
-        # makes the real figure differ from `risk_percent`, and the exposure cap
-        # should be judged against what will actually be sent.
-        proposed = _proposed_risk_percent(broker, config_, intent, risk_basis)
+        # makes the real figure differ from `risk_percent`. With fit-remaining
+        # enabled, a second setup may step down to the largest configured tier
+        # whose rounded risk fits all three risk budgets.
+        selected_risk, proposed = _fit_dynamic_setup_risk(
+            broker, config_, state, intent, risk_basis, account["equity"],
+            account["balance"], positions, orders, live_risk, setup_risk)
+        if selected_risk != setup_risk:
+            print(f"[DYNAMIC_RISK_FIT] plan={intent.plan_id} "
+                  f"requested={setup_risk:.2f}% selected={selected_risk:.2f}% "
+                  f"actual={proposed:.2f}% live={live_risk:.2f}%")
+        setup_risk = selected_risk
         checks = (
             guardrails.entry_window_open(config_, quote["server_time"],
                                          news_windows, calendar.usable),
             guardrails.can_open(
                 config_, state,
-                open_risk_percent(broker.spec, positions, risk_basis),
+                live_risk,
                 len(positions), len(orders),
                 state.day_requests + broker.requests,
                 proposed_risk=proposed,
                 active_setups=active_setup_count(state, positions, orders)),
+            guardrails.projected_internal_daily_risk(
+                config_, state, account["equity"], risk_basis,
+                live_risk, proposed, balance=account["balance"]),
+            guardrails.projected_max_loss_risk(
+                config_, state, risk_basis, live_risk, proposed,
+                account["balance"]),
             guardrails.no_opposing_position(config_, positions, intent.direction),
             guardrails.risk_per_idea(config_, broker.spec, positions, intent.direction,
-                                     risk_basis),
+                                     risk_basis, proposed_risk=proposed,
+                                     orders=orders),
             guardrails.margin_available(
                 account, broker.margin_for(intent.direction, _largest_leg(
-                    broker, config_, intent, risk_basis)),
+                    broker, config_, intent, risk_basis, setup_risk)),
                 len(config_.leg_weights_for(risk_basis))),
         )
         blocked = next((check for check in checks if not check), None)
         if blocked is not None:
+            # Say when the block lands after a conversion. The limit is already
+            # cancelled at this point, so the outcome is not "trade skipped" but
+            # "trade given up" — an order that might still have filled is gone.
+            # Reordering the guards ahead of the cancel would trade this away for
+            # a worse bug: they would then count the very order being replaced as
+            # live exposure and refuse the conversion on the account's own limits.
             journal.write(JOURNAL_PATH, "entry_blocked", plan_id=intent.plan_id,
-                          reason=blocked.reason)
-            print(f"[GUARD] {intent.plan_id}: {blocked.reason}")
+                          reason=blocked.reason, after_conversion=intent.converted)
+            note = " scope='limit already cancelled'" if intent.converted else ""
+            print(f"[GUARD] {intent.plan_id}: {blocked.reason}{note}")
             continue
         if intent.action == "market":
             price = quote["ask"] if intent.direction == 1 else quote["bid"]
@@ -955,7 +1165,8 @@ def pass_once(broker: Broker, state: BotState, config_) -> None:
                 print(f"[SKIP] {intent.plan_id}: {slippage.reason}")
                 state.remember_plan(intent.plan_id)
                 continue
-        trader.open_trade(broker, config_, state, intent, risk_basis)
+        trader.open_trade(broker, config_, state, intent, risk_basis,
+                          risk_percent=setup_risk)
 
     trader.prune(state)
     checkpoint_state(broker, state)
@@ -995,6 +1206,7 @@ def loop(broker: Broker, state: BotState, config_) -> None:
             next_check = server_time + timedelta(seconds=sleep_seconds)
             positions = broker.positions()
             orders = broker.pending_orders()
+            account = broker.account()
             floating = floating_pnl(positions)
             exposure_level = "ok" if not positions and not orders else "live"
             # A frozen feed produced heartbeats that looked entirely normal while
@@ -1020,9 +1232,13 @@ def loop(broker: Broker, state: BotState, config_) -> None:
                 print(f"[PENDING_HEALTH] {pending_health(order, state, server_time)}")
             risk_basis = state.initial_balance or config_.initial_balance
             if risk_basis:
+                heartbeat_risk = dynamic_risk.decide(
+                    config_, state, account["equity"]).risk_percent
                 _, capacity = entry_capacity(
                     config_, state, positions, orders, broker.spec, risk_basis,
-                    state.day_requests + broker.requests)
+                    state.day_requests + broker.requests,
+                    setup_risk=heartbeat_risk, equity=account["equity"],
+                    balance=account["balance"])
                 print(f"[ENTRY_CAPACITY] {capacity}")
             else:
                 print("[ENTRY_CAPACITY] NO | initial balance not anchored yet")
