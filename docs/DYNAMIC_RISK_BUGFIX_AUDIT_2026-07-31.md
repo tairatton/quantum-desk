@@ -131,6 +131,38 @@ broker แต่ไม่มีใน `state.json` เพิ่ม startup recov
 signature ครบ TP1/TP2/TP3 และค่าทิศทาง, entry, SL, เวลาเปิดตรงกัน จากนั้นซ่อม
 state ปัจจุบันสำเร็จโดยใช้ MT5 dry-run ไม่มีการแก้หรือส่งออเดอร์ไป broker
 
+### 15. ผลปิดย้อนหลังปน loss streak ของวันใหม่
+
+เดิมเมื่อบอทหยุดข้ามวัน `roll_day()` เริ่มวันใหม่ก่อน `reconcile_closed()` ทำให้
+ผลขาดทุนที่ปิดเมื่อวานถูกเพิ่มเข้า `day_realised` และ `consecutive_losses` วันนี้
+แก้ให้ใช้ deal timestamp แปลงเป็น FTMO day, นับ cash flow เฉพาะวันปัจจุบัน และ
+เรียงหลายผลลัพธ์ตามเวลาปิดจริงก่อนคำนวณ loss streak
+
+### 16. Recovery ใช้ exact fill price/time และไม่รองรับ pending
+
+ขยาย recovery ให้รับ market legs ที่ fill ต่างราคาเล็กน้อยและห่างกันตามช่วงส่ง
+สามคำสั่ง โดยยังต้องมี TP1/TP2/TP3, direction, common SL และ target ordering
+ครบและไม่กำกวม เพิ่มการกู้ pending order ทั้งแบบครบและ partial placement รวมถึง
+attach ticket ที่หลุดใน crash window กลับเข้า trade เดิม แทนสร้าง setup ซ้ำ
+
+### 17. Offline fill ถูกนับเป็นวันรีสตาร์ตและเริ่ม timeout ใหม่
+
+เก็บ deal-history fill timestamp ระหว่าง order-to-position mapping แล้วใช้เวลา fill
+จริงเป็น `fill_bar_time` และ trading day ทำให้ pending ที่ fill ระหว่างบอทหยุดไม่
+เพิ่มวันสอบผิดวันหรือยืด timeout 120 bars ออกจากระบบ
+
+### 18. Stale news cache ยังเปิด entry ได้
+
+เมื่อ cache เกิน `news_cache_hours` และ network refresh ล้มเหลว เดิม calendar ยัง
+รายงาน `usable=True` ทั้งที่ production ตั้ง `news_require_calendar=true` แก้ source
+เป็น `stale-cache` ซึ่งยังแสดง event เก่าให้ operator ดูได้ แต่ entry guard ปิด
+
+### 19. Dashboard และ forward evidence ใช้ฐานข้อมูลไม่ครบ
+
+แก้ Daily room ให้เทียบเงินเหนือ hard floor กับ Initial Capital และให้
+`forward_check.py` อ่าน risk cash จาก orphan recovery events เพื่อคำนวณต้นทุน/R
+ของไม้ที่ state ถูกกู้กลับมา
+
 ## Regression tests ที่เพิ่ม
 
 - การลดและเพิ่ม risk tier ตาม DD
@@ -149,7 +181,7 @@ state ปัจจุบันสำเร็จโดยใช้ MT5 dry-run �
 
 | รายการ | ผล |
 |---|---:|
-| Full unit/regression suite | 259 tests + 19 subtests ผ่าน |
+| Full unit/regression suite | 271 tests + 19 subtests ผ่าน |
 | Python compile | ผ่าน |
 | `git diff --check` | ผ่าน |
 | MT5 `--status` dry-run | ผ่าน |
@@ -160,9 +192,9 @@ state ปัจจุบันสำเร็จโดยใช้ MT5 dry-run �
 - Account: FTMO-Demo 1514115848, Hedging
 - Balance: $50,435.50
 - Midnight balance 00:00 CE(S)T: $50,435.77
-- Equity ณ การตรวจรอบสุดท้าย: $50,329.10 (เปลี่ยนตามราคา)
+- Equity ณ การตรวจรอบสุดท้าย: $50,381.60 (เปลี่ยนตามราคา)
 - High-water: $50,435.50
-- Dynamic DD ณ การตรวจรอบสุดท้าย: 0.21%
+- Dynamic DD ณ การตรวจรอบสุดท้าย: 0.11%
 - Risk tier: 1.00%
 - Position: 3 ขาของ setup เดียว, open risk รวมประมาณ 0.39%
 - Pending: 0

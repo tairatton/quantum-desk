@@ -324,6 +324,9 @@ def progress(settings: Settings, state: BotState, equity: float) -> dict:
     day_reference = state.day_start_balance
     day_change = ((equity - day_reference) / day_reference * 100
                   if day_reference else 0.0)
+    daily_floor = daily_loss_floor(settings, state, initial)
+    daily_room = ((equity - daily_floor) / initial * 100
+                  if initial and daily_floor else settings.daily_loss_percent)
     traded_days = len(state.trading_days)
     return {
         "equity": round(equity, 2),
@@ -331,7 +334,7 @@ def progress(settings: Settings, state: BotState, equity: float) -> dict:
         "gain_percent": round(gain, 2),
         "target_progress": round(gain / settings.profit_target_percent * 100, 1),
         "day_change_percent": round(day_change, 2),
-        "daily_room_percent": round(settings.daily_loss_percent + day_change, 2),
+        "daily_room_percent": round(daily_room, 2),
         "max_loss_room_percent": round(settings.max_loss_percent + gain, 2),
         "consecutive_losses": state.consecutive_losses,
         "trading_days": f"{traded_days} of {settings.min_trading_days} required",

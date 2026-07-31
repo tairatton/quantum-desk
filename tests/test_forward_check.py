@@ -22,6 +22,14 @@ class ForwardCheckPolicyTests(unittest.TestCase):
         ])
         self.assertEqual(trades[0]["risk_cash"], 160.0)
 
+    def test_recovered_setup_supplies_risk_for_forward_cost_statistics(self):
+        trades = forward_check.closed_trades([
+            {"event": "orphan_setup_recovered", "plan_id": "recovered",
+             "risk_cash": 194.8},
+            {"event": "trade_closed", "plan_id": "recovered", "r": -1.0},
+        ])
+        self.assertEqual(trades[0]["risk_cash"], 194.8)
+
 
 if __name__ == "__main__":
     unittest.main()

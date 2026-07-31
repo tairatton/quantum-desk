@@ -46,7 +46,7 @@ class Event:
 class Calendar:
     events: tuple[Event, ...]
     fetched_at: datetime | None
-    source: str            # "network" | "cache" | "manual" | "none"
+    source: str            # "network" | "cache" | "stale-cache" | "manual" | "none"
     error: str = ""
 
     @property
@@ -144,7 +144,11 @@ def load(settings: Settings) -> Calendar:
     if fresh.usable:
         return fresh
     if cached.usable:
-        return Calendar(cached.events, cached.fetched_at, "cache",
+        # Keep the events for operator visibility, but do not call an expired
+        # calendar usable. With news_require_calendar enabled, the entry guard
+        # must fail closed when refresh fails instead of trading indefinitely
+        # from last week's cached schedule.
+        return Calendar(cached.events, cached.fetched_at, "stale-cache",
                         f"using stale cache; {fresh.error}")
     return fresh
 

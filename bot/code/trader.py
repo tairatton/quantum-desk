@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import math
 import re
-from datetime import timedelta
+from datetime import datetime, timedelta
 
 import pandas as pd
 
@@ -28,7 +28,7 @@ from .broker import Broker, OrderRejected, Position
 from .settings import JOURNAL_PATH, STATE_PATH, Settings
 from .signals import Intent
 from .sizing import SizingError, size_plan
-from .state import BotState, ManagedTrade
+from .state import BotState, ManagedTrade, ftmo_day
 
 
 _RECOVERABLE_COMMENT = re.compile(
@@ -66,6 +66,37 @@ def _positions_risk_cash(broker: Broker, positions, stop: float | None = None) -
         if distance > 0:
             total += distance * broker.spec.value_per_point * position.volume
     return total
+
+
+def _count_trading_moment(state: BotState, moment: datetime) -> None:
+    """Attribute an entry to its real FTMO day, not the restart day."""
+    if state.server_utc_offset is None:
+        state.count_trading_day()
+        return
+    key = ftmo_day(moment, state.server_utc_offset).isoformat()
+    if key not in state.trading_days:
+        state.trading_days.append(key)
+
+
+def _recovered_fill_moment(broker: Broker, position_tickets: list[int],
+                           frames: dict[str, pd.DataFrame] | None = None,
+                           timeframe: str = "") -> datetime:
+    """Best authoritative fill time for positions recovered through history."""
+    history_reader = getattr(broker, "filled_position_time", None)
+    moments = ([history_reader(ticket) for ticket in position_tickets]
+               if history_reader is not None else [])
+    moments = [moment for moment in moments if moment is not None]
+    frame = (frames or {}).get(timeframe)
+    if not moments and frame is not None and len(frame):
+        # Legacy/test adapters have no deal-time cache. The last closed bar was
+        # the pre-existing fallback and remains safer than an unrelated local
+        # wall-clock timestamp.
+        return pd.Timestamp(frame["time"].iloc[-1]).to_pydatetime()
+    if not moments:
+        live = {position.ticket: position for position in broker.positions()}
+        moments = [live[ticket].opened_at for ticket in position_tickets
+                   if ticket in live]
+    return min(moments) if moments else broker.tick()["server_time"]
 
 
 def _actualize_converted_risk_from_deals(broker: Broker, trade: ManagedTrade,
@@ -183,13 +214,15 @@ def _check_exit_mode(exit_mode: str, sizing, intent: Intent) -> str | None:
 
 
 def recover_orphan_setups(broker: Broker, state: BotState) -> list[ManagedTrade]:
-    """Adopt a complete, unmistakable three-leg setup missing from state.
+    """Adopt unmistakable live positions/pending orders missing from state.
 
     A reset or stale state file must not leave live bot positions without TP1
-    break-even and timeout management. Recovery is deliberately strict: all
-    TP1/TP2/TP3 comments, common timeframe/direction/fill/SL/open time and valid
-    broker-side stops/targets are required. Partial or ambiguous groups remain
-    orphans and retain the existing timeout-only fail-safe.
+    break-even and timeout management. Position recovery requires all three
+    TP roles, a common plan stop, fills close in time, and entry dispersion no
+    larger than the configured market slippage envelope. Pending recovery can
+    safely retain a partial placement because every ticket still has its own
+    broker-side SL/TP/expiry; an absent TP1 is explicitly marked unknown so it
+    can never trigger a guessed break-even move.
     """
     positions = broker.positions()
     managed = {
@@ -206,26 +239,85 @@ def recover_orphan_setups(broker: Broker, state: BotState) -> list[ManagedTrade]
         candidates.append((position, match.group("timeframe").upper(),
                            int(match.group("target"))))
 
+    recovered = []
+    live_by_ticket = {position.ticket: position for position in positions}
+    unattached = []
+    for position, timeframe, target in candidates:
+        matches = []
+        for trade in state.open_trades():
+            if (trade.timeframe.upper() != timeframe
+                    or trade.direction != position.direction
+                    or trade.exit_mode != "be_33_33_34"
+                    or len(trade.targets) < target or trade.risk <= 0):
+                continue
+            price_tolerance = max(broker.spec.point * 2, trade.risk * 0.02)
+            if (abs(position.stop - trade.stop) > price_tolerance
+                    or abs(position.take_profit - trade.targets[target - 1])
+                    > price_tolerance
+                    or abs(position.price_open - trade.entry) > trade.risk * 0.20):
+                continue
+            role_already_live = any(
+                ticket in live_by_ticket
+                and abs(live_by_ticket[ticket].take_profit
+                        - trade.targets[target - 1]) <= price_tolerance
+                for ticket in trade.position_tickets
+            )
+            if not role_already_live:
+                matches.append(trade)
+        if len(matches) != 1:
+            unattached.append((position, timeframe, target))
+            continue
+        trade = matches[0]
+        trade.position_tickets.append(position.ticket)
+        if target == 1:
+            trade.tp1_position_ticket = position.ticket
+        trade.filled_at = trade.filled_at or str(position.opened_at)
+        trade.fill_bar_time = trade.fill_bar_time or str(position.opened_at)
+        _count_trading_moment(state, position.opened_at)
+        managed.add(position.ticket)
+        if trade not in recovered:
+            recovered.append(trade)
+        journal.write(
+            JOURNAL_PATH, "orphan_position_attached", plan_id=trade.plan_id,
+            ticket=position.ticket, role=target,
+        )
+        print(f"[ORPHAN_ATTACHED] plan={trade.plan_id} "
+              f"position={position.ticket} role=TP{target}")
+    candidates = unattached
+
     groups: dict[tuple, list[tuple[Position, int]]] = {}
     for position, timeframe, target in candidates:
         key = (
             timeframe, position.direction,
-            round(position.price_open, broker.spec.digits),
             round(position.stop, broker.spec.digits),
-            position.opened_at.replace(microsecond=0),
         )
         groups.setdefault(key, []).append((position, target))
 
-    recovered = []
     for key, legs in groups.items():
         roles = [target for _, target in legs]
         if len(legs) != 3 or sorted(roles) != [1, 2, 3]:
             continue
-        timeframe, direction, entry, stop, opened_at = key
+        timeframe, direction, stop = key
         ordered = sorted(legs, key=lambda item: item[1])
-        risk = (entry - stop) * direction
-        if risk <= 0:
+        opened_times = [position.opened_at for position, _ in ordered]
+        recovery_window = max(
+            10.0, float(getattr(broker, "write_spacing_seconds", 0.0)) * 4 + 5,
+        )
+        if (max(opened_times) - min(opened_times)).total_seconds() > recovery_window:
             continue
+        entries = [position.price_open for position, _ in ordered]
+        risks = [(entry - stop) * direction for entry in entries]
+        if min(risks) <= 0 or max(entries) - min(entries) > min(risks) * 0.20:
+            continue
+        # TP1/TP2/TP3 must progress farther in the profitable direction. This
+        # rejects three unrelated tickets that merely reuse the same stop.
+        directed_targets = [position.take_profit * direction
+                            for position, _ in ordered]
+        if not directed_targets[0] < directed_targets[1] < directed_targets[2]:
+            continue
+        entry = sum(entries) / len(entries)
+        opened_at = max(opened_times)
+        risk = (entry - stop) * direction
         position_tickets = [position.ticket for position, _ in ordered]
         if any(ticket in managed for ticket in position_tickets):
             continue
@@ -250,7 +342,7 @@ def recover_orphan_setups(broker: Broker, state: BotState) -> list[ManagedTrade]
         )
         state.trades[plan_id] = trade
         state.remember_plan(plan_id)
-        state.count_trading_day()
+        _count_trading_moment(state, opened_at)
         managed.update(position_tickets)
         recovered.append(trade)
         journal.write(
@@ -260,6 +352,114 @@ def recover_orphan_setups(broker: Broker, state: BotState) -> list[ManagedTrade]
         )
         print(f"[ORPHAN_RECOVERED] plan={plan_id} "
               f"positions={position_tickets} risk_cash={trade.risk_cash:.2f}")
+
+    managed_pending = {
+        ticket for trade in state.open_trades()
+        for ticket in trade.pending_tickets
+    }
+    pending_groups: dict[tuple, list[tuple[dict, int]]] = {}
+    for order in broker.pending_orders():
+        if order["ticket"] in managed_pending:
+            continue
+        match = _RECOVERABLE_COMMENT.search(str(order.get("comment", "")))
+        type_name = str(order.get("type_name", "")).upper()
+        direction = (1 if type_name.startswith("BUY") else
+                     -1 if type_name.startswith("SELL") else 0)
+        entry = float(order.get("price") or 0.0)
+        stop = float(order.get("stop") or 0.0)
+        target_price = float(order.get("take_profit") or 0.0)
+        if (match is None or not direction or entry <= 0 or stop <= 0
+                or target_price <= 0 or (entry - stop) * direction <= 0):
+            continue
+        timeframe = match.group("timeframe").upper()
+        role = int(match.group("target"))
+        matches = []
+        for trade in state.open_trades():
+            if (trade.timeframe.upper() != timeframe
+                    or trade.direction != direction
+                    or trade.exit_mode != "be_33_33_34"
+                    or len(trade.targets) < role or trade.risk <= 0):
+                continue
+            price_tolerance = max(broker.spec.point * 2, trade.risk * 0.02)
+            if (abs(entry - trade.entry) <= price_tolerance
+                    and abs(stop - trade.stop) <= price_tolerance
+                    and abs(target_price - trade.targets[role - 1])
+                    <= price_tolerance):
+                matches.append(trade)
+        if len(matches) == 1:
+            trade = matches[0]
+            trade.pending_tickets.append(order["ticket"])
+            if role == 1:
+                trade.tp1_pending_ticket = order["ticket"]
+            managed_pending.add(order["ticket"])
+            if trade not in recovered:
+                recovered.append(trade)
+            journal.write(
+                JOURNAL_PATH, "orphan_pending_attached", plan_id=trade.plan_id,
+                ticket=order["ticket"], role=role,
+            )
+            print(f"[ORPHAN_PENDING_ATTACHED] plan={trade.plan_id} "
+                  f"order={order['ticket']} role=TP{role}")
+            continue
+        key = (
+            timeframe, direction,
+            round(entry, broker.spec.digits), round(stop, broker.spec.digits),
+            order.get("expires_at"),
+        )
+        pending_groups.setdefault(key, []).append(
+            (order, role),
+        )
+
+    for key, legs in pending_groups.items():
+        roles = [role for _, role in legs]
+        if len(set(roles)) != len(roles) or not 1 <= len(legs) <= 3:
+            continue
+        timeframe, direction, entry, stop, expires_at = key
+        risk = (entry - stop) * direction
+        targets = [entry + direction * risk * reward for reward in (1.0, 1.5, 2.0)]
+        volumes = [0.0, 0.0, 0.0]
+        by_role = {}
+        for order, role in legs:
+            targets[role - 1] = float(order["take_profit"])
+            volumes[role - 1] = float(order["volume"])
+            by_role[role] = order
+        pending_tickets = [by_role[role]["ticket"] for role in sorted(by_role)]
+        if any(ticket in managed_pending for ticket in pending_tickets):
+            continue
+        stamp = (expires_at.isoformat(sep=" ") if expires_at is not None
+                 else f"tickets-{min(pending_tickets)}")
+        base_id = f"{timeframe}@recovered-pending-{stamp}"
+        plan_id = base_id
+        suffix = 2
+        while plan_id in state.trades:
+            plan_id = f"{base_id}-{suffix}"
+            suffix += 1
+        risk_cash = sum(
+            abs(float(order["price"]) - float(order["stop"]))
+            * broker.spec.value_per_point * float(order["volume"])
+            for order, _ in legs
+        )
+        trade = ManagedTrade(
+            plan_id=plan_id, timeframe=timeframe, direction=direction,
+            entry=entry, stop=stop, risk=risk, risk_cash=round(risk_cash, 2),
+            targets=targets, legs=volumes,
+            pending_tickets=pending_tickets,
+            tp1_pending_ticket=(by_role[1]["ticket"] if 1 in by_role else -1),
+            exit_mode="be_33_33_34", dry_run=False,
+        )
+        state.trades[plan_id] = trade
+        state.remember_plan(plan_id)
+        managed_pending.update(pending_tickets)
+        recovered.append(trade)
+        journal.write(
+            JOURNAL_PATH, "orphan_pending_recovered", plan_id=plan_id,
+            timeframe=timeframe, direction=direction,
+            pending_tickets=pending_tickets, roles=sorted(by_role),
+            risk_cash=trade.risk_cash,
+        )
+        print(f"[ORPHAN_PENDING_RECOVERED] plan={plan_id} "
+              f"orders={pending_tickets} roles={sorted(by_role)} "
+              f"risk_cash={trade.risk_cash:.2f}")
     if recovered:
         state.save(STATE_PATH)
     return recovered
@@ -546,13 +746,16 @@ def sync_fills(broker: Broker, state: BotState,
         unresolved_market = list(trade.market_order_tickets)
         if recovered_market:
             changed = True
-            trade.filled_at = trade.filled_at or str(broker.tick()["server_time"])
-            if not trade.fill_bar_time:
-                trade.fill_bar_time = _fill_bar_time(frames, trade, broker)
-            state.count_trading_day()
             recovered_positions = [
                 filled_by_order[ticket] for ticket in recovered_market
             ]
+            fill_moment = _recovered_fill_moment(
+                broker, recovered_positions, frames, trade.timeframe,
+            )
+            trade.filled_at = trade.filled_at or str(fill_moment)
+            if not trade.fill_bar_time:
+                trade.fill_bar_time = str(fill_moment)
+            _count_trading_moment(state, fill_moment)
             journal.write(
                 JOURNAL_PATH, "market_fill_recovered",
                 plan_id=trade.plan_id, order_tickets=recovered_market,
@@ -596,10 +799,13 @@ def sync_fills(broker: Broker, state: BotState,
         changed = changed or trade.pending_tickets != original
 
         if filled_positions:
-            trade.filled_at = trade.filled_at or str(broker.tick()["server_time"])
+            fill_moment = _recovered_fill_moment(
+                broker, filled_positions, frames, trade.timeframe,
+            )
+            trade.filled_at = trade.filled_at or str(fill_moment)
             if not trade.fill_bar_time:
-                trade.fill_bar_time = _fill_bar_time(frames, trade, broker)
-            state.count_trading_day()
+                trade.fill_bar_time = str(fill_moment)
+            _count_trading_moment(state, fill_moment)
             journal.write(JOURNAL_PATH, "pending_filled", plan_id=trade.plan_id,
                           order_tickets=filled_orders,
                           position_tickets=filled_positions,
@@ -624,21 +830,6 @@ def sync_fills(broker: Broker, state: BotState,
 
     if changed:
         state.save(STATE_PATH)
-
-def _fill_bar_time(frames: dict[str, pd.DataFrame] | None, trade: ManagedTrade,
-                   broker: Broker) -> str:
-    """The closed bar the fill belongs to, which starts the 120-bar clock.
-
-    The strategy counts from the bar that filled, so the last closed bar on the
-    trade's own timeframe is the right anchor. Falling back to the raw server
-    time still beats leaving it unset: a timestamp `bars_since` cannot match
-    yields 0 bars, which merely delays the timeout instead of disabling it.
-    """
-    frame = (frames or {}).get(trade.timeframe)
-    if frame is not None and len(frame):
-        return str(pd.Timestamp(frame["time"].iloc[-1]))
-    return str(broker.tick()["server_time"])
-
 
 def apply_breakeven(broker: Broker, state: BotState) -> set[int]:
     """Move survivors to cost-covered fills and return live position tickets.
@@ -1038,7 +1229,8 @@ def reconcile_closed(broker: Broker, state: BotState) -> list[dict]:
     open_tickets = {position.ticket for position in broker.positions()}
     pending_tickets = {order["ticket"] for order in broker.pending_orders()}
     finished = []
-    for trade in state.open_trades():
+    current_day_outcomes = []
+    for sequence, trade in enumerate(state.open_trades()):
         if trade.dry_run or not trade.position_tickets:
             continue
         # A partial history response can map TP1 before the survivor market
@@ -1126,11 +1318,33 @@ def reconcile_closed(broker: Broker, state: BotState) -> list[dict]:
         )
         r_value = profit / trade.risk_cash if trade.risk_cash else None
         trade.closed = True
-        state.day_realised += profit
-        if profit < 0:
-            state.consecutive_losses += 1
-        elif profit > 0:
-            state.consecutive_losses = 0
+        # A process can be offline for several FTMO days. Deal history then
+        # contains old closures, and applying those outcomes after today's
+        # roll_day() would manufacture today's realised loss/loss streak from
+        # yesterday's trading. Production deals all carry broker-server time;
+        # legacy fake adapters without it retain the old current-day contract.
+        timed_deals = [deal for deal in position_deals
+                       if isinstance(deal.get("time"), datetime)]
+        timed_exits = [deal for deal in deals
+                       if isinstance(deal.get("time"), datetime)]
+        if timed_deals and state.server_utc_offset is not None:
+            today_profit = sum(
+                deal["net"] for deal in timed_deals
+                if ftmo_day(deal["time"], state.server_utc_offset).isoformat()
+                == state.day_key
+            )
+            state.day_realised += today_profit
+            latest_exit = max(deal["time"] for deal in timed_exits)
+            closes_today = (
+                ftmo_day(latest_exit, state.server_utc_offset).isoformat()
+                == state.day_key
+            )
+        else:
+            state.day_realised += profit
+            latest_exit = None
+            closes_today = True
+        if closes_today:
+            current_day_outcomes.append((latest_exit, sequence, profit))
         record = journal.write(JOURNAL_PATH, "trade_closed", plan_id=trade.plan_id,
                                timeframe=trade.timeframe, profit=round(profit, 2),
                                costs=round(costs, 2),
@@ -1140,7 +1354,19 @@ def reconcile_closed(broker: Broker, state: BotState) -> list[dict]:
         scored = f" ({r_value:+.2f}R)" if r_value is not None else ""
         print(f"[POSITION_CLOSED] plan={trade.plan_id} net={profit:+.2f} "
               f"result={scored.strip() or 'n/a'} costs={costs:+.2f} "
-              f"consecutive_losses={state.consecutive_losses}")
+              f"closure_day={'current' if closes_today else 'historical'}")
+    # State dictionary order is creation order, not necessarily close order.
+    # Several trades can finish while the process is offline, so replay today's
+    # outcomes chronologically before deciding whether the loss streak pauses
+    # new entries.
+    current_day_outcomes.sort(key=lambda row: (
+        row[0] is None, row[0] or datetime.min, row[1],
+    ))
+    for _, _, profit in current_day_outcomes:
+        if profit < 0:
+            state.consecutive_losses += 1
+        elif profit > 0:
+            state.consecutive_losses = 0
     return finished
 
 

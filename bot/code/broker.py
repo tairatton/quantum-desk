@@ -105,6 +105,7 @@ class Broker:
         # appeared, so a feed that stops advancing can be told from a live one.
         self._tick_stamp: datetime | None = None
         self._tick_first_seen: datetime | None = None
+        self._filled_position_times: dict[int, datetime] = {}
 
     @property
     def requests(self) -> int:
@@ -380,11 +381,22 @@ class Broker:
                 continue
             order_ticket = int(getattr(deal, "order", 0) or 0)
             deal_ticket = int(getattr(deal, "ticket", 0) or 0)
+            raw_time = int(getattr(deal, "time", 0) or 0)
+            deal_time = (datetime.fromtimestamp(raw_time, tz=timezone.utc)
+                         .replace(tzinfo=None) if raw_time else None)
             if order_ticket in wanted:
                 mapped[order_ticket] = position_ticket
+                if deal_time is not None:
+                    self._filled_position_times[position_ticket] = deal_time
             if deal_ticket in wanted:
                 mapped[deal_ticket] = position_ticket
+                if deal_time is not None:
+                    self._filled_position_times[position_ticket] = deal_time
         return mapped
+
+    def filled_position_time(self, position_ticket: int) -> datetime | None:
+        """Deal-history fill time cached by filled_order_positions()."""
+        return self._filled_position_times.get(int(position_ticket))
 
     def account_cashflow_since(self, since_server: datetime) -> float:
         """Net balance-changing cash flow since a broker-server timestamp.

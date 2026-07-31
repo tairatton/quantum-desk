@@ -66,7 +66,10 @@ def closed_trades(events: list[dict]) -> list[dict]:
     for event in events:
         # A converted market fill can become visible only after `trade_opened`.
         # Its later deal-derived value supersedes the conservative sizing value.
-        if (event.get("event") in {"trade_opened", "risk_cash_actualized"}
+        if (event.get("event") in {
+                "trade_opened", "risk_cash_actualized",
+                "orphan_setup_recovered", "orphan_pending_recovered",
+        }
                 and event.get("risk_cash")):
             risk_by_plan[event["plan_id"]] = event["risk_cash"]
     trades = []

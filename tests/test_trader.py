@@ -466,6 +466,29 @@ class TraderPathsTests(unittest.TestCase):
         self.assertEqual(trade.position_tickets, position_tickets)
         self.assertEqual(self.state.trading_days, ["2026-06-01"])
 
+    def test_offline_pending_fill_keeps_its_real_trading_day_and_timeout_anchor(self):
+        class TimedFillBroker(FakeBroker):
+            fill_times = {}
+
+            def filled_position_time(self, ticket):
+                return self.fill_times.get(ticket)
+
+        broker = TimedFillBroker()
+        trade = trader.open_trade(broker, self.settings, self.state,
+                                  intent("limit"), 100_000.0)
+        positions = [broker.fill_order(ticket)
+                     for ticket in list(trade.pending_tickets)]
+        fill_time = datetime(2026, 6, 1, 20, 15)
+        broker.fill_times = {ticket: fill_time for ticket in positions}
+        self.state.server_utc_offset = 0.0
+        self.state.day_key = "2026-06-02"
+        self.state.trading_days.clear()
+
+        trader.sync_fills(broker, self.state, {"M15": bars(300)})
+
+        self.assertEqual(trade.fill_bar_time, str(fill_time))
+        self.assertEqual(self.state.trading_days, ["2026-06-01"])
+
     def test_out_of_order_pending_fills_keep_the_real_tp1_identity(self):
         broker = FakeBroker()
         trade = trader.open_trade(
@@ -1349,6 +1372,57 @@ class TraderPathsTests(unittest.TestCase):
         self.assertAlmostEqual(record["r"], 367.0 / trade.risk_cash, places=4)
         self.assertEqual(self.state.consecutive_losses, 0)
 
+    def test_a_historical_offline_close_does_not_change_todays_loss_streak(self):
+        broker = FakeBroker()
+        trade = trader.open_trade(broker, self.settings, self.state, intent(), 100_000.0)
+        broker._positions = []
+        self.state.server_utc_offset = 0.0
+        self.state.day_key = "2026-06-02"
+        broker.deals = [
+            {"position": ticket, "volume": volume, "profit": -10.0,
+             "commission": 0.0, "swap": 0.0, "fee": 0.0, "net": -10.0,
+             "is_exit": True, "time": datetime(2026, 6, 1, 20, 0)}
+            for ticket, volume in zip(trade.position_tickets, trade.legs)
+        ]
+
+        trader.reconcile_closed(broker, self.state)
+
+        self.assertTrue(trade.closed)
+        self.assertEqual(self.state.day_realised, 0.0)
+        self.assertEqual(self.state.consecutive_losses, 0)
+
+    def test_offline_closes_are_replayed_in_exit_time_order(self):
+        self.state.server_utc_offset = 0.0
+        self.state.day_key = "2026-06-01"
+        later_win = ManagedTrade(
+            plan_id="later-win", timeframe="M15", direction=1,
+            entry=4000.0, stop=3980.0, risk=20.0, risk_cash=100.0,
+            targets=[4040.0], legs=[0.05], position_tickets=[801],
+            filled_at="2026-06-01 10:00:00", exit_mode="fixed_tp3",
+        )
+        earlier_loss = ManagedTrade(
+            plan_id="earlier-loss", timeframe="M15", direction=1,
+            entry=4000.0, stop=3980.0, risk=20.0, risk_cash=100.0,
+            targets=[4040.0], legs=[0.05], position_tickets=[802],
+            filled_at="2026-06-01 10:00:00", exit_mode="fixed_tp3",
+        )
+        # Deliberately insert in the opposite order from the exits.
+        self.state.trades = {later_win.plan_id: later_win,
+                             earlier_loss.plan_id: earlier_loss}
+        broker = FakeBroker(deals=[
+            {"position": 801, "volume": 0.05, "profit": 20.0,
+             "commission": 0.0, "swap": 0.0, "fee": 0.0, "net": 20.0,
+             "is_exit": True, "time": datetime(2026, 6, 1, 12, 0)},
+            {"position": 802, "volume": 0.05, "profit": -20.0,
+             "commission": 0.0, "swap": 0.0, "fee": 0.0, "net": -20.0,
+             "is_exit": True, "time": datetime(2026, 6, 1, 11, 0)},
+        ])
+
+        trader.reconcile_closed(broker, self.state)
+
+        self.assertEqual(self.state.day_realised, 0.0)
+        self.assertEqual(self.state.consecutive_losses, 0)
+
 
 class TerminalNotificationTests(unittest.TestCase):
     def test_exposure_lists_open_positions_and_pending_orders(self):
@@ -1692,6 +1766,121 @@ class OrphanTimeoutTests(unittest.TestCase):
         self.assertEqual(recovered[0].tp1_position_ticket, 501)
         self.assertAlmostEqual(recovered[0].risk_cash, 194.80)
 
+    def test_market_legs_with_small_fill_and_time_differences_are_recovered(self):
+        broker = FakeBroker(_positions=[
+            FakePos(ticket=501, volume=0.03, price_open=4000.10,
+                    stop=3980.0, take_profit=4020.0,
+                    comment="M15 TP1 quantum|be33", opened_at=self.recent),
+            FakePos(ticket=502, volume=0.03, price_open=4000.15,
+                    stop=3980.0, take_profit=4030.0,
+                    comment="M15 TP2 quantum|be33",
+                    opened_at=self.recent + timedelta(seconds=1)),
+            FakePos(ticket=503, volume=0.04, price_open=4000.20,
+                    stop=3980.0, take_profit=4040.0,
+                    comment="M15 TP3 quantum|be33",
+                    opened_at=self.recent + timedelta(seconds=2)),
+        ])
+
+        recovered = trader.recover_orphan_setups(
+            broker, BotState(initial_balance=50_000.0),
+        )
+
+        self.assertEqual(len(recovered), 1)
+        self.assertEqual(recovered[0].position_tickets, [501, 502, 503])
+        self.assertAlmostEqual(recovered[0].entry, 4000.15)
+
+    def test_untracked_pending_legs_are_recovered_without_counting_a_trading_day(self):
+        expiry = datetime(2026, 7, 31, 15, 0)
+        orders = [
+            {"ticket": 601, "type_name": "BUY_LIMIT", "price": 3990.0,
+             "stop": 3970.0, "take_profit": 4010.0, "volume": 0.03,
+             "comment": "M15 TP1 quantum|be33", "expires_at": expiry},
+            {"ticket": 602, "type_name": "BUY_LIMIT", "price": 3990.0,
+             "stop": 3970.0, "take_profit": 4020.0, "volume": 0.03,
+             "comment": "M15 TP2 quantum|be33", "expires_at": expiry},
+            {"ticket": 603, "type_name": "BUY_LIMIT", "price": 3990.0,
+             "stop": 3970.0, "take_profit": 4030.0, "volume": 0.04,
+             "comment": "M15 TP3 quantum|be33", "expires_at": expiry},
+        ]
+        broker = FakeBroker(_orders=orders)
+        state = BotState(initial_balance=50_000.0)
+        state.roll_day(date(2026, 7, 31), 50_000.0, 50_000.0)
+
+        recovered = trader.recover_orphan_setups(broker, state)
+
+        self.assertEqual(len(recovered), 1)
+        self.assertEqual(recovered[0].pending_tickets, [601, 602, 603])
+        self.assertEqual(recovered[0].tp1_pending_ticket, 601)
+        self.assertEqual(state.trading_days, [])
+
+    def test_partial_pending_without_tp1_never_guesses_a_survivor_is_tp1(self):
+        orders = [
+            {"ticket": 602, "type_name": "BUY_LIMIT", "price": 3990.0,
+             "stop": 3970.0, "take_profit": 4020.0, "volume": 0.03,
+             "comment": "M15 TP2 quantum|be33", "expires_at": None},
+            {"ticket": 603, "type_name": "BUY_LIMIT", "price": 3990.0,
+             "stop": 3970.0, "take_profit": 4030.0, "volume": 0.04,
+             "comment": "M15 TP3 quantum|be33", "expires_at": None},
+        ]
+        recovered = trader.recover_orphan_setups(
+            FakeBroker(_orders=orders), BotState(initial_balance=50_000.0),
+        )
+        self.assertEqual(len(recovered), 1)
+        self.assertEqual(recovered[0].tp1_pending_ticket, -1)
+
+    def test_a_single_crash_window_position_attaches_to_the_existing_plan(self):
+        state = BotState(initial_balance=50_000.0)
+        trade = ManagedTrade(
+            plan_id="M15@existing", timeframe="M15", direction=1,
+            entry=4000.0, stop=3980.0, risk=20.0, risk_cash=200.0,
+            targets=[4020.0, 4030.0, 4040.0], legs=[0.03, 0.03, 0.04],
+            position_tickets=[501, 502], tp1_position_ticket=501,
+            exit_mode="be_33_33_34",
+        )
+        state.trades[trade.plan_id] = trade
+        broker = FakeBroker(_positions=[
+            FakePos(ticket=501, volume=0.03, price_open=4000.0, stop=3980.0,
+                    take_profit=4020.0, comment="M15 TP1 quantum|be33"),
+            FakePos(ticket=502, volume=0.03, price_open=4000.0, stop=3980.0,
+                    take_profit=4030.0, comment="M15 TP2 quantum|be33"),
+            FakePos(ticket=503, volume=0.04, price_open=4000.1, stop=3980.0,
+                    take_profit=4040.0, comment="M15 TP3 quantum|be33"),
+        ])
+
+        recovered = trader.recover_orphan_setups(broker, state)
+
+        self.assertEqual(recovered, [trade])
+        self.assertEqual(trade.position_tickets, [501, 502, 503])
+        self.assertEqual(len(state.trades), 1)
+
+    def test_a_single_crash_window_pending_order_attaches_to_existing_plan(self):
+        state = BotState(initial_balance=50_000.0)
+        trade = ManagedTrade(
+            plan_id="M15@existing", timeframe="M15", direction=1,
+            entry=3990.0, stop=3970.0, risk=20.0, risk_cash=200.0,
+            targets=[4010.0, 4020.0, 4030.0], legs=[0.03, 0.03, 0.04],
+            pending_tickets=[601, 602], tp1_pending_ticket=601,
+            exit_mode="be_33_33_34",
+        )
+        state.trades[trade.plan_id] = trade
+        broker = FakeBroker(_orders=[
+            {"ticket": 601, "type_name": "BUY_LIMIT", "price": 3990.0,
+             "stop": 3970.0, "take_profit": 4010.0, "volume": 0.03,
+             "comment": "M15 TP1 quantum|be33", "expires_at": None},
+            {"ticket": 602, "type_name": "BUY_LIMIT", "price": 3990.0,
+             "stop": 3970.0, "take_profit": 4020.0, "volume": 0.03,
+             "comment": "M15 TP2 quantum|be33", "expires_at": None},
+            {"ticket": 603, "type_name": "BUY_LIMIT", "price": 3990.0,
+             "stop": 3970.0, "take_profit": 4030.0, "volume": 0.04,
+             "comment": "M15 TP3 quantum|be33", "expires_at": None},
+        ])
+
+        recovered = trader.recover_orphan_setups(broker, state)
+
+        self.assertEqual(recovered, [trade])
+        self.assertEqual(trade.pending_tickets, [601, 602, 603])
+        self.assertEqual(len(state.trades), 1)
+
     def test_an_incomplete_or_ambiguous_setup_is_not_recovered(self):
         broker = FakeBroker(_positions=[
             FakePos(ticket=501, comment="M15 TP1 quantum|be33"),
@@ -1882,6 +2071,21 @@ class BrokerReadFailureTests(unittest.TestCase):
         broker = self.broker((deal,))
 
         self.assertEqual(broker.filled_order_positions([701]), {701: 901})
+
+    def test_order_mapping_caches_the_authoritative_fill_time(self):
+        stamp = int(datetime(2026, 7, 31, 12, 34,
+                             tzinfo=timezone.utc).timestamp())
+        deal = SimpleNamespace(
+            ticket=701, order=601, position_id=901, magic=1,
+            symbol=GOLD.name, time=stamp,
+        )
+        broker = self.broker((deal,))
+
+        broker.filled_order_positions([601])
+
+        self.assertEqual(
+            broker.filled_position_time(901), datetime(2026, 7, 31, 12, 34),
+        )
 
     def test_closed_deal_net_includes_the_mt5_fee_field(self):
         deal = SimpleNamespace(
