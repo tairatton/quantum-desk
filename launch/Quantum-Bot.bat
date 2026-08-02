@@ -8,5 +8,9 @@ rem เพราะ Windows ส่งมาให้ตรงๆตอนดั�
 chcp 65001 >nul
 title HTF Quantum bot
 cd /d "%~dp0.."
-python -m bot.main
+if exist ".venv\Scripts\python.exe" (
+  ".venv\Scripts\python.exe" -m bot.main
+) else (
+  python -m bot.main
+)
 pause
