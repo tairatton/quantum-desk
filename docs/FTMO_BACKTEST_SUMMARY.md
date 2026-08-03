@@ -1,6 +1,6 @@
 # FTMO Technique-Lab Backtest Summary
 
-Generated: 2026-07-27
+Generated: 2026-08-02
 
 ## Scope and method
 
@@ -11,11 +11,31 @@ Generated: 2026-07-27
 - **Cost is spread + commission + slippage** (`xau.config.COSTS`). Bars are bid-quoted, so a round trip pays the spread once; commission and slippage are absent from the feed and are modelled per symbol. The figures are estimates, not measurements - replace them with what an FTMO demo actually charges.
 - Every exit technique uses the same filled entries, so exit comparisons do not change trade frequency.
 
+## Production-aligned results for the current bot
+
+The live account starts at $50,000. Its `capital_tier` setting resolves to `be_after_tp1_33_33_34` for both XAUUSD M15 and M30. The tables below pin both timeframes to that exit instead of selecting an exit separately for research.
+
+| Symbol | TF | Exit technique | Holdout trades | Win rate | Net | Expectancy | PF | Max DD |
+|---|---:|---|---:|---:|---:|---:|---:|---:|
+| XAUUSD | M15 | BE + 33/33/34 | 248 | 47.98% | +41.63R | +0.17R/trade | 1.46 | 9.06R |
+| XAUUSD | M30 | BE + 33/33/34 | 227 | 57.71% | +78.03R | +0.34R/trade | 2.03 | 6.09R |
+
+### Production-aligned split results
+
+| Symbol | TF | Split | Trades | Win rate | Net | Expectancy | PF | Max DD |
+|---|---:|---|---:|---:|---:|---:|---:|---:|
+| XAUUSD | M15 | Train | 752 | 48.14% | +120.89R | +0.16R/trade | 1.42 | 10.97R |
+| XAUUSD | M15 | Validation | 226 | 54.42% | +72.71R | +0.32R/trade | 1.99 | 5.62R |
+| XAUUSD | M15 | Holdout | 248 | 47.98% | +41.63R | +0.17R/trade | 1.46 | 9.06R |
+| XAUUSD | M30 | Train | 693 | 46.75% | +33.54R | +0.05R/trade | 1.11 | 26.80R |
+| XAUUSD | M30 | Validation | 225 | 52.44% | +45.18R | +0.20R/trade | 1.49 | 14.04R |
+| XAUUSD | M30 | Holdout | 227 | 57.71% | +78.03R | +0.34R/trade | 2.03 | 6.09R |
+
 ## Selected smallest practical profitable timeframe
 
 | Symbol | TF | Exit technique | Holdout trades | Win rate | Net | PF | Max DD | Consistent? |
 |---|---:|---|---:|---:|---:|---:|---:|---|
-| XAUUSD | M30 | Full TP3 | 204 | 37.25% | +60.92R | 1.68 | 10.20R | Yes |
+| XAUUSD | M30 | BE + 33/33/34 | 227 | 57.71% | +78.03R | 2.03 | 6.09R | Yes |
 | EURUSD | M30 | BE + 33/33/34 | 215 | 52.09% | +26.04R | 1.29 | 10.51R | No |
 
 The selection prioritises the smallest timeframe with a material edge and positive train, validation, and holdout splits. Tiny positive results with high drawdown are rejected. A row marked `Consistent? = No` is **not tradeable** - it is listed because it was a candidate, not because it passed.
@@ -36,13 +56,13 @@ Charts assume 0.25% account risk per trade.
 
 ### XAUUSD M30
 
-Selected exit: **Full TP3**
+Selected exit: **BE + 33/33/34**
 
 | Split | Trades | Win rate | Net | Expectancy | PF | Max DD |
 |---|---:|---:|---:|---:|---:|---:|
-| Train | 649 | 29.28% | +1.92R | +0.00R/trade | 1.00 | 44.92R |
-| Validation | 200 | 37.00% | +51.03R | +0.26R/trade | 1.53 | 14.67R |
-| Holdout | 204 | 37.25% | +60.92R | +0.30R/trade | 1.68 | 10.20R |
+| Train | 693 | 46.75% | +33.54R | +0.05R/trade | 1.11 | 26.80R |
+| Validation | 225 | 52.44% | +45.18R | +0.20R/trade | 1.49 | 14.04R |
+| Holdout | 227 | 57.71% | +78.03R | +0.34R/trade | 2.03 | 6.09R |
 
 [FTMO performance chart](../outputs/charts/ftmo/symbols/XAUUSD/M30/performance.png)
 
@@ -62,10 +82,10 @@ Selected exit: **BE + 33/33/34**
 
 | Symbol | TF | Bars | Best exit | Holdout trades | Win rate | Net | PF | Max DD |
 |---|---:|---:|---|---:|---:|---:|---:|---:|
-| XAUUSD | M5 | 50000 | BE + 33/33/34 | 216 | 48.61% | +35.56R | 1.50 | 9.84R |
-| XAUUSD | M15 | 50000 | Full TP3 | 221 | 29.41% | +34.41R | 1.36 | 8.25R |
-| XAUUSD | M30 | 50000 | Full TP3 | 204 | 37.25% | +60.92R | 1.68 | 10.20R |
-| XAUUSD | H1 | 50000 | Full TP3 | 201 | 35.32% | +30.85R | 1.28 | 13.22R |
+| XAUUSD | M5 | 50000 | BE + 33/33/34 | 239 | 47.70% | +31.36R | 1.38 | 9.51R |
+| XAUUSD | M15 | 50000 | Full TP3 | 248 | 30.65% | +38.11R | 1.34 | 11.42R |
+| XAUUSD | M30 | 50000 | BE + 33/33/34 | 227 | 57.71% | +78.03R | 2.03 | 6.09R |
+| XAUUSD | H1 | 50000 | Full TP3 | 236 | 37.29% | +49.50R | 1.39 | 9.24R |
 | XAUUSD | H4 | 15962 | BE + 33/33/34 | 73 | 61.64% | +24.09R | 1.92 | 4.02R |
 | BTCUSD | M5 | 50002 | BE + 33/33/34 | 238 | 43.70% | +23.53R | 1.25 | 10.65R |
 | EURUSD | M5 | 50000 | BE + 33/33/34 | 239 | 41.00% | -51.31R | 0.62 | 54.09R |
