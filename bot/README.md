@@ -67,12 +67,16 @@ Terminal จะแสดง STARTING, WAITING, LIVE, เวลา server แล�
 ```powershell
 python -m bot.code.run --status
 python -m bot.code.run --once
+python -m bot.code.run --reconcile          # dry-run: inspect startup recovery only
+python -m bot.code.run --reconcile --live   # persist recovery; no signal evaluation
 python -m bot.code.run
 python -m bot.code.run --flatten --live
 ```
 
 - `--status` อ่านสถานะ แต่ต้องเชื่อมต่อ MT5
 - `--once` เป็น dry-run หนึ่งรอบ
+- `--reconcile` ตรวจและกู้ state/order/position ตอน startup แล้วจบ โดยไม่ประเมินสัญญาณ
+- `--reconcile --live` บันทึกผล reconciliation จริง แต่ไม่เปิดออเดอร์ใหม่
 - ไม่ใส่ flag เป็น dry-run แบบวนลูป
 - `--flatten --live` ยกเลิก order และปิด position ของบอท เป็นคำสั่งฉุกเฉิน
 
@@ -143,7 +147,7 @@ News, Exposure และ Journal ส่วนรายละเอียด posi
   และให้ setup ถัดไปใช้ tier ที่ต่ำกว่าซึ่งพอดีกับ room ที่เหลือได้ โดย cap รวมยัง 1.50%
 - Exit policy: **capital tier ที่ $30,000 โดยยึด initial balance**
 - บัญชีที่ผูกอยู่: **FTMO Demo $50,000** → อยู่ tier บน
-- Exit จริงของบัญชีนี้: **แบ่ง 33/33/34 ปิดที่ TP1/TP2/TP3 + เลื่อน BE หลัง TP1**
+- Exit จริงของบัญชีนี้: **แบ่ง 33/33/34 ปิดที่ TP1/TP2/TP3 + BE หลัง TP1 + เลื่อน TP3 ไป TP1 หลัง TP2**
 - `bot/main.py` เริ่ม live trading ทันที
 
 ### Exit ที่บอทรันจริงคือ BE + 33/33/34
@@ -166,8 +170,8 @@ $10–14 จึงแบ่งสามขาตาม `sizing._split` ได้
 
 | | holdout net R | holdout expectancy | holdout DD |
 |---|---:|---:|---:|
-| XAUUSD M15 `be_after_tp1_33_33_34` | +41.6R | +0.1679R/trade | 9.06R |
-| XAUUSD M30 `be_after_tp1_33_33_34` | +78.0R | +0.3437R/trade | 6.09R |
+| XAUUSD M15 `be_after_tp1_33_33_34` | +43.7R | +0.1761R/trade | 9.06R |
+| XAUUSD M30 `be_after_tp1_33_33_34` | +81.1R | +0.3572R/trade | 6.09R |
 
 > **หมายเหตุประวัติ:** เอกสารรุ่นก่อนบรรยายเคสบัญชี **$10,000** ซึ่งอยู่ tier ล่าง
 > และใช้ `fixed_tp3` ขาเดียว เพราะงบเสี่ยง $40 แบ่งสามขาไม่ได้ (0.01 lot ของทอง
@@ -197,7 +201,13 @@ journal คำนวณจาก lot ที่ส่งจริง ไม่ใ
 | Initial balance | โหมดที่ใช้ |
 |---|---|
 | ต่ำกว่า $30,000 | `fixed_tp3`: position เดียว ปิดทั้งหมดที่ +2R ไม่เลื่อน SL |
-| ตั้งแต่ $30,000 | `be_33_33_34`: TP1 +1R, TP2 +1.5R, TP3 +2R; หลัง TP1 ปิดจริง เลื่อนสองส่วนที่เหลือไป BE |
+| ตั้งแต่ $30,000 | `be_33_33_34`: TP1 +1R, TP2 +1.5R, TP3 +2R; หลัง TP1 เลื่อน TP2/TP3 ไป BE และหลัง TP2 เลื่อน TP3 ไปล็อกที่ TP1 |
+
+สำหรับ XAU จุด BE/ขั้นกำไรจะบวกต้นทุนคอมมิชชันประมาณ $0.07 และ reserve
+สำหรับการไถลของ stop $0.50 รวมเป็นประมาณ $0.57 เหนือราคาเปิดสำหรับ BUY
+(หรือต่ำกว่าสำหรับ SELL) รวมทั้งชดเชย swap ติดลบที่เกิดขึ้นแล้วด้วย ค่า reserve
+นี้ครอบคลุมการไถล $0.43 ที่พบเมื่อ 5 ส.ค. 2026 แต่ไม่สามารถรับประกันกรณีตลาด gap
+หรือสภาพคล่องผิดปกติที่ไถลเกิน $0.50 ได้
 
 ```text
 Exit    capital_tier $30,000 -> fixed_tp3 (one leg to TP3 (2R))
@@ -218,15 +228,15 @@ Exit    capital_tier $30,000 -> fixed_tp3 (one leg to TP3 (2R))
 exit ที่บัญชี $50K ใช้จริง และรวมผลของ `CONVERT_TO_MARKET_BARS = 2` แล้ว
 (รายงานเมื่อ 31 ก.ค. 2026 — ดู `docs/ENTRY_TIMING_EXPERIMENT_2026-07-31.md`)
 
-### XAUUSD M15 — BE + 33/33/34
+### XAUUSD M15 — BE + 33/33/34 + TP2 step
 
 ช่วงข้อมูล 12 มิถุนายน 2024 ถึง 24 กรกฎาคม 2026
 
 | Split | Trades | Win rate | Net | Expectancy | PF | Max DD |
 |---|---:|---:|---:|---:|---:|---:|
-| Train | 752 | 48.14% | +120.89R | +0.1608R/trade | 1.422 | 10.97R |
-| Validation | 226 | 54.42% | +72.71R | +0.3217R/trade | 1.991 | 5.62R |
-| Holdout | 248 | 47.98% | +41.63R | +0.1679R/trade | 1.463 | 9.06R |
+| Train | 752 | 48.14% | +129.39R | +0.1721R/trade | 1.452 | 10.97R |
+| Validation | 226 | 54.42% | +74.07R | +0.3277R/trade | 2.009 | 5.62R |
+| Holdout | 248 | 47.98% | +43.67R | +0.1761R/trade | 1.485 | 9.06R |
 
 สรุป: M15 เป็นบวกทั้งสาม split แต่ช่วงข้อมูลเริ่มกลางปี 2024 จึงครอบคลุม regime
 น้อยกว่า M30 และไม่ควรตีความว่า expectancy ระดับนี้จะคงอยู่ตลอด
@@ -237,34 +247,36 @@ exit ที่บัญชี $50K ใช้จริง และรวมผ�
 > ค่า 5.61R เดิมอยู่ที่เปอร์เซ็นไทล์ 87 คือเป็น**ลำดับที่โชคดีผิดปกติ** ส่วน 9.06R
 > อยู่ที่ 40 คือค่าปกติ ห้ามใช้ตัวเลขนี้ตัดสินใจอะไร
 
-### XAUUSD M30 — BE + 33/33/34
+### XAUUSD M30 — BE + 33/33/34 + TP2 step
 
 ช่วงข้อมูล 2 พฤษภาคม 2022 ถึง 24 กรกฎาคม 2026
 
 | Split | Trades | Win rate | Net | Expectancy | PF | Max DD |
 |---|---:|---:|---:|---:|---:|---:|
-| Train | 693 | 46.75% | +33.54R | +0.0484R/trade | 1.106 | 26.80R |
-| Validation | 225 | 52.44% | +45.18R | +0.2008R/trade | 1.485 | 14.04R |
-| Holdout | 227 | 57.71% | +78.03R | +0.3437R/trade | 2.027 | 6.09R |
+| Train | 693 | 46.75% | +36.94R | +0.0533R/trade | 1.116 | 25.78R |
+| Validation | 225 | 52.44% | +46.88R | +0.2084R/trade | 1.504 | 14.04R |
+| Holdout | 227 | 57.71% | +81.09R | +0.3572R/trade | 2.068 | 6.09R |
 
 สรุป: M30 เป็นบวกทั้งสาม split แต่ train มี edge บางและ drawdown สูง แสดงว่าระบบเคยผ่าน
-ช่วงตลาดที่ยากกว่าช่วง holdout ปัจจุบัน — holdout ดีขึ้นจาก +64.09R เป็น +78.03R
+ช่วงตลาดที่ยากกว่าช่วง holdout ปัจจุบัน — holdout ของ exit แบบขั้นบันไดอยู่ที่ +81.09R
 หลังเปิด conversion
 
 ## ความต่างจากรายงานวิจัยที่เลือก Exit
 
 `docs/FTMO_BACKTEST_SUMMARY.md` เลือก exit จาก validation เพื่อไม่ใช้ holdout ทั้งเลือกและให้คะแนน
 
-หลังเปิด `CONVERT_TO_MARKET_BARS = 2` การเลือกนั้นเปลี่ยนไปสำหรับ M30:
+หลังเปิด `CONVERT_TO_MARKET_BARS = 2` การเลือกจาก validation ยังต่างจาก
+production policy สำหรับ M15:
 
 | | exit ที่ validation เลือก | ตรงกับที่บัญชี $50K รันไหม |
 |---|---|---|
 | XAUUSD M30 | **`be_after_tp1_33_33_34`** | ✅ ตรง (เดิมเลือก `fixed_tp3`) |
-| XAUUSD M15 | `fixed_tp3` | ❌ ไม่ตรง — บอทรัน be33 ตาม capital tier |
+| XAUUSD M15 | `fixed_tp3` | ℹ️ production ตั้งใจรัน be33 ตาม capital tier |
 
 บัญชีที่ initial balance ตั้งแต่ $30,000 ใช้ผล `be_after_tp1_33_33_34` เป็นตัวอ้างอิงเสมอ
-ไม่ว่ารายงานจะเลือกอะไร และ status จะแสดงคำเตือนถ้าทั้งสองไม่ตรงกัน — ซึ่งตอนนี้
-ยังเกิดกับ M15 อยู่
+ไม่ว่ารายงานจะเลือกอะไร เพราะเป็น production contract ที่เลือกจากความทนทานของ
+หลาย split และ drawdown ไม่ใช่ validation ranking ของ TF เดียว ดังนั้น status จะแสดง
+`research baseline` เป็นข้อมูลประกอบ ไม่ใช่ `CHECK` เมื่อใช้ `capital_tier`.
 
 ## ต้นทุนและข้อจำกัดของ Backtest
 
@@ -350,7 +362,7 @@ py -3.13 -m venv .venv
 Capital tier เป็นตัวกำหนด exit:
 
 - Initial balance ต่ำกว่า $30,000: `fixed_tp3` — เปิดหนึ่ง position และปิดที่ TP3 (2R)
-- Initial balance ตั้งแต่ $30,000: `be_after_tp1_33_33_34` — แบ่ง TP1/TP2/TP3 เป็น 33/33/34 และเลื่อนส่วนที่เหลือไป break-even หลัง TP1
+- Initial balance ตั้งแต่ $30,000: `be_after_tp1_33_33_34` — แบ่ง TP1/TP2/TP3 เป็น 33/33/34, เลื่อน TP2/TP3 ไป break-even หลัง TP1 และเลื่อน TP3 ไปล็อกกำไรระดับ TP1 หลัง TP2
 
 อย่าแก้ exit ของ position ที่เปิดอยู่ย้อนหลัง และอย่าใช้ martingale, averaging down หรือขยาย SL; นโยบายเหล่านี้ถูกห้ามโดยการออกแบบ
 
@@ -393,5 +405,5 @@ Get-Content bot\code\journal.jsonl -Tail 100
 - Backtest และ Monte Carlo ไม่ยืนยันกำไรหรือการผ่าน FTMO
 - News cache, holiday schedule และ weekly-close setting ต้องตรวจจาก `--status` เป็นระยะ
 - บอทยังไม่รองรับหลาย symbol ใน process เดียว
-- ไม่มี trailing stop นอกจาก break-even หลัง TP1
+- ไม่มี trailing stop นอกจาก BE หลัง TP1 และขั้น TP2 -> TP1 สำหรับ TP3
 - หากเครื่องหรือบอทหยุดทำงาน การเลื่อน break-even จะหยุดตาม แต่ SL/TP ที่ส่งให้โบรกเกอร์ยังคงอยู่; เมื่อเปิดบอทใหม่ startup sync จะตรวจ TP1 และเลื่อนส่วนที่เหลือทันที

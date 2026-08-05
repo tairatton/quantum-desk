@@ -15,6 +15,17 @@ class TechniqueLabTests(unittest.TestCase):
         value = technique_lab._weighted_payoff(plan, (.33, .33, .34), True)
         self.assertAlmostEqual(value, .33 * 1 + .33 * 1.5 + .34 * 2)
 
+    def test_tp2_step_locks_the_tp3_weight_at_one_r(self):
+        plan = {"resolved": ["tp", "tp", "sl"]}
+        be_only = technique_lab._weighted_payoff(
+            plan, (.33, .33, .34), True,
+        )
+        stepped = technique_lab._weighted_payoff(
+            plan, (.33, .33, .34), True, step_after_tp2=True,
+        )
+        self.assertAlmostEqual(be_only, .33 * 1 + .33 * 1.5)
+        self.assertAlmostEqual(stepped, be_only + .34)
+
     def test_summary_reports_drawdown_and_expectancy(self):
         result = technique_lab._summary([1.0, -1.0, 2.0, 0.0])
         self.assertEqual(result["trades"], 4)

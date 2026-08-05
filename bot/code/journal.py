@@ -11,9 +11,25 @@ import json
 from datetime import datetime
 from pathlib import Path
 
+_ENABLED = True
+
+
+def set_enabled(enabled: bool) -> bool:
+    """Enable/disable append writes and return the previous setting.
+
+    Dry-run lifecycle checks may replay closed deals in memory. They must not
+    contaminate the live evidence log with duplicate trade outcomes.
+    """
+    global _ENABLED
+    previous = _ENABLED
+    _ENABLED = bool(enabled)
+    return previous
+
 
 def write(path: Path, event: str, **payload) -> dict:
     record = {"at": datetime.now().isoformat(timespec="seconds"), "event": event, **payload}
+    if not _ENABLED:
+        return record
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a", encoding="utf-8") as handle:
         handle.write(json.dumps(record, ensure_ascii=False, default=str) + "\n")

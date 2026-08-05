@@ -40,8 +40,8 @@
   "exit_mode": "capital_tier",
   "split_exit_min_balance": 30000.0,
 
-  "_comment_timeframes": "M15 + M30, both on the pinned fixed_tp3 exit above.",
-  "_comment_timeframes_why": "M30 added 28 Jul 2026 to lift frequency from 1.9 to 2.8 trades/day. It earns the slot on evidence, not frequency: 4.2 years of data covering the flat 2023, and the highest expectancy of any stream tested (+0.299R against M15's +0.156R). A second SYMBOL was rejected instead -- USDJPY and GBPUSD sit at +0.03 to +0.07R and would dilute the book, and running every qualifying stream at once produced a worst day of -5.11%, which breaches the 5% daily loss rule on its own.",
+  "_comment_timeframes": "M15 + M30, both use the production capital-tier exit: fixed TP3 below $30,000 and three-leg BE plus TP2-to-TP1 step at or above $30,000.",
+  "_comment_timeframes_why": "M30 added 28 Jul 2026 to lift frequency from 1.9 to 2.8 trades/day. It earns the slot on evidence, not frequency: 4.2 years of data covering the flat 2023, and the stepped split exit now reports +0.357R/trade on M30 holdout and +0.176R on M15 holdout. A second SYMBOL was rejected instead -- USDJPY and GBPUSD sit at +0.03 to +0.07R and would dilute the book, and running every qualifying stream at once produced a worst day of -5.11%, which breaches the 5% daily loss rule on its own.",
   "timeframes": ["M15", "M30"],
 
   "_comment_news": "Fail closed for production safety: if the high-impact USD calendar is unavailable or stale, existing positions remain managed but no new entry is allowed.",

@@ -318,14 +318,17 @@ def plot_expectancy_by_year(streams=(("XAU H1", "XAUUSD H1"), ("XAU M30", "XAUUS
 
     fig, axes = plt.subplots(1, 3, figsize=(16, 5.4), constrained_layout=True)
     for axis, (key, title) in zip(axes, streams):
-        symbol, timeframe, technique, cost = STREAMS[key]
+        symbol, timeframe, cost = STREAMS[key]
+        report = backtest_reporting.load_report(
+            backtest_reporting.report_path(symbol, timeframe))
+        technique = TECHNIQUE_OVERRIDE or backtest_reporting.select_technique(report)
+        payoff_of = lab.payoff_for(technique)
         frame = pd.read_csv(config.MARKET_DATA_DIR / symbol / f"{timeframe}.csv",
                             parse_dates=["time"])
         result = quantum.analyse(frame, timeframe)
         data = result["data"]
         rows = [{"year": pd.Timestamp(data["time"].iloc[p["signal_index"]]).year,
-                 "r": lab._weighted_payoff(p, (.33, .33, .34), True)
-                      - lab._spread_r(data, p, symbol) - cost}
+                 "r": payoff_of(p) - lab._cost_r(data, p, symbol) - cost}
                 for p in result["plans"] if p["entry_fill_index"] is not None]
         yearly = pd.DataFrame(rows).groupby("year")["r"].agg(["mean", "count"])
 
@@ -389,9 +392,10 @@ def plot_cost_sensitivity(keys=("XAU M30", "XAU M15", "XAU H1", "EUR M30", "BTC 
     style_axis(axis)
     ends = []
     for key, color in zip(keys, colors):
-        symbol, timeframe, technique, own_cost = STREAMS[key]
+        symbol, timeframe, own_cost = STREAMS[key]
         report = backtest_reporting.load_report(
             backtest_reporting.report_path(symbol, timeframe))
+        technique = TECHNIQUE_OVERRIDE or backtest_reporting.select_technique(report)
         base = report["techniques"][technique]["validation"]["expectancy_r"]
         axis.plot(costs, base - costs, color=color, linewidth=2)
         axis.plot(own_cost, base - own_cost, "o", color=color, markersize=9,

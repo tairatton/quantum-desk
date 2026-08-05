@@ -99,16 +99,21 @@ SYMBOLS: dict[str, dict] = {
 #   commission_per_lot account currency per 1.0 lot, round trip
 #   value_per_point    account currency per 1.0 price point per 1.0 lot, needed to
 #                      turn a cash commission into R
-#   slippage_points    points lost to fills over the whole round trip. Entry is a
-#                      market order and the stop is a stop order, so both slip; a
-#                      take-profit is a limit and does not.
+#   slippage_points    expected points lost over the whole round trip; used by
+#                      research/backtest expectancy.
+#   breakeven_slippage_points
+#                      conservative stop-fill reserve used only when live SL is
+#                      moved to BE/a profit step. This is a tail allowance, not
+#                      an average cost. XAU is calibrated above the observed
+#                      $0.43 adverse stop fill on 2026-08-05.
 #
 # These are estimates of the right order of magnitude, not measurements. Replace
 # them with what an FTMO demo actually charges — that is what phase 2 of the plan
 # in docs/FTMO_SYMBOL_AND_TIMELINE.md is for.
 COSTS: dict[str, dict] = {
     "XAUUSD": {"spread_sides": 1, "commission_per_lot": 7.0,
-               "value_per_point": 100.0, "slippage_points": 50},      # $0.05
+               "value_per_point": 100.0, "slippage_points": 50,
+               "breakeven_slippage_points": 500},                    # $0.50
     "BTCUSD": {"spread_sides": 1, "commission_per_lot": 0.0,
                "value_per_point": 1.0, "slippage_points": 500},       # $5
     "EURUSD": {"spread_sides": 1, "commission_per_lot": 7.0,

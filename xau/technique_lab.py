@@ -46,8 +46,10 @@ def _target_payoff(plan: dict, target: int) -> float:
     return quantum.RR_TARGETS[target] if outcome == "tp" else -1.0 if outcome == "sl" else 0.0
 
 
-def _weighted_payoff(plan: dict, weights: tuple[float, float, float], breakeven: bool) -> float:
+def _weighted_payoff(plan: dict, weights: tuple[float, float, float],
+                     breakeven: bool, step_after_tp2: bool = False) -> float:
     tp1_hit = plan["resolved"][0] == "tp"
+    tp2_hit = plan["resolved"][1] == "tp"
     value = 0.0
     for k, weight in enumerate(weights):
         outcome = plan["resolved"][k]
@@ -55,7 +57,14 @@ def _weighted_payoff(plan: dict, weights: tuple[float, float, float], breakeven:
             value += weight * quantum.RR_TARGETS[k]
         elif outcome == "sl":
             # Once TP1 is banked, a BE rule protects only the remaining size.
-            value += 0.0 if breakeven and tp1_hit and k > 0 else -weight
+            if breakeven and tp1_hit and k > 0:
+                # After TP2, the remaining TP3 leg is protected at TP1 (+1R).
+                # The caller supplies the flag because the lab also retains
+                # older BE-only techniques for comparison.
+                value += (weight if step_after_tp2 and tp2_hit and k == 2
+                          else 0.0)
+            else:
+                value -= weight
     return value
 
 
@@ -70,7 +79,9 @@ TECHNIQUE_PAYOFFS = {
     "scale_50_25_25": lambda p: _weighted_payoff(p, (.5, .25, .25), False),
     "scale_33_33_34": lambda p: _weighted_payoff(p, (.33, .33, .34), False),
     "be_after_tp1_50_25_25": lambda p: _weighted_payoff(p, (.5, .25, .25), True),
-    "be_after_tp1_33_33_34": lambda p: _weighted_payoff(p, (.33, .33, .34), True),
+    "be_after_tp1_33_33_34": lambda p: _weighted_payoff(
+        p, (.33, .33, .34), True, step_after_tp2=True,
+    ),
 }
 
 
@@ -169,7 +180,7 @@ def evaluate(data: pd.DataFrame, result: dict, symbol: str, timeframe: str) -> d
     chart_techniques = {
         "TP1 ทั้งก้อน": techniques["fixed_tp1"],
         "TP3 ทั้งก้อน": techniques["fixed_tp3"],
-        "แบ่ง 33/33/34 + BE": techniques["be_after_tp1_33_33_34"],
+        "แบ่ง 33/33/34 + BE + step": techniques["be_after_tp1_33_33_34"],
     }
     chart = {"time": [str(pd.Timestamp(data["time"].iloc[p["signal_index"]]))
                        for p in groups["holdout"]], "equity": {}, "drawdown": {}}
@@ -213,8 +224,10 @@ def evaluate(data: pd.DataFrame, result: dict, symbol: str, timeframe: str) -> d
         "holdout_all_curves_r": all_curve,
         "notes": [
             "All techniques use the same filled entries; order frequency is unchanged.",
-            "Spread is included; commission and slippage are not available in the source data.",
+            "Spread, estimated commission, and expected slippage are included in every trade.",
             "Each fixed TP result represents a separate full-position exit policy.",
+            "The production split exit banks TP1, moves survivors to cost-covered BE, "
+            "then locks the TP3 leg at TP1 after TP2.",
         ],
     }
 

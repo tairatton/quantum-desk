@@ -188,7 +188,7 @@ bot/                        # ตัวรันเทรดจริง (dry-ru
     ├── sizing.py           # risk % -> lot และแบ่ง leg 33/33/34
     ├── guardrails.py       # ด่าน FTMO + ด่านภายใน
     ├── signals.py          # สะพานไป xau.quantum
-    ├── trader.py           # เปิด 3 leg, BE หลัง TP1, timeout
+    ├── trader.py           # เปิด 3 leg, BE หลัง TP1, step หลัง TP2, timeout
     ├── news.py             # ปฏิทินข่าว + หน้าต่าง blackout
     ├── state.py            # state.json รอด restart
     └── journal.py          # journal.jsonl + สรุปสถิติ R
