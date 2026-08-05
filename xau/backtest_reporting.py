@@ -20,7 +20,7 @@ TECHNIQUE_NAMES = {
     "scale_50_25_25": "Scale 50/25/25",
     "scale_33_33_34": "Scale 33/33/34",
     "be_after_tp1_50_25_25": "BE + 50/25/25",
-    "be_after_tp1_33_33_34": "BE + 33/33/34",
+    "be_after_tp1_33_33_34": "BE + 33/33/34 + TP2 step",
     "regime_adaptive": "Regime adaptive",
 }
 

@@ -563,6 +563,21 @@ class StateTests(unittest.TestCase):
             with self.assertRaises(__import__("json").JSONDecodeError):
                 journal.read(path)
 
+    def test_disabled_journal_write_does_not_pollute_live_evidence(self):
+        import tempfile
+
+        from bot.code import journal
+
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "journal.jsonl"
+            previous = journal.set_enabled(False)
+            try:
+                record = journal.write(path, "trade_closed", r=-1.0)
+            finally:
+                journal.set_enabled(previous)
+            self.assertEqual(record["event"], "trade_closed")
+            self.assertFalse(path.exists())
+
     def test_status_exposes_account_state_mismatch(self):
         from bot.code.run import account_binding_status
 

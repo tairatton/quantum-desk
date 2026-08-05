@@ -63,14 +63,25 @@ class ManagedTrade:
     # price/comment.
     market_order_tickets: list[int] = field(default_factory=list)
     tp1_market_order_ticket: int | None = None
-    # TP1 identity is persisted separately from list order. Pending fills can
-    # become visible to MT5 history out of order, so "first position ticket" is
-    # not a safe long-term definition of the TP1 leg.
+    # Target identities are persisted separately from list order. Pending fills
+    # can become visible to MT5 history out of order, so list position is not a
+    # safe long-term definition of a leg. The TP1 fields predate the stepped
+    # exit fields below and remain for state-file compatibility.
     tp1_position_ticket: int | None = None
     tp1_pending_ticket: int | None = None
+    tp2_market_order_ticket: int | None = None
+    tp3_market_order_ticket: int | None = None
+    tp2_position_ticket: int | None = None
+    tp3_position_ticket: int | None = None
+    tp2_pending_ticket: int | None = None
+    tp3_pending_ticket: int | None = None
     filled_at: str | None = None
     fill_bar_time: str | None = None
     breakeven_done: bool = False
+    # TP2 -> TP1 profit lock for the remaining TP3 leg. Kept separate from
+    # breakeven_done because the two transitions can happen at different times
+    # and both must remain retryable across a restart.
+    tp2_lock_done: bool = False
     closed: bool = False
     # The working limit was conclusively cancelled for a limit -> market
     # conversion. Keep this durable through the replacement attempt so a guard,

@@ -2,6 +2,7 @@
 
     python -m bot.code.run --status          # account, guards and live R stats
     python -m bot.code.run --once            # one pass, dry-run
+    python -m bot.code.run --reconcile      # startup/state reconciliation only
     python -m bot.code.run                   # loop, dry-run (safe default)
     python -m bot.code.run --live            # loop, sends real orders
     python -m bot.code.run --flatten --live  # emergency: cancel and close everything
@@ -103,8 +104,8 @@ def resolve_offset(broker: Broker, state: BotState, config_) -> tuple[float, str
 
 EXIT_LABELS = {
     "fixed_tp3": "one leg to TP3 (2R)",
-    "be_33_33_34": "three legs 33/33/34, BE after TP1",
-    "capital_tier": "fixed TP3 below threshold; 33/33/34 + BE at/above threshold",
+    "be_33_33_34": "three legs 33/33/34, BE after TP1, step after TP2",
+    "capital_tier": "fixed TP3 below threshold; 33/33/34 + BE/step at/above threshold",
     "auto": "split when the size allows (NOT RECOMMENDED)",
 }
 #: `exit_mode` value that corresponds to each technique the lab can select.
@@ -113,12 +114,11 @@ TECHNIQUE_TO_MODE = {"fixed_tp3": "fixed_tp3",
 
 
 def exit_mode_line(config_, initial_balance: float | None = None) -> str:
-    """The exit in force, checked against what the study selected for each TF.
+    """Show production exit and distinguish intentional tier overrides.
 
-    The point of naming the exit was to stop the account balance choosing it. The
-    other half of that is checking the name still matches the research: a report
-    regenerated with fresh data can select a different technique, and nothing
-    would otherwise tell the operator that live and backtest had parted company.
+    A capital-tier policy is a deliberate production contract: it may use the
+    robust split exit even when a timeframe's validation ranking picks full TP3.
+    That is research context, not a runtime configuration error.
     """
     active_mode = config_.resolved_exit_mode(initial_balance)
     active_label = EXIT_LABELS.get(active_mode, active_mode)
@@ -131,15 +131,20 @@ def exit_mode_line(config_, initial_balance: float | None = None) -> str:
         from xau import backtest_reporting as br
 
         mismatched = []
+        research = []
         for timeframe in config_.timeframes:
             path = br.report_path(config_.symbol, timeframe)
             if not path.exists():
                 continue
             picked = br.select_technique(br.load_report(path))
-            if TECHNIQUE_TO_MODE.get(picked, picked) != active_mode:
+            if config_.exit_mode == "capital_tier":
+                research.append(f"{timeframe}={picked}")
+            elif TECHNIQUE_TO_MODE.get(picked, picked) != active_mode:
                 mismatched.append(f"{timeframe} wants {picked}")
         if mismatched:
             return f"{label}    <-- CHECK: {', '.join(mismatched)}"
+        if research:
+            return f"{label}    research baseline: {', '.join(research)}"
         return f"{label}    matches the study"
     except Exception as error:                    # noqa: BLE001 - reporting only
         return f"{label}    (could not check: {error})"
@@ -375,7 +380,7 @@ def active_setup_count(state: BotState, positions, orders) -> int:
 
 
 def needs_split_management(state: BotState) -> bool:
-    """Whether a split trade needs ticket sync, BE, or swap-buffer refresh."""
+    """Whether a split trade needs ticket sync, BE/step, or swap refresh."""
     return any(
         trade.exit_mode == "be_33_33_34"
         and (
@@ -426,6 +431,7 @@ def position_health(position, state: BotState, quote: dict,
         flags.append("MISSING_SL")
     if not position.take_profit:
         flags.append("MISSING_TP")
+    role = _target_name(trade, position.take_profit)
     if position.stop:
         # Broker price precision rounds the planned stop (4047.9359 -> 4047.94
         # on two-digit gold). Treat sub-basis-point differences as formatting,
@@ -444,8 +450,11 @@ def position_health(position, state: BotState, quote: dict,
                 else position.stop > position.price_open + fill_tolerance
             )
             at_fill = abs(position.stop - position.price_open) <= fill_tolerance
+            stepped = trade.tp2_lock_done and role == "TP3"
             desired_net_stop = (
-                trader.breakeven_stop(broker, position)
+                trader.stepped_profit_stop(broker, trade, position)
+                if broker is not None and stepped
+                else trader.breakeven_stop(broker, position)
                 if broker is not None else position.price_open
             )
             below_net = (
@@ -464,10 +473,11 @@ def position_health(position, state: BotState, quote: dict,
             elif at_fill:
                 # Gross price break-even still loses commission.
                 flags.append("SL_AT_GROSS_BE")
+            elif stepped:
+                flags.append("SL_AT_TP1_STEP")
             else:
                 flags.append("SL_AT_NET_BE")
     status = ",".join(flags) if flags else "PROTECTED"
-    role = _target_name(trade, position.take_profit)
     return (
         f"ticket={position.ticket} plan={trade.plan_id} tf={trade.timeframe} "
         f"mode={trade.exit_mode or 'legacy'} role={role} side={side} "
@@ -1307,7 +1317,7 @@ def loop(broker: Broker, state: BotState, config_) -> None:
 
 
 def execute(*, live: bool = False, once: bool = False, status: bool = False,
-            flatten: bool = False) -> None:
+            flatten: bool = False, reconcile_only: bool = False) -> None:
     """Open a session and do one thing with it.
 
     Separate from `main` so `bot.main`'s menu can ask for an action directly
@@ -1318,6 +1328,7 @@ def execute(*, live: bool = False, once: bool = False, status: bool = False,
         message = "another Quantum Desk LIVE process is already running"
         print(status_line("BLOCKED", message, "error"))
         raise SystemExit(f"blocked: {message}")
+    previous_journal_enabled = journal.set_enabled(live)
     try:
         config_ = settings_module.load()
         state = BotState.load(STATE_PATH)
@@ -1342,12 +1353,21 @@ def execute(*, live: bool = False, once: bool = False, status: bool = False,
                 return
             reconcile_startup(broker, state, config_)
             print_status(broker, state, config_)
+            if reconcile_only:
+                print(status_line(
+                    "RECONCILED",
+                    "startup state and broker exposure checked; no signal pass",
+                    "ok",
+                ))
+                state.save(STATE_PATH)
+                return
             if once:
                 pass_once(broker, state, config_)
             else:
                 loop(broker, state, config_)
             state.save(STATE_PATH)
     finally:
+        journal.set_enabled(previous_journal_enabled)
         if instance_lock is not None:
             instance_lock.release()
 
@@ -1359,10 +1379,15 @@ def main(argv: list[str] | None = None) -> None:
                         help="send real orders (default is dry-run)")
     parser.add_argument("--once", action="store_true", help="run a single pass and exit")
     parser.add_argument("--status", action="store_true", help="print status and exit")
+    parser.add_argument(
+        "--reconcile", action="store_true",
+        help="reconcile broker/state and exit without evaluating signals",
+    )
     parser.add_argument("--flatten", action="store_true",
                         help="cancel every order and close every position, then exit")
     args = parser.parse_args(argv)
-    execute(live=args.live, once=args.once, status=args.status, flatten=args.flatten)
+    execute(live=args.live, once=args.once, status=args.status,
+            flatten=args.flatten, reconcile_only=args.reconcile)
 
 
 if __name__ == "__main__":

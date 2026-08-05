@@ -171,3 +171,10 @@
 {"at": "2026-07-31T21:56:11", "event": "status_checked", "mode": "DRY-RUN", "login": 1514115848, "server": "FTMO-Demo"}
 {"at": "2026-07-31T22:01:13", "event": "status_checked", "mode": "DRY-RUN", "login": 1514115848, "server": "FTMO-Demo"}
 {"at": "2026-07-31T22:23:51", "event": "status_checked", "mode": "DRY-RUN", "login": 1514115848, "server": "FTMO-Demo"}
+{"at": "2026-08-05T22:11:13", "event": "status_checked", "mode": "DRY-RUN", "login": 1514115848, "server": "FTMO-Demo"}
+{"at": "2026-08-05T22:21:13", "event": "status_checked", "mode": "DRY-RUN", "login": 1514115848, "server": "FTMO-Demo"}
+{"at": "2026-08-05T22:25:53", "event": "status_checked", "mode": "DRY-RUN", "login": 1514115848, "server": "FTMO-Demo"}
+{"at": "2026-08-05T22:27:41", "event": "status_checked", "mode": "DRY-RUN", "login": 1514115848, "server": "FTMO-Demo"}
+{"at": "2026-08-05T22:28:39", "event": "status_checked", "mode": "DRY-RUN", "login": 1514115848, "server": "FTMO-Demo"}
+{"at": "2026-08-05T22:31:16", "event": "trade_closed", "plan_id": "M15@recovered-2026-07-31 17:22:24", "timeframe": "M15", "profit": -386.52, "costs": -2.92, "r": -1.9842, "breakeven_done": false}
+{"at": "2026-08-05T22:31:16", "event": "startup_sync", "login": 1514115848, "server": "FTMO-Demo", "managed_trades": 0, "position_tickets": [], "pending_tickets": [], "market_order_tickets": []}

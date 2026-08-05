@@ -3,8 +3,9 @@
 The production setting is ``capital_tier``, so which exit runs depends on the
 account's anchored capital: ``fixed_tp3`` below 30,000 — one position, full exit
 at TP3 (2R) — and ``be_33_33_34`` at or above it, which uses three broker-side
-legs and moves the survivors to break-even after TP1. A 50,000 account is on the
-split. Both carry the same 120-bar timeout the study measured.
+legs and moves the survivors to break-even after TP1, then locks the TP3
+survivor at the TP1 level after TP2. A 50,000 account is on the split. Both
+carry the same 120-bar timeout the study measured.
 
 The three legs are sent one at a time with `Broker.write_spacing_seconds`
 between them. Firing them in the same instant reads as automated order flooding
@@ -152,6 +153,61 @@ def _position_target_index(trade: ManagedTrade, position: Position) -> int:
     )
 
 
+def _target_ticket_field(target: int, kind: str) -> str:
+    if target not in (1, 2, 3):
+        raise ValueError(f"invalid split target: {target}")
+    if kind not in {"market_order", "position", "pending"}:
+        raise ValueError(f"invalid split ticket kind: {kind}")
+    return f"tp{target}_{kind}_ticket"
+
+
+def _set_target_ticket(trade: ManagedTrade, target: int, kind: str,
+                       ticket: int | None) -> None:
+    """Persist the broker identity for one target leg."""
+    setattr(trade, _target_ticket_field(target, kind), ticket)
+
+
+def _hydrate_target_positions(trade: ManagedTrade,
+                              open_positions: dict[int, Position]) -> bool:
+    """Fill target -> position mappings from the broker's live TP prices.
+
+    New state records map every leg explicitly. Older records only carried a
+    TP1 identity, so use the authoritative live take-profit price first and
+    retain the old sorted-list contract as a final migration fallback.
+    """
+    changed = False
+    candidates: dict[int, list[int]] = {1: [], 2: [], 3: []}
+    for ticket in trade.position_tickets:
+        position = open_positions.get(ticket)
+        if position is None:
+            continue
+        target = _position_target_index(trade, position) + 1
+        if target in candidates:
+            candidates[target].append(ticket)
+    for target, tickets in candidates.items():
+        # A unique broker TP price is authoritative. Duplicate/placeholder
+        # prices are ambiguous (and common in test adapters), so leave them to
+        # the legacy sorted-ticket fallback below.
+        if len(tickets) != 1:
+            continue
+        field = _target_ticket_field(target, "position")
+        if getattr(trade, field) is None:
+            setattr(trade, field, tickets[0])
+            changed = True
+
+    # Before explicit target identities were added, market positions were
+    # sorted by TP1/TP2/TP3 at creation and recovery. Only use that migration
+    # path when all three tickets exist; guessing in a partial placement could
+    # falsely treat TP2 as banked and move TP3's stop.
+    if (len(trade.position_tickets) >= 3
+            and all(getattr(trade, _target_ticket_field(target, "position")) is None
+                    for target in (1, 2, 3))):
+        for target, ticket in zip((1, 2, 3), trade.position_tickets[:3]):
+            _set_target_ticket(trade, target, "position", ticket)
+            changed = True
+    return changed
+
+
 def _breakeven_cost_buffer(broker: Broker, position: Position | None = None) -> float:
     """Price distance needed to cover costs and current negative swap.
 
@@ -173,7 +229,18 @@ def _breakeven_cost_buffer(broker: Broker, position: Position | None = None) -> 
         source_point = 10 ** -int(config.symbol_cfg(symbol_key)["decimals"])
     except KeyError:
         source_point = float(broker.spec.point)
-    slippage_price = float(costs.get("slippage_points", 0.0)) * source_point
+    # Expected slippage is appropriate for expectancy, but a stop intended to
+    # protect capital needs a tail reserve. On 2026-08-05 XAU BE stops at
+    # 4183.98/4183.84 filled at 4183.55: $0.43/$0.29 adverse execution. Use the
+    # larger protective value when configured; no finite reserve can protect a
+    # true market gap, but this covers the observed ordinary stop slippage.
+    slippage_points = max(
+        float(costs.get("slippage_points", 0.0)),
+        float(costs.get(
+            "breakeven_slippage_points", costs.get("slippage_points", 0.0),
+        )),
+    )
+    slippage_price = slippage_points * source_point
     negative_swap_price = 0.0
     if position is not None and position.volume > 0 and value_per_point > 0:
         # POSITION_SWAP is cumulative cash in the account currency. Positive
@@ -186,18 +253,29 @@ def _breakeven_cost_buffer(broker: Broker, position: Position | None = None) -> 
     return max(0.0, commission_price + slippage_price + negative_swap_price)
 
 
-def breakeven_stop(broker: Broker, position: Position) -> float:
-    """Cost-covered break-even based on this leg's authoritative broker fill."""
-    raw = (
-        position.price_open
-        + position.direction * _breakeven_cost_buffer(broker, position)
-    )
+def _cost_covered_stop(broker: Broker, position: Position,
+                       anchor: float) -> float:
+    """Round a cost-covered stop away from the losing side."""
+    raw = anchor + position.direction * _breakeven_cost_buffer(broker, position)
     scale = 10 ** broker.spec.digits
     # Round away from the losing side. Built-in round() can round a BUY stop
     # down (or a SELL stop up), silently discarding the last cost-covering tick.
     if position.direction == 1:
         return math.ceil(raw * scale - 1e-9) / scale
     return math.floor(raw * scale + 1e-9) / scale
+
+
+def breakeven_stop(broker: Broker, position: Position) -> float:
+    """Cost-covered break-even based on this leg's authoritative broker fill."""
+    return _cost_covered_stop(broker, position, position.price_open)
+
+
+def stepped_profit_stop(broker: Broker, trade: ManagedTrade,
+                        position: Position) -> float:
+    """Cost-covered TP1 lock for the surviving TP3 leg after TP2."""
+    if not trade.targets:
+        return breakeven_stop(broker, position)
+    return _cost_covered_stop(broker, position, trade.targets[0])
 
 
 def _check_exit_mode(exit_mode: str, sizing, intent: Intent) -> str | None:
@@ -269,8 +347,7 @@ def recover_orphan_setups(broker: Broker, state: BotState) -> list[ManagedTrade]
             continue
         trade = matches[0]
         trade.position_tickets.append(position.ticket)
-        if target == 1:
-            trade.tp1_position_ticket = position.ticket
+        _set_target_ticket(trade, target, "position", position.ticket)
         trade.filled_at = trade.filled_at or str(position.opened_at)
         trade.fill_bar_time = trade.fill_bar_time or str(position.opened_at)
         _count_trading_moment(state, position.opened_at)
@@ -336,10 +413,11 @@ def recover_orphan_setups(broker: Broker, state: BotState) -> list[ManagedTrade]
             targets=[position.take_profit for position, _ in ordered],
             legs=[position.volume for position, _ in ordered],
             position_tickets=position_tickets,
-            tp1_position_ticket=ordered[0][0].ticket,
             filled_at=str(opened_at), fill_bar_time=str(opened_at),
             exit_mode="be_33_33_34", dry_run=False,
         )
+        for target, (position, _) in enumerate(ordered, start=1):
+            _set_target_ticket(trade, target, "position", position.ticket)
         state.trades[plan_id] = trade
         state.remember_plan(plan_id)
         _count_trading_moment(state, opened_at)
@@ -389,8 +467,7 @@ def recover_orphan_setups(broker: Broker, state: BotState) -> list[ManagedTrade]
         if len(matches) == 1:
             trade = matches[0]
             trade.pending_tickets.append(order["ticket"])
-            if role == 1:
-                trade.tp1_pending_ticket = order["ticket"]
+            _set_target_ticket(trade, role, "pending", order["ticket"])
             managed_pending.add(order["ticket"])
             if trade not in recovered:
                 recovered.append(trade)
@@ -444,9 +521,14 @@ def recover_orphan_setups(broker: Broker, state: BotState) -> list[ManagedTrade]
             entry=entry, stop=stop, risk=risk, risk_cash=round(risk_cash, 2),
             targets=targets, legs=volumes,
             pending_tickets=pending_tickets,
-            tp1_pending_ticket=(by_role[1]["ticket"] if 1 in by_role else -1),
             exit_mode="be_33_33_34", dry_run=False,
         )
+        for target, order in by_role.items():
+            _set_target_ticket(trade, target, "pending", order["ticket"])
+        if 1 not in by_role:
+            # Preserve the existing explicit-unknown sentinel used by startup
+            # reconciliation: a missing TP1 must never be guessed as banked.
+            trade.tp1_pending_ticket = -1
         state.trades[plan_id] = trade
         state.remember_plan(plan_id)
         managed_pending.update(pending_tickets)
@@ -598,8 +680,10 @@ def open_trade(broker: Broker, settings: Settings, state: BotState, intent: Inte
                     trade.expected_market_volume = round(
                         trade.expected_market_volume + executed_volume, 8
                     )
-                    if index == 1 and actual_exit_mode == "be_33_33_34":
-                        trade.tp1_market_order_ticket = recovery_ticket
+                    if actual_exit_mode == "be_33_33_34":
+                        _set_target_ticket(
+                            trade, index, "market_order", recovery_ticket,
+                        )
                     # Persist each accepted leg immediately. The final broker
                     # position lookup below is still authoritative, but a hard
                     # power loss before `finally` now leaves enough identity for
@@ -611,8 +695,8 @@ def open_trade(broker: Broker, settings: Settings, state: BotState, intent: Inte
                 ticket = int(result.get("order") or 0)
                 if ticket:
                     trade.pending_tickets.append(ticket)
-                    if index == 1 and actual_exit_mode == "be_33_33_34":
-                        trade.tp1_pending_ticket = ticket
+                    if actual_exit_mode == "be_33_33_34":
+                        _set_target_ticket(trade, index, "pending", ticket)
                     state.save(STATE_PATH)
             placed = index
     except OrderRejected as error:
@@ -647,11 +731,12 @@ def open_trade(broker: Broker, settings: Settings, state: BotState, intent: Inte
                     trade.risk_cash = round(actual_risk_cash, 2)
                     trade.converted_risk_pending = False
             if opened and actual_exit_mode == "be_33_33_34":
-                tp1 = min(opened, key=lambda position: (
-                    _position_target_index(trade, position), position.ticket,
-                ))
-                if _position_target_index(trade, tp1) == 0:
-                    trade.tp1_position_ticket = tp1.ticket
+                for position in opened:
+                    target = _position_target_index(trade, position) + 1
+                    if target in (1, 2, 3):
+                        _set_target_ticket(
+                            trade, target, "position", position.ticket,
+                        )
             # Every accepted market leg is visible, so no history recovery is
             # outstanding. If visibility lags, retain the order/deal ids for
             # startup.
@@ -738,8 +823,12 @@ def sync_fills(broker: Broker, state: BotState,
             position_ticket = filled_by_order[order_ticket]
             if position_ticket not in trade.position_tickets:
                 trade.position_tickets.append(position_ticket)
-            if order_ticket == trade.tp1_market_order_ticket:
-                trade.tp1_position_ticket = position_ticket
+            for target in (1, 2, 3):
+                if order_ticket == getattr(
+                        trade, _target_ticket_field(target, "market_order")):
+                    _set_target_ticket(
+                        trade, target, "position", position_ticket,
+                    )
         trade.market_order_tickets = [
             ticket for ticket in original_market if ticket not in filled_by_order
         ]
@@ -794,8 +883,12 @@ def sync_fills(broker: Broker, state: BotState,
         for order_ticket, position_ticket in zip(filled_orders, filled_positions):
             if position_ticket not in trade.position_tickets:
                 trade.position_tickets.append(position_ticket)
-            if order_ticket == trade.tp1_pending_ticket:
-                trade.tp1_position_ticket = position_ticket
+            for target in (1, 2, 3):
+                if order_ticket == getattr(
+                        trade, _target_ticket_field(target, "pending")):
+                    _set_target_ticket(
+                        trade, target, "position", position_ticket,
+                    )
         changed = changed or trade.pending_tickets != original
 
         if filled_positions:
@@ -832,10 +925,12 @@ def sync_fills(broker: Broker, state: BotState,
         state.save(STATE_PATH)
 
 def apply_breakeven(broker: Broker, state: BotState) -> set[int]:
-    """Move survivors to cost-covered fills and return live position tickets.
+    """Apply the split exit ladder and return live position tickets.
 
-    All legs share one stop, so if the TP1 leg is gone while later legs are still
-    open, TP1 must have been taken rather than stopped out.
+    All legs start with one stop. Once TP1 is gone while later legs remain, TP1
+    must have been taken rather than stopped out, so TP2 and TP3 move to
+    cost-covered break-even. Once the TP2 leg is also gone while TP3 remains,
+    TP2 must have been taken, so TP3 moves to a cost-covered TP1 lock (+1R).
 
     A `fixed_tp3` trade holds one leg and is skipped by the `< 2` test below,
     which is what should happen: there is no TP1 to bank and nothing behind it to
@@ -854,6 +949,7 @@ def apply_breakeven(broker: Broker, state: BotState) -> set[int]:
     for trade in state.open_trades():
         if trade.exit_mode != "be_33_33_34" or len(trade.position_tickets) < 2:
             continue
+        _hydrate_target_positions(trade, open_positions)
         if trade.tp1_position_ticket is not None:
             tp1_ticket = trade.tp1_position_ticket
         elif (trade.tp1_market_order_ticket is not None
@@ -926,23 +1022,94 @@ def apply_breakeven(broker: Broker, state: BotState) -> set[int]:
             # Clear that stale flag so fast split polling becomes active again.
             trade.breakeven_done = False
             continue
-        if trade.breakeven_done and not moved:
+        if not (trade.breakeven_done and not moved):
+            trade.breakeven_done = True
+            journal.write(JOURNAL_PATH, "breakeven", plan_id=trade.plan_id,
+                          tickets=[position.ticket for position in survivors],
+                          moved_tickets=[position.ticket for position in moved],
+                          already_protected=already_protected,
+                          stops=desired_stops,
+                          cost_buffers=cost_buffers,
+                          swaps=swaps)
+            if moved:
+                print(f"[STOP_MOVED] plan={trade.plan_id} mode=NET_BREAK_EVEN "
+                      f"stops={desired_stops} "
+                      f"positions={[position.ticket for position in moved]}")
+            else:
+                print(f"[STOP_CONFIRMED] plan={trade.plan_id} mode=NET_BREAK_EVEN "
+                      f"stops={desired_stops} positions={already_protected}")
+
+        # The second step is intentionally based on exact TP2/TP3 identities.
+        # A missing TP2 position without a recorded fill is not evidence that
+        # TP2 was banked: it may have been rejected, canceled, or still waiting
+        # for MT5 history. Legacy three-position records retain the original
+        # TP1/TP2/TP3 list ordering as a safe migration fallback.
+        tp2_ticket = trade.tp2_position_ticket
+        tp3_ticket = trade.tp3_position_ticket
+        if tp2_ticket is None and (
+                trade.tp2_market_order_ticket is not None
+                or trade.tp2_pending_ticket is not None):
             continue
-        trade.breakeven_done = True
-        journal.write(JOURNAL_PATH, "breakeven", plan_id=trade.plan_id,
-                      tickets=[position.ticket for position in survivors],
-                      moved_tickets=[position.ticket for position in moved],
-                      already_protected=already_protected,
-                      stops=desired_stops,
-                      cost_buffers=cost_buffers,
-                      swaps=swaps)
+        if tp3_ticket is None and (
+                trade.tp3_market_order_ticket is not None
+                or trade.tp3_pending_ticket is not None):
+            continue
+        if tp2_ticket is None or tp3_ticket is None:
+            if len(trade.position_tickets) < 3:
+                continue
+            tp2_ticket = trade.position_tickets[1]
+            tp3_ticket = trade.position_tickets[2]
+        if tp2_ticket in open_positions:
+            continue
+        tp3_position = open_positions.get(tp3_ticket)
+        if tp3_position is None:
+            continue
+
+        desired_stop = stepped_profit_stop(broker, trade, tp3_position)
+        improves = (
+            not tp3_position.stop
+            or (desired_stop > tp3_position.stop if trade.direction == 1
+                else desired_stop < tp3_position.stop)
+        )
+        moved = False
+        if improves:
+            try:
+                broker.move_stop(tp3_position, desired_stop)
+            except OrderRejected as error:
+                journal.write(
+                    JOURNAL_PATH, "step_stop_rejected", plan_id=trade.plan_id,
+                    trigger="TP2", ticket=tp3_position.ticket,
+                    reason=str(error),
+                )
+                print(f"[STOP_REJECTED] ticket={tp3_position.ticket} "
+                      f"reason={str(error)!r} scope='tp2_step'")
+                continue
+            moved = True
+
+        # A prior process may have completed the broker write before crashing.
+        # Treat an already tighter stop as complete, while still allowing a
+        # later negative-swap update to tighten it further.
+        if trade.tp2_lock_done and not moved:
+            continue
+        trade.tp2_lock_done = True
+        buffer = round(
+            _breakeven_cost_buffer(broker, tp3_position), broker.spec.digits,
+        )
+        journal.write(
+            JOURNAL_PATH, "step_stop", plan_id=trade.plan_id,
+            trigger="TP2", ticket=tp3_position.ticket,
+            anchor=trade.targets[0] if trade.targets else None,
+            stop=desired_stop, moved=moved, cost_buffer=buffer,
+            swap=float(getattr(tp3_position, "swap", 0.0)),
+        )
         if moved:
-            print(f"[STOP_MOVED] plan={trade.plan_id} mode=NET_BREAK_EVEN "
-                  f"stops={desired_stops} "
-                  f"positions={[position.ticket for position in moved]}")
+            print(f"[STOP_MOVED] plan={trade.plan_id} "
+                  f"mode=TP2_STEP_TO_TP1 stop={desired_stop} "
+                  f"position={tp3_position.ticket}")
         else:
-            print(f"[STOP_CONFIRMED] plan={trade.plan_id} mode=NET_BREAK_EVEN "
-                  f"stops={desired_stops} positions={already_protected}")
+            print(f"[STOP_CONFIRMED] plan={trade.plan_id} "
+                  f"mode=TP2_STEP_TO_TP1 stop={desired_stop} "
+                  f"position={tp3_position.ticket}")
     return set(open_positions)
 
 
