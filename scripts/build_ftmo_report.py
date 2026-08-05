@@ -15,6 +15,8 @@ from xau import backtest_reporting, config  # noqa: E402
 
 OUTPUT = config.DOCS_DIR / "FTMO_BACKTEST_SUMMARY.md"
 SPLITS = ("train", "validation", "holdout")
+PRODUCTION_TECHNIQUE = "be_after_tp1_33_33_34"
+PRODUCTION_STREAMS = (("XAUUSD", "M15"), ("XAUUSD", "M30"))
 
 
 def number(value, digits: int = 2) -> str:
@@ -29,6 +31,50 @@ def signed(value, suffix: str = "R") -> str:
 
 def technique_label(key: str) -> str:
     return backtest_reporting.TECHNIQUE_NAMES.get(key, key)
+
+
+def production_reports() -> list[dict]:
+    return [
+        backtest_reporting.load_report(
+            backtest_reporting.report_path(symbol, timeframe)
+        )
+        for symbol, timeframe in PRODUCTION_STREAMS
+    ]
+
+
+def production_table(reports: list[dict]) -> list[str]:
+    lines = [
+        "| Symbol | TF | Exit technique | Holdout trades | Win rate | Net | Expectancy | PF | Max DD |",
+        "|---|---:|---|---:|---:|---:|---:|---:|---:|",
+    ]
+    for report in reports:
+        row = report["techniques"][PRODUCTION_TECHNIQUE]["holdout"]
+        lines.append(
+            f"| {report['symbol']} | {report['timeframe']} | "
+            f"{technique_label(PRODUCTION_TECHNIQUE)} | {row['trades']} "
+            f"| {number(row['win_rate'])}% | {signed(row['net_r'])} "
+            f"| {signed(row['expectancy_r'])}/trade | {number(row['profit_factor'])} "
+            f"| {number(row['max_drawdown_r'])}R |"
+        )
+    return lines
+
+
+def production_split_table(reports: list[dict]) -> list[str]:
+    lines = [
+        "| Symbol | TF | Split | Trades | Win rate | Net | Expectancy | PF | Max DD |",
+        "|---|---:|---|---:|---:|---:|---:|---:|---:|",
+    ]
+    for report in reports:
+        metrics = report["techniques"][PRODUCTION_TECHNIQUE]
+        for split in SPLITS:
+            row = metrics[split]
+            lines.append(
+                f"| {report['symbol']} | {report['timeframe']} | {split.title()} "
+                f"| {row['trades']} | {number(row['win_rate'])}% | {signed(row['net_r'])} "
+                f"| {signed(row['expectancy_r'])}/trade | {number(row['profit_factor'])} "
+                f"| {number(row['max_drawdown_r'])}R |"
+            )
+    return lines
 
 
 def selected_table(reports: list[dict]) -> list[str]:
@@ -104,6 +150,7 @@ def all_timeframes_table(reports: list[dict]) -> list[str]:
 def build() -> str:
     selected = backtest_reporting.sort_reports(backtest_reporting.selected_reports())
     all_reports = backtest_reporting.sort_reports(backtest_reporting.discover_reports())
+    production = production_reports()
     lines = [
         "# FTMO Technique-Lab Backtest Summary",
         "",
@@ -122,6 +169,18 @@ def build() -> str:
         "and are modelled per symbol. The figures are estimates, not measurements - replace them "
         "with what an FTMO demo actually charges.",
         "- Every exit technique uses the same filled entries, so exit comparisons do not change trade frequency.",
+        "",
+        "## Production-aligned results for the current bot",
+        "",
+        "The live account starts at $50,000. Its `capital_tier` setting resolves to "
+        "`be_after_tp1_33_33_34` for both XAUUSD M15 and M30. The tables below pin both "
+        "timeframes to that exit instead of selecting an exit separately for research.",
+        "",
+        *production_table(production),
+        "",
+        "### Production-aligned split results",
+        "",
+        *production_split_table(production),
         "",
         "## Selected smallest practical profitable timeframe",
         "",

@@ -35,6 +35,7 @@ from . import dynamic_risk
 from .state import BotState, ftmo_day, ftmo_day_start_server
 
 LIVE_LOCK_PATH = BOT_DIR / ".live.lock"
+STALE_FEED_RECHECK_SECONDS = 300.0
 
 
 class _Ansi:
@@ -993,6 +994,21 @@ def reconcile_startup(broker: Broker, state: BotState, config_) -> None:
           "reconciled before signal loop")
 
 
+def _record_missed_entry(state: BotState, intent: signals.Intent,
+                         *, dry_run: bool = False) -> None:
+    """Persist one non-actionable plan that appeared after its entry bar."""
+    journal.write(
+        JOURNAL_PATH, "entry_missed",
+        plan_id=intent.plan_id, timeframe=intent.timeframe,
+        side=intent.side, bars_since_signal=intent.bars_since_signal,
+        reason="entry bar already passed; late entry not sent",
+        dry_run=dry_run,
+    )
+    print(f"[MISSED_ENTRY] {intent.plan_id}: entry bar already passed; "
+          "late entry not sent")
+    state.remember_plan(intent.plan_id)
+
+
 def pass_once(broker: Broker, state: BotState, config_) -> None:
     quote, account = _bind_and_anchor(broker, state, config_)
 
@@ -1082,7 +1098,16 @@ def pass_once(broker: Broker, state: BotState, config_) -> None:
             # then re-checks every guardrail against the new stop distance.
             if not trader.release_for_conversion(broker, state, intent):
                 continue
-        elif intent.action == signals.WAIT or known:
+        elif intent.action == signals.WAIT:
+            # The strategy still labels a plan active after its entry bar, but a
+            # process that was asleep or disconnected may have no corresponding
+            # broker order. Entering it late would be a different trade from the
+            # backtest. Record that distinction once instead of silently looking
+            # as though the bot ignored a valid fresh signal.
+            if not known:
+                _record_missed_entry(state, intent, dry_run=broker.dry_run)
+            continue
+        elif known:
             continue
 
         # A previous timeframe in this same pass may just have opened at market.
@@ -1205,6 +1230,7 @@ def loop(broker: Broker, state: BotState, config_) -> None:
                       "Ctrl+C to stop",
                       "live" if mode == "LIVE" else "warn"))
     reconnect_failures = 0
+    feed_was_stale = False
     while True:
         try:
             # Sleeping to the next bar close instead of polling keeps the day's
@@ -1249,6 +1275,9 @@ def loop(broker: Broker, state: BotState, config_) -> None:
                     state.day_requests + broker.requests,
                     setup_risk=heartbeat_risk, equity=account["equity"],
                     balance=account["balance"])
+                if stale is not None:
+                    capacity = (f"NO | feed stale {stale:.0f}m; "
+                                "waiting for an advancing quote")
                 print(f"[ENTRY_CAPACITY] {capacity}")
             else:
                 print("[ENTRY_CAPACITY] NO | initial balance not anchored yet")
@@ -1258,6 +1287,40 @@ def loop(broker: Broker, state: BotState, config_) -> None:
                           pending_orders=len(orders), floating_pnl=round(floating, 2),
                           entry_capacity=capacity)
             print_management_alerts(state, positions, orders)
+
+            # A frozen quote cannot produce a new closed bar. Calling pass_once
+            # here used to ask MT5 for history anyway; over the weekend that call
+            # could remain blocked until Monday, so the first live signal after
+            # reopen was already several bars old when the loop returned. Fast
+            # split polling also burned the terminal request allowance while no
+            # fill or BE trigger could occur. Broker-side SL/TP remain active, so
+            # checkpoint reads already made by this heartbeat and wait for a new
+            # tick before touching history again.
+            if stale is not None:
+                if not feed_was_stale:
+                    journal.write(JOURNAL_PATH, "feed_stale",
+                                  server_time=server_time,
+                                  stale_minutes=round(stale, 1))
+                feed_was_stale = True
+                checkpoint_state(broker, state)
+                time.sleep(STALE_FEED_RECHECK_SECONDS)
+                continue
+
+            # Scan immediately on the first advancing tick. Waiting for the next
+            # scheduled close here can age the newest closed bar from fresh to
+            # stale and lose exactly the entry the recovery was meant to catch.
+            if feed_was_stale:
+                feed_was_stale = False
+                print(status_line(
+                    "FEED_RESTORED",
+                    "quotes are advancing again | scanning closed bars now",
+                    "ok"))
+                journal.write(JOURNAL_PATH, "feed_restored",
+                              server_time=server_time)
+                pass_once(broker, state, config_)
+                reconnect_failures = 0
+                continue
+
             sleep_and_manage_split(broker, state, config_, sleep_seconds)
             pass_once(broker, state, config_)
             reconnect_failures = 0

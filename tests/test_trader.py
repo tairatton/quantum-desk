@@ -1707,6 +1707,80 @@ class ReconnectTests(unittest.TestCase):
                 run.loop(broker, BotState(), config_)
         self.assertEqual(broker.reconnects, 0)
 
+    def test_stale_feed_skips_history_and_scans_immediately_when_restored(self):
+        """Weekend quotes must not enter a blocking history call or age the
+        first post-reopen signal by waiting for one more bar close."""
+        class LoopBroker:
+            dry_run = True
+            requests = 0
+            spec = GOLD
+
+            def __init__(self):
+                self.stale = iter((25.0, None))
+                self.now = datetime(2026, 8, 3, 0, 0)
+
+            def account(self):
+                return {"login": 1, "server": "test"}
+
+            def tick(self):
+                moment = self.now
+                self.now += timedelta(minutes=5)
+                return {"server_time": moment}
+
+            def positions(self):
+                return []
+
+            def pending_orders(self):
+                return []
+
+            def feed_stale_minutes(self):
+                return next(self.stale)
+
+            def take_requests(self):
+                return 0
+
+        broker = LoopBroker()
+        state = BotState()
+        config_ = SimpleNamespace(
+            symbol="XAUUSDm", timeframes=("M15",),
+            entry_grace_seconds=20, initial_balance=0.0,
+        )
+        with tempfile.TemporaryDirectory() as directory, \
+                mock.patch.object(run, "JOURNAL_PATH", Path(directory) / "journal.jsonl"), \
+                mock.patch.object(run, "STATE_PATH", Path(directory) / "state.json"), \
+                mock.patch.object(run.time, "sleep") as sleep, \
+                mock.patch.object(run, "sleep_and_manage_split") as managed_sleep, \
+                mock.patch.object(run, "pass_once",
+                                  side_effect=KeyboardInterrupt()) as scan:
+            with redirect_stdout(io.StringIO()):
+                run.loop(broker, state, config_)
+
+        sleep.assert_called_once_with(run.STALE_FEED_RECHECK_SECONDS)
+        managed_sleep.assert_not_called()
+        scan.assert_called_once_with(broker, state, config_)
+
+    def test_missed_entry_is_recorded_once_without_becoming_a_trade(self):
+        state = BotState()
+        missed = intent()
+        missed = replace(missed, action=signals.WAIT,
+                         bars_since_signal=7,
+                         reason="already running")
+
+        with tempfile.TemporaryDirectory() as directory, \
+                mock.patch.object(run, "JOURNAL_PATH", Path(directory) / "journal.jsonl"), \
+                redirect_stdout(io.StringIO()):
+            run._record_missed_entry(state, missed)
+
+            rows = [json.loads(line) for line in
+                    (Path(directory) / "journal.jsonl").read_text().splitlines()]
+
+        self.assertIn(missed.plan_id, state.seen_plan_ids)
+        self.assertNotIn(missed.plan_id, state.trades)
+        self.assertEqual(rows[-1]["event"], "entry_missed")
+        self.assertEqual(rows[-1]["bars_since_signal"], 7)
+        self.assertFalse(rows[-1]["dry_run"])
+        self.assertIn("late entry not sent", rows[-1]["reason"])
+
     def test_connection_loss_checkpoints_requests_before_reconnect(self):
         class LoopBroker:
             dry_run = True
