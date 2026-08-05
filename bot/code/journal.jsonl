@@ -314,7 +314,6 @@
 {"at": "2026-08-02T21:42:16", "event": "heartbeat", "mode": "LIVE", "server_time": "2026-07-31 23:49:58", "positions": 3, "pending_orders": 0, "floating_pnl": -140.96, "entry_capacity": "NO | requests 1928/2000"}
 {"at": "2026-08-02T21:52:39", "event": "heartbeat", "mode": "LIVE", "server_time": "2026-07-31 23:49:58", "positions": 3, "pending_orders": 0, "floating_pnl": -140.96, "entry_capacity": "NO | requests 1947/2000"}
 {"at": "2026-08-02T22:03:02", "event": "heartbeat", "mode": "LIVE", "server_time": "2026-07-31 23:49:58", "positions": 3, "pending_orders": 0, "floating_pnl": -140.96, "entry_capacity": "NO | requests 1966/2000"}
-{"at": "2026-08-03T19:34:21", "event": "trade_closed", "plan_id": "M15@2026-07-31 16:30:00", "timeframe": "M15", "profit": -386.52, "costs": -2.92, "r": -1.9511, "breakeven_done": false}
 {"at": "2026-08-03T19:34:23", "event": "heartbeat", "mode": "LIVE", "server_time": "2026-08-03 15:34:21", "positions": 0, "pending_orders": 0, "floating_pnl": 0, "entry_capacity": "YES | capacity only | setups 0/2 | risk 0.00/1.50% | next 1.00% nominal | allowed side BUY/SELL"}
 {"at": "2026-08-03T19:36:24", "event": "status_checked", "mode": "DRY-RUN", "login": 1514115848, "server": "FTMO-Demo"}
 {"at": "2026-08-03T19:36:40", "event": "startup_sync", "login": 1514115848, "server": "FTMO-Demo", "managed_trades": 0, "position_tickets": [], "pending_tickets": [], "market_order_tickets": []}
