@@ -8,8 +8,8 @@ goes all the way down:
     bot/   TopStep   ProjectX API   CME futures, sized in whole contracts
     engine/       shared    -              sizing, state, journal, news, sessions
 
-Each instance keeps its own settings, state file, journal and single-instance
-lock, so one can be stopped, repaired or breached without touching the other.
+Each tree keeps its own settings, state file, journal and single-instance lock,
+so one can be stopped, repaired or breached without touching the other.
 The two prop firms do not share a rulebook -- FTMO's max loss is static and
 measured from the initial balance, TopStep's trails the highest end-of-day
 balance -- which is exactly why the guardrails live in the venue package rather

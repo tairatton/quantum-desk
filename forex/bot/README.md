@@ -15,7 +15,7 @@ bot/
 └── README.md   # เอกสารนี้
 ```
 
-ไฟล์สำคัญภายใน `bot/code`:
+ไฟล์สำคัญภายใน `forex/bot`:
 
 | ไฟล์ | หน้าที่ |
 |---|---|
@@ -126,7 +126,7 @@ News, Exposure และ Journal ส่วนรายละเอียด posi
 
 | ตัวแปร | Path ปัจจุบัน |
 |---|---|
-| `BOT_DIR` | `bot/code` |
+| `BOT_DIR` | `forex/bot` |
 | `STATE_PATH` | `bot/state.json` |
 | `JOURNAL_PATH` | `bot/journal.jsonl` |
 | `LOCAL_SETTINGS` | `bot/settings.local.json` |

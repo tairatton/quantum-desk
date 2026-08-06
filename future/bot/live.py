@@ -13,6 +13,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 
 if not __package__:
@@ -62,7 +63,11 @@ def main(argv: list[str] | None = None) -> int:
               "          then set COMMISSIONED = True in bot/live.py")
         return 2
 
-    verdict = guardrails.session_open(settings, __import__("datetime").datetime.now())
+    # UTC, not local: `session_open` converts to the exchange clock, and a naive
+    # local timestamp would be taken AS exchange time -- on a Bangkok machine
+    # that is twelve hours out, so the session gate would have been answering
+    # about the wrong half of the day.
+    verdict = guardrails.session_open(settings, datetime.now(timezone.utc))
     print(f"[FUTURES] dry run | {settings.contract_symbol} | "
           f"risk ${settings.risk_dollars:,.0f} | session: {verdict.reason}")
     return 0

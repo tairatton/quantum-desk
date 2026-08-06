@@ -49,6 +49,35 @@ def decide(settings: "Settings", state: "BotState", equity: float) -> RiskDecisi
     return RiskDecision(float(risk), float(drawdown), high_water)
 
 
+def decide_dollars(settings: "Settings", state: "BotState",
+                   equity: float) -> RiskDecision:
+    """The same ladder as `decide`, denominated in dollars.
+
+    Identical rule, different unit -- which is the whole difference between the
+    two venues. FTMO's limits are percentages of initial capital so the forex
+    ladder is in percent; TopStep's are fixed dollar amounts that do not scale
+    with equity, so expressing the same tiers as percentages of a moving balance
+    would make the ladder drift against the rule that ends the account.
+
+    `risk_percent` on the returned decision carries dollars. The field keeps its
+    name so the callers, journal keys and tests read the same at both venues.
+    """
+    initial = float(state.initial_balance or settings.initial_balance or 0.0)
+    high_water = max(float(state.balance_high_water or 0.0), initial)
+    drawdown = max(0.0, high_water - float(equity))
+    if not settings.dynamic_risk_enabled:
+        risk = settings.risk_dollars
+    elif drawdown < settings.dynamic_risk_dd1_dollars:
+        risk = settings.dynamic_risk_max_dollars
+    elif drawdown < settings.dynamic_risk_dd2_dollars:
+        risk = settings.dynamic_risk_tier2_dollars
+    elif drawdown < settings.dynamic_risk_dd3_dollars:
+        risk = settings.dynamic_risk_tier3_dollars
+    else:
+        risk = settings.risk_dollars
+    return RiskDecision(float(risk), float(drawdown), high_water)
+
+
 def fitting_tiers(settings: "Settings", ceiling: float) -> tuple[float, ...]:
     """Configured risk tiers at or below ``ceiling``, largest first."""
     values = (settings.dynamic_risk_max_percent,

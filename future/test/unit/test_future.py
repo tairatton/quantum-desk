@@ -9,14 +9,14 @@ from __future__ import annotations
 
 import sys
 import unittest
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from bot import guardrails, trader                      # noqa: E402
+from bot import guardrails, terminal, trader            # noqa: E402
 from bot.broker import OrderRejected, size_contracts    # noqa: E402
 from bot.settings import Settings                       # noqa: E402
 from engine.signals import Intent                              # noqa: E402
@@ -75,7 +75,20 @@ class SplitTests(unittest.TestCase):
 
     def test_the_remainder_goes_to_the_runner(self):
         self.assertEqual(trader.split_contracts(4, (0.33, 0.33, 0.34)), (1, 1, 2))
-        self.assertEqual(trader.split_contracts(5, (0.33, 0.33, 0.34)), (1, 1, 3))
+
+    def test_a_split_stays_proportional_above_three_contracts(self):
+        # Regression: truncating each leg made 6 contracts come out 1/1/4, a
+        # 17/17/66 split masquerading as 33/33/34, with two thirds of the
+        # position riding to TP3 instead of one third.
+        self.assertEqual(trader.split_contracts(6, (0.33, 0.33, 0.34)), (2, 2, 2))
+        self.assertEqual(trader.split_contracts(9, (0.33, 0.33, 0.34)), (3, 3, 3))
+
+    def test_every_split_sums_to_the_position_and_fills_every_leg(self):
+        for total in range(3, 51):
+            legs = trader.split_contracts(total, (0.33, 0.33, 0.34))
+            self.assertEqual(sum(legs), total, total)
+            self.assertTrue(all(leg >= 1 for leg in legs), total)
+            self.assertLessEqual(max(legs) - min(legs), 1 + total // 30, total)
 
     def test_a_split_that_cannot_fill_every_leg_is_refused(self):
         with self.assertRaises(ValueError):
@@ -133,11 +146,61 @@ class OpenTradeTests(unittest.TestCase):
             trader.open_trade(self.FakeBroker(fail_after=0),
                               settings(risk_dollars=300.0), intent())
 
+    def test_the_survivor_steps_up_to_lock_tp1_after_tp2(self):
+        # Second step of the same technique the forex bot runs. Without it the
+        # futures account trades a different system from the measured one.
+        self.assertAlmostEqual(
+            trader.stop_after_tp2(intent(direction=1), 1.0), 20_051.0)
+        self.assertAlmostEqual(
+            trader.stop_after_tp2(intent(direction=-1), 1.0), 20_049.0)
+
     def test_breakeven_includes_cost_in_the_direction_of_the_trade(self):
         self.assertAlmostEqual(
             trader.stop_after_tp1(intent(direction=1), 20_000.0, 2.0), 20_002.0)
         self.assertAlmostEqual(
             trader.stop_after_tp1(intent(direction=-1), 20_000.0, 2.0), 19_998.0)
+
+
+class DynamicRiskTests(unittest.TestCase):
+    """The forex ladder, in dollars. Same thresholds, same high-water rule."""
+
+    def ladder(self, **overrides) -> Settings:
+        # The top tier is $500, so the exposure cap has to make room for it --
+        # the same validation the forex settings apply, and worth asserting
+        # rather than working around: a ladder whose top tier cannot be taken
+        # is a ladder that lies about the risk it will use.
+        base = dict(dynamic_risk_enabled=True, max_open_risk_dollars=1_000.0)
+        base.update(overrides)
+        return settings(**base)
+
+    def state(self, high_water: float) -> BotState:
+        state = BotState(initial_balance=50_000.0)
+        state.balance_high_water = high_water
+        return state
+
+    def test_full_size_while_close_to_the_high_water_mark(self):
+        risk = trader.risk_for(self.ladder(), self.state(50_000.0), equity=49_900.0)
+        self.assertAlmostEqual(risk, 500.0)          # forex 1.00%
+
+    def test_it_steps_down_as_drawdown_deepens(self):
+        ladder, state = self.ladder(), self.state(50_000.0)
+        self.assertAlmostEqual(trader.risk_for(ladder, state, 49_700.0), 375.0)
+        self.assertAlmostEqual(trader.risk_for(ladder, state, 49_400.0), 250.0)
+        self.assertAlmostEqual(trader.risk_for(ladder, state, 49_100.0), 200.0)
+
+    def test_a_floating_profit_cannot_ratchet_the_high_water_mark(self):
+        # Equity above the closed high water is still full size, but the mark
+        # itself has not moved, so giving it back does not throttle the account.
+        risk = trader.risk_for(self.ladder(), self.state(50_000.0), equity=51_000.0)
+        self.assertAlmostEqual(risk, 500.0)
+
+    def test_a_ladder_whose_top_tier_exceeds_the_exposure_cap_is_refused(self):
+        with self.assertRaises(ValueError):
+            settings(dynamic_risk_enabled=True, max_open_risk_dollars=400.0)
+
+    def test_the_ladder_is_off_by_default(self):
+        self.assertAlmostEqual(
+            trader.risk_for(settings(), self.state(50_000.0), 49_000.0), 200.0)
 
 
 class TrailingMaxLossTests(unittest.TestCase):
@@ -182,18 +245,59 @@ class TrailingMaxLossTests(unittest.TestCase):
 
 
 class SessionTests(unittest.TestCase):
-    def test_entries_are_refused_after_the_flat_by_deadline(self):
+    """The exchange week, on the exchange clock. Dates below are 2026.
+
+    Aug 7 is a Friday, Aug 8 Saturday, Aug 9 Sunday, Aug 10 Monday.
+    """
+
+    def test_entries_are_refused_inside_the_flat_by_window(self):
         verdict = guardrails.session_open(settings(), datetime(2026, 8, 6, 15, 30))
         self.assertFalse(verdict.allowed)
         self.assertIn("flat-by", verdict.reason)
 
     def test_entries_are_refused_during_the_maintenance_halt(self):
-        verdict = guardrails.session_open(settings(), datetime(2026, 8, 6, 16, 30))
-        self.assertFalse(verdict.allowed)
+        self.assertFalse(guardrails.session_open(settings(),
+                                                 datetime(2026, 8, 6, 16, 30)))
 
     def test_the_morning_session_is_open(self):
         self.assertTrue(guardrails.session_open(settings(),
                                                 datetime(2026, 8, 6, 9, 30)))
+
+    def test_the_evening_session_is_open(self):
+        # Regression: a naive "past the deadline" test blocked everything after
+        # 15:10, which threw away the whole overnight session the strategy
+        # trades on M15 and M30.
+        self.assertTrue(guardrails.session_open(settings(),
+                                                datetime(2026, 8, 10, 18, 0)))
+
+    def test_sunday_morning_is_shut(self):
+        # Regression: only Saturday was checked, so Sunday morning read as a
+        # normal session eight hours before the exchange opens.
+        verdict = guardrails.session_open(settings(), datetime(2026, 8, 9, 9, 30))
+        self.assertFalse(verdict.allowed)
+        self.assertIn("Sunday", verdict.reason)
+
+    def test_the_week_opens_sunday_evening(self):
+        self.assertTrue(guardrails.session_open(settings(),
+                                                datetime(2026, 8, 9, 18, 0)))
+
+    def test_friday_evening_does_not_reopen(self):
+        verdict = guardrails.session_open(settings(), datetime(2026, 8, 7, 18, 0))
+        self.assertFalse(verdict.allowed)
+        self.assertIn("week closed", verdict.reason)
+
+    def test_saturday_is_shut(self):
+        self.assertFalse(guardrails.session_open(settings(),
+                                                 datetime(2026, 8, 8, 9, 30)))
+
+    def test_an_aware_timestamp_is_converted_not_reinterpreted(self):
+        # Bangkok 09:30 Monday is 21:30 Sunday in Chicago (UTC+7 vs UTC-5) -- an open
+        # evening session. Passing local wall-clock time as if it were exchange
+        # time answered about the wrong half of the day.
+        bangkok = timezone(timedelta(hours=7))
+        moment = datetime(2026, 8, 10, 9, 30, tzinfo=bangkok)
+        self.assertEqual(guardrails.exchange_now(settings(), moment).hour, 21)
+        self.assertTrue(guardrails.session_open(settings(), moment))
 
 
 class ExposureTests(unittest.TestCase):
@@ -219,3 +323,53 @@ class ExposureTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TerminalTests(unittest.TestCase):
+    """The screen has to render from a state file alone.
+
+    A terminal that needs the network to draw anything is a terminal that is
+    blank exactly when the connection is the problem being diagnosed.
+    """
+
+    def state(self, **overrides) -> BotState:
+        state = BotState(initial_balance=50_000.0)
+        for key, value in overrides.items():
+            setattr(state, key, value)
+        return state
+
+    def test_the_account_panel_renders_without_a_connection(self):
+        lines = terminal.account_panel(settings(), self.state(), None)
+        self.assertTrue(any("no connection" in line for line in lines))
+        self.assertTrue(any("48,000" in line for line in lines))   # the floor
+
+    def test_the_floor_shown_is_the_trailed_one(self):
+        lines = terminal.account_panel(
+            settings(), self.state(eod_balance_high_water=51_500.0), 51_500.0)
+        self.assertTrue(any("49,500" in line for line in lines))
+
+    def mgc(self) -> Settings:
+        """Real MGC economics: 0.10 tick, $1.00 a tick, so $10 an index point.
+
+        The shared `settings()` helper uses round synthetic numbers; this panel
+        is about what the operator will actually see, so it is worth pinning to
+        the contract the bot is configured to trade.
+        """
+        return settings(tick_size=0.10, tick_value=1.00, max_contracts=5)
+
+    def test_the_order_panel_names_the_stop_that_cannot_be_traded(self):
+        # 40 points on MGC is $400 a contract against $200 of risk: no trade,
+        # and the screen has to say so rather than showing a rounded-up 1.
+        lines = terminal.order_panel(self.mgc(), self.state(), 50_000.0)
+        self.assertTrue(any("no trade" in line for line in lines))
+
+    def test_the_order_panel_reports_real_risk_after_rounding(self):
+        lines = terminal.order_panel(self.mgc(), self.state(), 50_000.0)
+        row = next(line for line in lines if "stop 20 pts" in line)
+        self.assertIn("1 contract", row)
+        self.assertIn("$200 real risk", row)
+
+    def test_the_bar_is_plain_text_when_not_a_terminal(self):
+        # stdout is captured under pytest, so no escape codes should appear.
+        self.assertNotIn("\033", terminal.bar(500.0, 2_000.0))
+        self.assertEqual(terminal.bar(0.0, 0.0).strip(), "")

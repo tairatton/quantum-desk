@@ -47,20 +47,41 @@ class ContractPlan:
 
 
 def split_contracts(total: int, weights: tuple[float, ...]) -> tuple[int, ...]:
-    """Divide whole contracts across legs, giving the remainder to the runner.
+    """Divide whole contracts across legs as close to `weights` as integers allow.
 
-    3 contracts on (.33, .33, .34) is 1/1/1. 4 is 1/1/2 -- the extra goes to the
-    last leg, which is the one that runs to TP3, so a rounding remainder adds to
-    the tail of the distribution rather than to the part that exits first. 5 is
-    1/1/3 for the same reason.
+    Largest remainder, not truncation. Truncating each leg and dumping what is
+    left on the runner looks harmless at three contracts and is badly wrong
+    above it: `int(6 * 0.33)` is 1, so six contracts came out 1/1/4 -- a 17/17/66
+    split pretending to be 33/33/34. That is a different exit from the one the
+    lab measured, with two thirds of the position riding to TP3 instead of one.
+
+    3 contracts is 1/1/1, 6 is 2/2/2, and where a remainder genuinely exists it
+    goes to the leg with the largest fractional claim, ties to the runner --
+    which keeps the tail of the distribution rather than the part that exits
+    first.
     """
     if total < len(weights):
         raise ValueError(f"{total} contracts cannot fill {len(weights)} legs")
-    legs = [max(1, int(total * weight)) for weight in weights[:-1]]
-    legs.append(total - sum(legs))
-    if legs[-1] < 1:                    # weights ate the runner; rebalance
-        legs = [1] * (len(weights) - 1)
-        legs.append(total - sum(legs))
+    exact = [total * weight for weight in weights]
+    legs = [max(1, int(value)) for value in exact]
+    remaining = total - sum(legs)
+    # Hand out what integer floors left over, largest fractional part first;
+    # reversed() breaks ties toward the runner.
+    order = sorted(range(len(weights)),
+                   key=lambda i: (exact[i] - int(exact[i]), i), reverse=True)
+    while remaining > 0:
+        for index in order:
+            if remaining <= 0:
+                break
+            legs[index] += 1
+            remaining -= 1
+    while remaining < 0:                # min-1 floors overspent the total
+        for index in reversed(order):
+            if remaining >= 0:
+                break
+            if legs[index] > 1:
+                legs[index] -= 1
+                remaining += 1
     return tuple(legs)
 
 
@@ -157,6 +178,35 @@ def stop_after_tp1(intent: Intent, fill_price: float,
     """
     return (fill_price + cost_points if intent.direction > 0
             else fill_price - cost_points)
+
+
+def stop_after_tp2(intent: Intent, cost_points: float = 0.0) -> float:
+    """Where the last leg's stop goes once TP2 is banked.
+
+    The second step of the same three-leg technique the forex instance runs: the
+    survivor does not sit at breakeven for the rest of the trade, it steps up to
+    lock the TP1 level. Cost is added the same way -- the lock is only a lock if
+    it still covers commission and the slip on the way out.
+
+    This is the step that turns the exit from `be_after_tp1_33_33_34` into the
+    version the lab actually measured (+0.357R on M30 holdout). Leaving it out
+    would mean the futures account runs a different system from the one the
+    simulation priced, which is the exact drift both venues exist to avoid.
+    """
+    target = intent.targets[0]
+    return (target + cost_points if intent.direction > 0
+            else target - cost_points)
+
+
+def risk_for(settings: Settings, state, equity: float) -> float:
+    """Dollars of risk for the next setup, after the drawdown ladder has spoken.
+
+    Same ladder, same thresholds and the same durable high-water mark as the
+    forex instance -- only the unit differs.
+    """
+    from engine.dynamic_risk import decide_dollars
+
+    return decide_dollars(settings, state, equity).risk_percent
 
 
 def open_risk_dollars(settings: Settings, positions, stop_price: float) -> float:

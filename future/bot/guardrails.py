@@ -101,16 +101,30 @@ def session_open(settings: Settings, moment: datetime) -> Verdict:
     is a rule breach.
     """
     local = exchange_now(settings, moment)
-    if local.weekday() == 5:                      # Saturday: no session at all
+    weekday, clock = local.weekday(), local.time()
+    reopen = time(settings.session_break_end_hour, 0)
+    flat_by = time(settings.flat_by_hour, settings.flat_by_minute)
+
+    if weekday == 5:                              # Saturday: no session at all
         return Verdict(False, "exchange closed (Saturday)")
-    break_start = time(settings.session_break_start_hour, 0)
-    break_end = time(settings.session_break_end_hour, 0)
-    if break_start <= local.time() < break_end:
-        return Verdict(False, f"daily maintenance halt "
-                              f"{break_start:%H:%M}-{break_end:%H:%M} exchange time")
-    if local >= flat_deadline(settings, local):
-        return Verdict(False, f"past the flat-by deadline "
-                              f"{settings.flat_by_hour:02d}:{settings.flat_by_minute:02d} "
+    # The week opens Sunday at the same hour the daily halt ends, 17:00 CT.
+    # Checking only for Saturday let Sunday morning through as a normal session,
+    # eight hours before the exchange is open.
+    if weekday == 6:
+        if clock < reopen:
+            return Verdict(False, f"exchange closed until Sunday "
+                                  f"{reopen:%H:%M} exchange time")
+        return ALLOWED
+    # Friday's flat deadline ends the week: there is no evening session to
+    # reopen into, so the gap runs to Sunday rather than to 17:00.
+    if weekday == 4 and clock >= flat_by:
+        return Verdict(False, f"week closed at {flat_by:%H:%M} Friday exchange time")
+    # Every other weekday: flat by 15:10, dark until the 17:00 reopen, then the
+    # evening session is a normal session. Blocking everything after 15:10 --
+    # which is what a naive "past the deadline" test does -- would throw away
+    # the entire overnight session the strategy trades on M15 and M30.
+    if flat_by <= clock < reopen:
+        return Verdict(False, f"flat-by window {flat_by:%H:%M}-{reopen:%H:%M} "
                               f"exchange time")
     return ALLOWED
 

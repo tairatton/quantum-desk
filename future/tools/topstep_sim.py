@@ -61,6 +61,12 @@ WINNING_DAY = 150.0                       # a day counts as a win at +$150 net
 # --- the bot's own, tighter stop -------------------------------------------
 INTERNAL_DAILY_STOP = 400.0
 
+# The drawdown ladder, in dollars: the same tiers the forex instance runs as
+# 1.00 / 0.75 / 0.50 / 0.40% of a 50,000 account, stepping down as the account
+# draws down from its closed high-water mark. `--ladder` prices the technique as
+# the bot would actually run it; a flat `--risk` prices a single tier.
+LADDER = ((250.0, 500.0), (500.0, 375.0), (750.0, 250.0), (float("inf"), 200.0))
+
 
 def daily_r(symbol: str, timeframe: str) -> np.ndarray:
     """Daily R totals over the stream's holdout span, including flat days."""
@@ -109,6 +115,74 @@ def daily_dollars(scenario: str, risk_dollars: float, corr: float,
         total = sum((1 - corr) * rng.choice(pool, size=shape)
                     + corr * np.quantile(pool, quantile) for pool in streams)
     return total * risk_dollars
+
+
+def ladder_risk(drawdown: np.ndarray) -> np.ndarray:
+    """Risk in dollars for each path, from its current drawdown."""
+    risk = np.full(drawdown.shape, LADDER[-1][1])
+    for threshold, size in reversed(LADDER[:-1]):
+        risk = np.where(drawdown < threshold, size, risk)
+    return risk
+
+
+def simulate_ladder(scenario: str, corr: float, internal_stop: float,
+                    seed: int = 41) -> dict:
+    """Walk the account day by day so the ladder can respond to drawdown.
+
+    The flat-risk simulation multiplies a whole matrix at once, which cannot
+    express a size that depends on where the account already is. This one pays
+    for the loop: each day is sized from the previous day's drawdown against the
+    closed high-water mark, exactly as `engine.dynamic_risk.decide_dollars` does.
+    """
+    rng = np.random.default_rng(seed)
+    streams = pools(scenario)
+    shape = (NSIM, MAXDAYS)
+    quantile = rng.random(shape)
+    unit = sum((1 - corr) * rng.choice(pool, size=shape)
+               + corr * np.quantile(pool, quantile) for pool in streams)
+
+    balance = np.full(NSIM, ACCOUNT_SIZE)
+    high_water = np.full(NSIM, ACCOUNT_SIZE)
+    floor = np.full(NSIM, ACCOUNT_SIZE - MAX_LOSS_LIMIT)
+    best_day = np.zeros(NSIM)
+    worst_day = np.zeros(NSIM)
+    alive = np.ones(NSIM, dtype=bool)
+    passed = np.zeros(NSIM, dtype=bool)
+    failed = np.zeros(NSIM, dtype=bool)
+    pass_day = np.full(NSIM, MAXDAYS + 10)
+    peak_balance = balance.copy()
+    max_dd = np.zeros(NSIM)
+
+    for day in range(MAXDAYS):
+        risk = ladder_risk(np.maximum(0.0, high_water - balance))
+        pnl = np.maximum(unit[:, day] * risk, -min(internal_stop, DAILY_LOSS_LIMIT))
+        balance = np.where(alive, balance + pnl, balance)
+        best_day = np.where(alive, np.maximum(best_day, pnl), best_day)
+        worst_day = np.where(alive, np.minimum(worst_day, pnl), worst_day)
+        peak_balance = np.maximum(peak_balance, balance)
+        max_dd = np.maximum(max_dd, peak_balance - balance)
+
+        breached = alive & (balance <= floor)
+        failed |= breached
+        alive &= ~breached
+
+        required = np.maximum(PROFIT_TARGET, best_day / CONSISTENCY_SHARE)
+        won = alive & ((balance - ACCOUNT_SIZE) >= required)
+        pass_day = np.where(won & ~passed, day + 1, pass_day)
+        passed |= won
+        alive &= ~won
+
+        high_water = np.maximum(high_water, balance)
+        floor = np.maximum(floor, np.minimum(balance - MAX_LOSS_LIMIT, ACCOUNT_SIZE))
+
+    pick = lambda values, q: int(np.quantile(values, q)) if len(values) else -1
+    return {"scenario": scenario, "risk": -1, "pass": passed.mean(),
+            "fail": failed.mean(), "unresolved": (~passed & ~failed).mean(),
+            "days_med": pick(pass_day[passed], .5),
+            "days_p90": pick(pass_day[passed], .9),
+            "dd_med": float(np.median(max_dd)), "dd_p95": float(np.quantile(max_dd, .95)),
+            "worst_day": float(np.quantile(worst_day, .05)),
+            "best_day_med": float(np.median(best_day))}
 
 
 def apply_daily_stops(days: np.ndarray, internal_stop: float) -> np.ndarray:
@@ -202,7 +276,8 @@ def report(risks, scenarios, corr: float, require_winning_days: int,
           f"{'best day':>10s}")
     for scenario in scenarios:
         for risk in risks:
-            m = simulate(scenario, risk, corr, require_winning_days, internal_stop)
+            m = (simulate_ladder(scenario, corr, internal_stop) if risk < 0
+                 else simulate(scenario, risk, corr, require_winning_days, internal_stop))
             print(f"{m['scenario']:12s}{m['risk']:7.0f}{m['pass']:8.1%}{m['fail']:8.1%}"
                   f"{m['unresolved']:7.1%}"
                   f"{f'{m['days_med']}/{m['days_p90']}':>12s}"
@@ -219,6 +294,8 @@ def main() -> None:
     parser.add_argument("--corr", type=float, default=0.3)
     parser.add_argument("--nsim", type=int, default=NSIM)
     parser.add_argument("--internal-stop", type=float, default=INTERNAL_DAILY_STOP)
+    parser.add_argument("--ladder", action="store_true",
+                        help="size with the drawdown ladder instead of flat risk")
     parser.add_argument("--require-winning-days", type=int, default=0,
                         help="sources disagree on whether the Combine still "
                              "needs winning days; 0 = target only")
@@ -228,7 +305,7 @@ def main() -> None:
     if args.nsim < 100:
         parser.error("--nsim must be at least 100")
     NSIM = args.nsim
-    report(args.risk or (100.0, 150.0, 200.0, 300.0),
+    report([-1.0] if args.ladder else args.risk or (100.0, 150.0, 200.0, 300.0),
            args.scenario or ("holdout", "validation", "train"),
            args.corr, args.require_winning_days, args.internal_stop)
 

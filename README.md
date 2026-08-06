@@ -28,6 +28,9 @@ stray environment variable: the forex tree reads `BOT_*`, the futures tree reads
 The cost of that separation is duplication: `engine/` and `strategy/` exist in
 both trees, so a fix in one is not a fix in the other.
 
+Full system documentation — what it does, measured results, and every
+known risk — is in [DOCUMENT.md](DOCUMENT.md).
+
 ## Running
 
 ```bash
@@ -41,6 +44,8 @@ python tools/ftmo_portfolio_sim.py  # pass rate and drawdown against FTMO rules
 
 ```bash
 cd future
+python -m bot.terminal              # menu: status, connection test, kill switch
+python -m bot.terminal --status --offline   # one status screen, no network
 python -m bot.live --check          # read-only ProjectX connection test
 python -m bot.live                  # dry run
 python -m pytest test/unit -q

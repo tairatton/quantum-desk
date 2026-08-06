@@ -64,6 +64,20 @@ class Settings:
     risk_dollars: float = 200.0
     max_open_risk_dollars: float = 400.0
     max_concurrent_trades: int = 2
+    # The same drawdown ladder the forex instance runs, in dollars instead of
+    # percent. `risk_dollars` stays the defensive floor; close to the realised
+    # balance high-water mark the bot may start larger, then steps down as the
+    # account draws down. The tiers below mirror the forex ratios exactly --
+    # 1.00 / 0.75 / 0.50 / 0.40% of a 50,000 account -- because the technique is
+    # meant to be identical at both venues and only the arithmetic differs.
+    dynamic_risk_enabled: bool = False
+    dynamic_risk_max_dollars: float = 500.0      # forex 1.00%
+    dynamic_risk_tier2_dollars: float = 375.0    # forex 0.75%
+    dynamic_risk_tier3_dollars: float = 250.0    # forex 0.50%
+    dynamic_risk_dd1_dollars: float = 250.0      # forex 0.50% drawdown
+    dynamic_risk_dd2_dollars: float = 500.0      # forex 1.00%
+    dynamic_risk_dd3_dollars: float = 750.0      # forex 1.50%
+    dynamic_risk_fit_remaining: bool = True
 
     # --- TopStep account rules ---------------------------------------------
     # ESTIMATES for a 50K Combine, and the single most important thing to verify
@@ -164,8 +178,21 @@ class Settings:
             errors.append("max_contracts must be >= min_contracts")
         if self.risk_dollars <= 0:
             errors.append("risk_dollars must be > 0")
-        if self.max_open_risk_dollars < self.risk_dollars:
-            errors.append("max_open_risk_dollars must be >= risk_dollars")
+        peak_risk = (self.dynamic_risk_max_dollars if self.dynamic_risk_enabled
+                     else self.risk_dollars)
+        if self.max_open_risk_dollars < peak_risk:
+            errors.append("max_open_risk_dollars must be >= the maximum per-setup risk")
+        if self.dynamic_risk_enabled:
+            tiers = (self.dynamic_risk_max_dollars, self.dynamic_risk_tier2_dollars,
+                     self.dynamic_risk_tier3_dollars, self.risk_dollars)
+            if not all(value > 0 for value in tiers):
+                errors.append("dynamic risk tiers must be positive")
+            if not all(a >= b for a, b in zip(tiers, tiers[1:])):
+                errors.append("dynamic risk tiers must decrease toward risk_dollars")
+            ladder = (self.dynamic_risk_dd1_dollars, self.dynamic_risk_dd2_dollars,
+                      self.dynamic_risk_dd3_dollars)
+            if not (0 < ladder[0] < ladder[1] < ladder[2]):
+                errors.append("dynamic risk drawdown thresholds must increase")
         if not 0 < self.internal_daily_stop_dollars <= self.daily_loss_limit_dollars:
             errors.append("internal_daily_stop_dollars must be > 0 and "
                           "<= daily_loss_limit_dollars")
