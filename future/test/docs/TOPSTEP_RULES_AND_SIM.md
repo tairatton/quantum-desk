@@ -45,7 +45,11 @@ Pass probability, by risk per trade and by which regime the edge is in:
 At $200 risk in the current regime the Combine passes in **20 trading days**
 (median), 33 at p90; in the flat regime, 32 and 59.
 
-### What happens as the edge decays (risk $200, current-regime shape)
+### Historical decay comparison (not an acceptance benchmark)
+
+The table below is retained as a historical, pre-room-aware snapshot. It does
+not define the current simulator's result: rerun `tools/topstep_sim.py` with a
+fixed seed and the documented parameters before quoting decay percentages.
 
 | Expectancy/trade | Pass | Fail |
 |---|---|---|

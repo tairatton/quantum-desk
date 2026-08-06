@@ -149,8 +149,8 @@ def resolve_technique(report: dict) -> str:
     return backtest_reporting.select_technique(report)
 
 
-def load_stream(key: str, scenario: str) -> tuple[np.ndarray, float, float]:
-    """Daily R totals over the stream's own holdout span, including flat days."""
+def load_stream(key: str, scenario: str) -> tuple[np.ndarray, np.ndarray, float, float]:
+    """Daily R totals and an explicit traded-day mask over the holdout span."""
     symbol, timeframe, cost = STREAMS[key]
     report = backtest_reporting.load_report(
         backtest_reporting.report_path(symbol, timeframe))
@@ -172,21 +172,47 @@ def load_stream(key: str, scenario: str) -> tuple[np.ndarray, float, float]:
     span = pd.DatetimeIndex([d for d in span if d.dayofweek < 5 or d.date() in traded])
     days = pd.Series(0.0, index=span.date)
     days.loc[list(by_day.index)] = by_day.values
-    return days.to_numpy(), len(series) / len(days), metrics[scenario]["expectancy_r"] - cost
+    traded_mask = pd.Series(False, index=span.date)
+    traded_mask.loc[list(by_day.index)] = True
+    return (days.to_numpy(), traded_mask.to_numpy(), len(series) / len(days),
+            metrics[scenario]["expectancy_r"] - cost)
 
 
-def portfolio_days(pools, risk_pct: float, corr: float, rng) -> np.ndarray:
-    """(NSIM, MAXDAYS) matrix of portfolio daily percent returns."""
+def _sample_pool(pool, shape: tuple[int, int], rng,
+                 shared_quantile: np.ndarray | None = None,
+                 correlation: float = 0.0):
+    """Sample values and their source-day mask without inferring trades from P&L."""
+    values, traded, _weight, _expectancy = pool
+    indices = rng.integers(0, len(values), size=shape)
+    independent = values[indices]
+    independent_traded = traded[indices]
+    if shared_quantile is None:
+        return independent, independent_traded
+    order = np.argsort(values)
+    shared_indices = order[np.minimum(
+        (shared_quantile * len(order)).astype(int), len(order) - 1)]
+    correlated = values[shared_indices]
+    correlated_traded = traded[shared_indices]
+    return ((1.0 - correlation) * independent + correlation * correlated,
+            independent_traded | correlated_traded)
+
+
+def portfolio_days(pools, risk_pct: float, corr: float, rng,
+                   return_traded: bool = False):
+    """(NSIM, MAXDAYS) returns, optionally with explicit traded-day mask."""
     shape = (NSIM, MAXDAYS)
     if corr <= 0:
-        total = sum(rng.choice(pool[0], size=shape) for pool in pools)
+        samples = [_sample_pool(pool, shape, rng) for pool in pools]
     else:
         # Blend an independent draw with a shared-quantile draw so every stream
         # has its good and bad days at the same time in the correlated part.
         quantile = rng.random(shape)
-        total = sum((1 - corr) * rng.choice(pool[0], size=shape)
-                    + corr * np.quantile(pool[0], quantile) for pool in pools)
-    return total * risk_pct
+        samples = [_sample_pool(pool, shape, rng, quantile, corr)
+                   for pool in pools]
+    total = sum(values for values, _traded in samples)
+    traded = np.logical_or.reduce([mask for _values, mask in samples])
+    result = total * risk_pct
+    return (result, traded) if return_traded else result
 
 
 def path_drawdown(days_pct: np.ndarray) -> np.ndarray:
@@ -202,12 +228,55 @@ def path_drawdown(days_pct: np.ndarray) -> np.ndarray:
     return (peak - cum).max(1)
 
 
-def resolve_phase(days_pct: np.ndarray, target: float):
-    """-> (passed mask, trading day the target was hit, breached mask)."""
+INTERNAL_DAILY_STOP = 1.50      # percent; the live bot stands down here
+MIN_TRADING_DAYS = 4            # FTMO 2-Step, applied to EACH phase
+
+
+def apply_internal_stop(days_pct: np.ndarray,
+                        internal_stop: float = INTERNAL_DAILY_STOP) -> np.ndarray:
+    """Clip each day's NET loss at the internal daily stop the live bot enforces.
+
+    The simulation used to model only FTMO's own 5% daily breach, so it kept
+    trading tails the live bot would never see: a -3% day is not a thing this
+    system can produce, because it stands down at -1.50%.
+
+    APPROXIMATION, in the same way the futures simulator's is: the stop is a
+    rule about the ORDER of trades inside a day, and this only sees the day's
+    net. A day that goes -1.8% and recovers to -0.5% is left alone here, while
+    the live bot would have stopped at -1.50% and never taken the recovery. The
+    three-consecutive-loss stand-down is likewise not modelled -- it needs the
+    trade sequence, which `load_stream` has already summed away.
+
+    Both omissions point the same way: results are OPTIMISTIC about recoveries.
+    """
+    return np.maximum(days_pct, -abs(internal_stop))
+
+
+def resolve_phase(days_pct: np.ndarray, target: float,
+                  min_days: int = MIN_TRADING_DAYS,
+                  traded_mask: np.ndarray | None = None):
+    """-> (passed mask, trading day the target was hit, breached mask).
+
+    `min_days` is FTMO's minimum trading day count and applies to EACH phase
+    independently. Without it a path that reached +10% on day one passed on day
+    one, which is not an outcome FTMO offers: the objective is the target AND
+    four trading days, so the earliest possible pass is day four.
+    """
     cum = np.cumsum(days_pct, axis=1)
     never = days_pct.shape[1] + 10
     first = lambda mask: np.where(mask.any(1), mask.argmax(1), never)
-    hit = first(cum >= target)
+    if traded_mask is None:
+        # Backwards-compatible direct-call behavior. Production simulation
+        # passes the explicit source-day mask from `portfolio_days` below.
+        traded_mask = days_pct != 0.0
+    traded_mask = np.asarray(traded_mask, dtype=bool)
+    if traded_mask.shape != days_pct.shape:
+        raise ValueError("traded_mask must have the same shape as days_pct")
+    traded = np.cumsum(traded_mask, axis=1)
+    eligible = cum >= target
+    if min_days:
+        eligible &= traded >= min_days
+    hit = first(eligible)
     blown = first(cum <= -MAX_LIMIT)
     daily = first(days_pct <= -DAILY_LIMIT)
     breach = np.minimum(blown, daily)
@@ -217,18 +286,24 @@ def resolve_phase(days_pct: np.ndarray, target: float):
 def simulate(keys: list[str], scenario: str, risk_pct: float, corr: float, seed: int = 41) -> dict:
     rng = np.random.default_rng(seed)
     pools = [load_stream(key, scenario) for key in keys]
-    step1 = portfolio_days(pools, risk_pct, corr, rng)
+    step1_raw, traded1 = portfolio_days(pools, risk_pct, corr, rng,
+                                        return_traded=True)
+    step1 = apply_internal_stop(step1_raw)
     dd = path_drawdown(step1)
-    passed1, day1, failed1 = resolve_phase(step1, STEP_TARGETS[0])
+    passed1, day1, failed1 = resolve_phase(step1, STEP_TARGETS[0],
+                                           traded_mask=traded1)
     # Verification is a fresh account, so draw an independent set of paths.
-    passed2, day2, _ = resolve_phase(portfolio_days(pools, risk_pct, corr, rng), STEP_TARGETS[1])
+    step2_raw, traded2 = portfolio_days(pools, risk_pct, corr, rng,
+                                        return_traded=True)
+    passed2, day2, _ = resolve_phase(
+        apply_internal_stop(step2_raw), STEP_TARGETS[1], traded_mask=traded2)
     both = passed1 & passed2
     total = np.where(both, day1 + day2, 0)
-    weights = [pool[1] for pool in pools]
+    weights = [pool[2] for pool in pools]
     pick = lambda values, q: int(np.quantile(values, q)) if len(values) else -1
     return {
         "trades_per_day": sum(weights),
-        "expectancy_r": float(np.average([pool[2] for pool in pools], weights=weights)),
+        "expectancy_r": float(np.average([pool[3] for pool in pools], weights=weights)),
         "r_per_day": sum(pool[0].mean() for pool in pools),
         "step1": passed1.mean(), "breach": failed1.mean(), "two_step": both.mean(),
         "d1_med": pick(day1[passed1], .5), "d1_p90": pick(day1[passed1], .9),
@@ -245,7 +320,11 @@ def report_books(risks=(0.25, 0.40, 0.50), corr: float = 0.3,
     for scenario, label in SCENARIOS:
         print(f"\n{'=' * 118}\n{label}   [FTMO 2-Step: {STEP_TARGETS[0]:.0f}% then "
               f"{STEP_TARGETS[1]:.0f}%, daily {DAILY_LIMIT:.0f}%, max {MAX_LIMIT:.0f}%, "
-              f"corr={corr}]\n{'=' * 118}")
+              f"corr={corr}, internal stop {INTERNAL_DAILY_STOP:.2f}%, "
+              f"{MIN_TRADING_DAYS} min trading days]\n{'=' * 118}")
+        print("  daily-net approximation: the internal stop clips a day\'s NET "
+              "result, not its trade sequence, and the 3-loss stand-down is not "
+              "modelled, so results are optimistic.")
         print(f"{'book':24s} {'risk':>5s} {'trd/d':>6s} {'expR':>7s} {'R/day':>7s} "
               f"{'step1':>7s} {'breach':>7s} {'2-step':>7s} {'days step1':>12s} "
               f"{'days total':>12s} {'worst day':>10s} {'dd med':>7s} {'dd p99':>7s} "

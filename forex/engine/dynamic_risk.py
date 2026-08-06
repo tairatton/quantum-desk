@@ -8,11 +8,22 @@ restart must never turn a drawdown account back into a fresh 1% account.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Protocol
 
 if TYPE_CHECKING:
-    from bot.settings import Settings
     from .state import BotState
+
+
+class Settings(Protocol):
+    """What the ladder needs from a venue's settings, declared structurally.
+
+    `engine` must not import `bot`, and "only for typing" is not an exemption:
+    the import still makes static tooling resolve the venue layer from inside
+    the shared one, and it is the first step of a real dependency. A Protocol
+    says the same thing about the shape without naming the class.
+    """
+
+    dynamic_risk_enabled: bool
 
 
 @dataclass(frozen=True)

@@ -1,4 +1,0 @@
-# Reproducible minimal environment for the live MT5 bot (Python 3.13).
-MetaTrader5==5.0.5735
-pandas==2.3.3
-numpy==2.3.5

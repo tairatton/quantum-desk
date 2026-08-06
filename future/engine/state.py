@@ -17,30 +17,37 @@ from zoneinfo import ZoneInfo
 
 
 _REPLACE_RETRY_DELAYS = (0.02, 0.05, 0.10, 0.20, 0.40, 0.80)
-FTMO_TIMEZONE = ZoneInfo("Europe/Prague")
+
+# TopStep's trading day is the CME day: it starts at 17:00 America/Chicago and
+# the daily loss limit resets there. This copy of the module used to carry
+# FTMO's Europe/Prague midnight, inherited wholesale from the forex tree, which
+# would have anchored `day_start_balance` seven hours into the session and reset
+# the daily counter in the middle of the US afternoon.
+EXCHANGE_TIMEZONE = ZoneInfo("America/Chicago")
+TRADING_DAY_START_HOUR = 17
 
 
-def ftmo_day(server_time: datetime, server_utc_offset: float) -> date:
-    """Return the official evaluation day at FTMO's 00:00 CE(S)T boundary."""
-    utc = (server_time - timedelta(hours=float(server_utc_offset))).replace(
-        tzinfo=timezone.utc)
-    return utc.astimezone(FTMO_TIMEZONE).date()
+def trading_day(moment: datetime) -> date:
+    """The TopStep trading day containing `moment`.
 
-
-def ftmo_day_start_server(server_time: datetime,
-                          server_utc_offset: float) -> datetime:
-    """Return the current FTMO midnight expressed in broker-server time.
-
-    Europe/Prague changes between CET and CEST while a broker can use a
-    different DST schedule. Converting through UTC keeps the boundary correct
-    instead of assuming that broker midnight and FTMO midnight are identical.
+    A naive timestamp is taken to be UTC rather than local: the machine running
+    this is not in Chicago, and guessing its clock is how a session boundary
+    ends up half a day out.
     """
-    evaluation_day = ftmo_day(server_time, server_utc_offset)
-    local_midnight = datetime.combine(
-        evaluation_day, datetime.min.time(), tzinfo=FTMO_TIMEZONE,
-    )
-    utc_midnight = local_midnight.astimezone(timezone.utc).replace(tzinfo=None)
-    return utc_midnight + timedelta(hours=float(server_utc_offset))
+    aware = moment.replace(tzinfo=timezone.utc) if moment.tzinfo is None else moment
+    local = aware.astimezone(EXCHANGE_TIMEZONE)
+    # 17:00 onward already belongs to the next calendar day's session.
+    if local.hour >= TRADING_DAY_START_HOUR:
+        return (local + timedelta(days=1)).date()
+    return local.date()
+
+
+def trading_day_start(moment: datetime) -> datetime:
+    """The 17:00 America/Chicago open of the trading day containing `moment`."""
+    day = trading_day(moment)
+    return datetime.combine(day - timedelta(days=1),
+                            datetime.min.time().replace(hour=TRADING_DAY_START_HOUR),
+                            tzinfo=EXCHANGE_TIMEZONE)
 
 
 @dataclass
@@ -103,11 +110,13 @@ class ManagedTrade:
 
 @dataclass
 class BotState:
-    # A state file belongs to exactly one broker account. Without this binding,
-    # switching from a demo to a Challenge could carry the old initial balance,
-    # trading days and tickets into the new account.
-    account_login: int | None = None
-    account_server: str = ""
+    # A state file belongs to exactly one account. Without this binding,
+    # switching from a demo to a Combine could carry the old initial balance,
+    # trading days and tickets into the new account. ProjectX identifies an
+    # account by a numeric id and a name; `account_login`/`account_server` are
+    # kept as the storage for those two so an existing state file still loads.
+    account_login: int | None = None       # ProjectX account id
+    account_server: str = ""               # ProjectX account name
     initial_balance: float = 0.0
     # Highest closed balance observed on this account. Dynamic risk compares
     # current equity against it, and persistence prevents a restart from
@@ -122,7 +131,12 @@ class BotState:
     # Last offset measured from a live tick. Kept because it cannot be measured
     # while the market is closed, and the news calendar needs it to line up.
     server_utc_offset: float | None = None
-    day_key: str = ""                  # FTMO Europe/Prague calendar day
+    day_key: str = ""                  # TopStep trading day, 17:00 CT boundary
+    # Best and worst completed-day P&L, durable because the consistency rule is
+    # scored across the whole evaluation: a restart that forgot the best day
+    # would report a $3,000 target that the rule has already raised.
+    best_day_profit: float = 0.0
+    worst_day_loss: float = 0.0
     day_start_balance: float = 0.0
     # Retained for diagnostics/backward compatibility. The 2-Step loss floor
     # uses day_start_balance, never the higher opening equity.
@@ -134,9 +148,9 @@ class BotState:
     consecutive_losses: int = 0
     halted_forever: bool = False       # max loss breached: never trade again
     halted_reason: str = ""
-    paused_until_day: str = ""         # daily stop hit: resume next FTMO day
-    # Server days on which at least one position was opened. FTMO's 2-Step needs
-    # four of them, so it has to survive restarts like everything else here.
+    paused_until_day: str = ""         # daily stop hit: resume next trading day
+    # Days on which at least one position was opened. Durable like everything
+    # else here so a restart cannot lose evaluation progress.
     trading_days: list[str] = field(default_factory=list)
     seen_plan_ids: list[str] = field(default_factory=list)
     trades: dict[str, ManagedTrade] = field(default_factory=dict)
@@ -214,27 +228,49 @@ class BotState:
         A legacy state with a materially different initial balance is refused:
         that is the tell-tale case of taking a $10K state into a $50K account.
         """
-        login = int(account.get("login") or 0)
-        server = str(account.get("server") or "")
+        # ProjectX returns {"id": .., "name": ..}; the older MT5 shape is still
+        # accepted so an inherited state file and its tests keep working.
+        login = int(account.get("id") or account.get("login") or 0)
+        server = str(account.get("name") or account.get("server") or "")
         balance = float(account.get("balance") or 0.0)
         if login <= 0 or not server:
-            raise ValueError("MT5 account identity is incomplete; refusing LIVE trading")
+            raise ValueError("ProjectX account identity is incomplete "
+                             "(need id and name); refusing LIVE trading")
         if self.account_login is None:
             if self.initial_balance > 0 and balance > 0:
                 difference = abs(balance - self.initial_balance) / self.initial_balance
                 if difference > 0.25:
                     raise ValueError(
                         f"legacy state is anchored at {self.initial_balance:,.2f}, "
-                        f"but MT5 balance is {balance:,.2f}; archive state.json before "
+                        f"but the account balance is {balance:,.2f}; archive state.json before "
                         "using a different account")
             self.account_login = login
             self.account_server = server
             return True
         if self.account_login != login or self.account_server != server:
             raise ValueError(
-                f"state belongs to {self.account_login}@{self.account_server}, "
-                f"but MT5 is {login}@{server}; use a separate state.json")
+                f"state belongs to account {self.account_login} "
+                f"({self.account_server}), but this is {login} ({server}); "
+                f"use a separate state.json")
         return False
+
+    def anchor_initial_balance(self, balance: float) -> bool:
+        """Record the starting balance once, before any limit is evaluated.
+
+        Every TopStep limit is measured from this number, so it cannot be
+        inferred from whatever the balance happens to be at the moment a guard
+        runs. Without it `max_loss_floor` fell back to current balance: a fresh
+        $50,000 account got a $48,000 floor, and the same fresh state at $49,000
+        got a $47,000 floor -- a trailing floor walking DOWNWARD, which is not a
+        rule any firm has.
+        """
+        candidate = float(balance or 0.0)
+        if self.initial_balance > 0 or candidate <= 0:
+            return False
+        self.initial_balance = candidate
+        self.balance_high_water = max(self.balance_high_water, candidate)
+        self.eod_balance_high_water = max(self.eod_balance_high_water, candidate)
+        return True
 
     def observe_balance(self, balance: float) -> bool:
         """Raise the durable realised-balance high-water mark when appropriate."""
@@ -247,26 +283,54 @@ class BotState:
     # -- day handling -----------------------------------------------------
     def roll_day(self, evaluation_day: date, balance: float,
                  equity: float | None = None) -> bool:
-        """Start a new trading day at Europe/Prague midnight.
+        """Start a new trading day at the 17:00 America/Chicago boundary.
 
-        ``evaluation_day`` must be the Europe/Prague calendar date. FTMO
-        2-Step uses balance at 00:00 CE(S)T; floating equity is diagnostic only.
+        ``evaluation_day`` must come from `trading_day()`. The day that is
+        ENDING is closed out first: its final balance sets the end-of-day high
+        water mark that TopStep's max loss trails, and its P&L updates the
+        durable best/worst day the consistency rule is scored on. Neither of
+        those was ever written before, so the trailing floor sat frozen at the
+        starting balance for the life of the account.
 
         The loss streak resets here too. It is a "stand down for the rest of the
-        day" rule, and it can only be cleared by a winning trade — so without
-        this reset a day that ends on the third loss would pause the bot for
-        every day after it as well, with no trade left that could ever clear it.
+        day" rule that can only be cleared by a winning trade — so without this
+        reset a day ending on the third loss would pause every day after it.
         """
         key = evaluation_day.isoformat()
         if key == self.day_key:
             return False
+        if self.day_key:                       # a real day just finished
+            self.close_out_day(balance)
+        elif self.initial_balance <= 0:
+            self.anchor_initial_balance(balance)
         self.day_key = key
         self.day_start_balance = balance
         self.day_start_equity = equity if equity is not None else balance
         self.day_realised = 0.0
         self.day_requests = 0
         self.consecutive_losses = 0
+        self.eod_balance_high_water = max(
+            float(self.eod_balance_high_water or 0.0),
+            float(self.initial_balance or 0.0))
         return True
+
+    def close_out_day(self, closing_balance: float) -> None:
+        """Settle the day that just ended: high-water mark and best/worst day.
+
+        The high water is `max(old, closing balance, initial balance)` and never
+        anything else. Taking it from an intraday figure would let a profit made
+        and given back inside one day ratchet the floor up, which is exactly the
+        difference between TopStep's end-of-day trail and an intraday one.
+        """
+        closing = float(closing_balance or 0.0)
+        self.eod_balance_high_water = max(
+            float(self.eod_balance_high_water or 0.0),
+            closing,
+            float(self.initial_balance or 0.0))
+        if self.day_start_balance:
+            result = closing - float(self.day_start_balance)
+            self.best_day_profit = max(float(self.best_day_profit or 0.0), result)
+            self.worst_day_loss = min(float(self.worst_day_loss or 0.0), result)
 
     @property
     def is_paused_today(self) -> bool:

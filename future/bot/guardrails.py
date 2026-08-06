@@ -44,14 +44,21 @@ def max_loss_floor(settings: Settings, state: BotState,
     starting balance once the account is funded and the rule stops trailing.
     Static: initial balance minus the limit, which is what a Combine that does
     not trail, or FTMO, would use.
+
+    A floor is not meaningful until the durable initial balance is anchored.
+    `fallback_balance` is retained only for API compatibility and is never
+    allowed to become a live trailing anchor. Live code must call
+    `state.anchor_initial_balance()` before any limit is evaluated;
+    `anchored()` below refuses to trade until it has.
     """
-    initial = float(state.initial_balance or settings.initial_balance
-                    or fallback_balance or 0.0)
+    initial = float(state.initial_balance or 0.0)
     if initial <= 0:
         return 0.0
     if not settings.trailing_max_loss:
         return initial - settings.max_loss_limit_dollars
 
+    # The anchor only ever rises: the recorded end-of-day high, never a lower
+    # current balance.
     anchor = max(float(state.eod_balance_high_water or 0.0), initial)
     floor = anchor - settings.max_loss_limit_dollars
     if settings.trailing_stops_at_initial_balance:
@@ -75,6 +82,59 @@ def internal_daily_floor(settings: Settings, state: BotState) -> float:
     if reference <= 0:
         return 0.0
     return reference - settings.internal_daily_stop_dollars
+
+
+def anchored(state: BotState) -> Verdict:
+    """Refuse to trade until the starting balance is on disk.
+
+    Every limit is measured from it. Trading while it is unknown means trading
+    against a floor derived from whatever the balance happens to be, which is
+    the defect this guard exists to make impossible.
+    """
+    if float(state.initial_balance or 0.0) > 0:
+        return ALLOWED
+    return Verdict(False, "initial balance not anchored yet; call "
+                          "state.anchor_initial_balance(balance) before trading")
+
+
+def remaining_room(settings: Settings, state: BotState, equity: float,
+                   fallback_balance: float = 0.0,
+                   include_reserve: bool = True) -> float:
+    """Dollars this account may still risk before the tightest floor is hit.
+
+    The binding constraint is whichever floor is nearest, not the firm's
+    headline max loss: a $2,000 max loss with $100 left above the trailing
+    floor allows a $100 trade, not a $200 one.
+
+    `loss_room_reserve_dollars` is then held back on top of that. Spending the
+    room down to its last dollar leaves the account exactly ON the floor if the
+    stop is hit, which is a breach rather than a near miss -- and the daily
+    model behind those numbers cannot see a gap through the stop at all. The
+    reserve is the difference between "almost never breaches" and "does not
+    breach by taking a trade".
+
+    Pass `include_reserve=False` for display, where the operator wants the raw
+    distance to the floor rather than the tradeable part of it.
+    """
+    if not anchored(state):
+        return 0.0
+    # The reserve guards the floor that ENDS the account, and only that one.
+    # Applying it to the daily floors as well was a real cost for no safety:
+    # hitting a daily limit at TopStep locks the account out for the day, it
+    # does not breach anything, so nothing needs to be held back from it. The
+    # daily stop is already $400 and the reserve was $200, which capped every
+    # trade at $200 -- the ladder's $500, $375 and $250 tiers could never be
+    # reached, and the evaluation took twice as long as it needed to for
+    # protection it was already getting elsewhere.
+    fatal = max_loss_floor(settings, state, fallback_balance)
+    room = float(equity) - fatal
+    if include_reserve:
+        room -= settings.loss_room_reserve_dollars
+    for floor in (daily_loss_floor(settings, state),
+                  internal_daily_floor(settings, state)):
+        if floor:
+            room = min(room, float(equity) - floor)
+    return room
 
 
 def flat_deadline(settings: Settings, now_exchange: datetime) -> datetime:
@@ -135,6 +195,10 @@ def account_health(settings: Settings, state: BotState, equity: float,
     if state.halted_forever:
         return Verdict(False, f"halted: {state.halted_reason}", fatal=True)
 
+    anchor = anchored(state)
+    if not anchor:
+        return anchor
+
     hard_floor = max_loss_floor(settings, state, balance)
     if hard_floor and equity <= hard_floor:
         state.halt(f"max loss breached: equity {equity:,.2f} <= {hard_floor:,.2f}")
@@ -171,10 +235,24 @@ def account_health(settings: Settings, state: BotState, equity: float,
 def can_open(settings: Settings, state: BotState, open_risk_dollars: float,
              open_count: int, pending_count: int,
              proposed_risk_dollars: float | None = None,
-             active_setups: int | None = None) -> Verdict:
-    """Exposure checks for one more entry, in dollars of risk."""
+             active_setups: int | None = None,
+             equity: float | None = None,
+             open_contracts: int = 0,
+             proposed_contracts: int = 0) -> Verdict:
+    """Exposure checks for one more entry, in dollars of risk and in contracts.
+
+    `equity` is required because the nearest loss floor is state-dependent. An
+    omitted balance used to let an account sitting $100 above its trailing
+    floor accept a $200 trade -- and that trade's own stop would end the
+    account. There is no safe live/read-only ambiguity at this entry boundary.
+    """
     if KILL_SWITCH.exists():
         return Verdict(False, f"kill switch present: {KILL_SWITCH.name}")
+    anchor = anchored(state)
+    if not anchor:
+        return anchor
+    if equity is None:
+        return Verdict(False, "equity is required to evaluate remaining loss room")
     exposure_count = (open_count + pending_count
                       if active_setups is None else active_setups)
     if exposure_count >= settings.max_concurrent_trades:
@@ -185,17 +263,58 @@ def can_open(settings: Settings, state: BotState, open_risk_dollars: float,
     if open_risk_dollars + incoming > settings.max_open_risk_dollars:
         return Verdict(False, f"open risk ${open_risk_dollars:,.0f} + ${incoming:,.0f} "
                               f"exceeds ${settings.max_open_risk_dollars:,.0f}")
+
+    if proposed_contracts:
+        verdict = can_hold_contracts(settings, proposed_contracts,
+                                     already_held=open_contracts)
+        if not verdict:
+            return verdict
+
+    if equity is not None:
+        room = remaining_room(settings, state, float(equity))
+        if room <= 0:
+            raw = remaining_room(settings, state, float(equity),
+                                 include_reserve=False)
+            return Verdict(False, f"no room left: ${raw:,.0f} above the nearest "
+                                  f"loss floor, all of it inside the "
+                                  f"${settings.loss_room_reserve_dollars:,.0f} reserve")
+        # Everything already exposed can still lose its stop distance, so the
+        # room has to cover the whole book rather than only the new trade.
+        committed = float(open_risk_dollars) + incoming
+        if committed > room:
+            return Verdict(False, f"${committed:,.0f} of stop risk (open "
+                                  f"${open_risk_dollars:,.0f} + new ${incoming:,.0f}) "
+                                  f"exceeds the ${room:,.0f} left above the nearest "
+                                  f"loss floor")
     return ALLOWED
 
 
-def can_hold_contracts(settings: Settings, contracts: int) -> Verdict:
-    """Scaling-plan check. Exceeding the contract cap is a rule breach itself."""
+def contract_cap(settings: Settings) -> int:
+    """The firm\'s simultaneous-position cap, in the contract actually traded.
+
+    TopStep publishes one limit in two units: 5 minis OR 50 micros. Configuring
+    the mini number while trading a micro understates the cap tenfold, and
+    configuring the micro number without aggregate accounting lets two 50-lot
+    setups through as 100. Both halves matter, so the cap is derived from the
+    contract class here and enforced across the whole book below.
+    """
+    return (settings.max_micro_contracts if settings.is_micro
+            else settings.max_mini_contracts)
+
+
+def can_hold_contracts(settings: Settings, contracts: int,
+                       already_held: int = 0) -> Verdict:
+    """Scaling-plan check across every open, pending and proposed contract."""
     if contracts < settings.min_contracts:
         return Verdict(False, f"{contracts} contracts is below the {settings.min_contracts} "
                               f"minimum; risk does not fit a whole contract")
-    if contracts > settings.max_contracts:
-        return Verdict(False, f"{contracts} contracts exceeds the scaling plan cap of "
-                              f"{settings.max_contracts}")
+    cap = contract_cap(settings)
+    total = int(already_held) + int(contracts)
+    if total > cap:
+        held = f"{already_held} already held + " if already_held else ""
+        return Verdict(False, f"{held}{contracts} contracts exceeds the "
+                              f"{cap}-contract simultaneous cap "
+                              f"({'micro' if settings.is_micro else 'mini'})")
     return ALLOWED
 
 
@@ -218,17 +337,37 @@ def consistency(settings: Settings, best_day_profit: float,
     return ALLOWED
 
 
+def required_target(settings: Settings, best_day_profit: float) -> float:
+    """The profit target after the consistency rule has had its say.
+
+    Breaking consistency does not fail the Combine, it RAISES the bar: a best
+    day over 50% of the target moves the target to best / 0.50. Reporting the
+    headline $3,000 while the rule has already moved it to $4,000 tells the
+    operator to stop and submit an evaluation that has not passed.
+    """
+    best = max(0.0, float(best_day_profit or 0.0))
+    if best <= 0:
+        return settings.profit_target_dollars
+    return max(settings.profit_target_dollars,
+               best / settings.consistency_max_day_share)
+
+
 def progress(settings: Settings, state: BotState, equity: float) -> dict:
     """Where the evaluation stands: profit against target, and days traded."""
     initial = float(state.initial_balance or settings.initial_balance or 0.0)
     gain = equity - initial if initial > 0 else 0.0
     days = len(state.trading_days)
-    target_met = initial > 0 and gain >= settings.profit_target_dollars
+    best_day = float(getattr(state, "best_day_profit", 0.0) or 0.0)
+    target = required_target(settings, best_day)
+    target_met = initial > 0 and gain >= target
     days_met = days >= settings.min_trading_days
     return {
         "initial_balance": initial,
         "gain_dollars": gain,
-        "target_dollars": settings.profit_target_dollars,
+        "target_dollars": target,
+        "base_target_dollars": settings.profit_target_dollars,
+        "best_day_profit": best_day,
+        "target_raised_by_consistency": target > settings.profit_target_dollars,
         "trading_days": days,
         "min_trading_days": settings.min_trading_days,
         "target_met": target_met,

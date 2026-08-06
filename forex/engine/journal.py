@@ -59,6 +59,9 @@ def read(path: Path) -> list[dict]:
 def summarise(path: Path) -> dict:
     """Live R statistics, in the same shape the technique lab reports."""
     closes = [record for record in read(path) if record["event"] == "trade_closed"]
+    # Recovery can append an older archived close after newer live rows. R
+    # statistics are path-dependent, so file order must not decide drawdown.
+    closes.sort(key=lambda record: str(record.get("at", "")))
     values = [record["r"] for record in closes if record.get("r") is not None]
     if not values:
         return {"trades": 0}

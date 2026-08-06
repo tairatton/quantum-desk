@@ -16,6 +16,19 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
+# Each tree is its own import root: `bot`, `engine`, `strategy` and `tools` are
+# top-level packages *within* it. Running `python -m future.bot.live` from the
+# repository root therefore cannot work -- Python would import
+# `future.bot`, whose own `from bot import ...` then resolves to a different,
+# unrelated package. That failure used to surface as a bare ImportError deep in
+# the module; it is caught here and explained instead.
+if __package__ and __package__ != "bot":
+    raise SystemExit(
+        "Run this from inside the tree, not from the repository root:\n"
+        "    cd future && python -m bot.live\n"
+        "Each tree is a separate import root, so `python -m future.bot.live` "
+        "would bind `bot` to the wrong package."
+    )
 if not __package__:
     PROJECT_ROOT = Path(__file__).resolve().parents[1]
     if str(PROJECT_ROOT) not in sys.path:

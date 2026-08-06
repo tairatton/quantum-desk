@@ -55,14 +55,27 @@ class Settings:
     # Whole contracts only. There is no 0.01 of a future.
     contract_step: int = 1
     min_contracts: int = 1
-    max_contracts: int = 5
+    # TopStep publishes ONE simultaneous-position limit in two units: 5 minis or
+    # 50 micros, at the documented 10:1 ratio. Storing a single `max_contracts`
+    # forced a choice between them, and the mini number was configured while a
+    # micro was traded -- understating the cap tenfold. Both are held here and
+    # `guardrails.contract_cap` picks the one that matches the contract.
+    max_mini_contracts: int = 5
+    max_micro_contracts: int = 50
+    # Micro roots are M-prefixed at CME (MGC, MNQ, MES, MCL). Set explicitly
+    # rather than inferred when trading something the prefix rule does not fit.
+    micro_contract: bool | None = None
 
     # --- risk ---------------------------------------------------------------
     # Denominated in dollars, not percent: TopStep's limits are dollar amounts
     # that do not scale with equity, so expressing risk as a percentage of a
     # moving balance would drift against the rule that actually ends the account.
     risk_dollars: float = 200.0
-    max_open_risk_dollars: float = 400.0
+    # The firm's daily loss limit is $1,000, and this must stay under it: two
+    # concurrent stops are one day's loss. The remaining-room guard binds first
+    # in practice (a day's room is the internal stop); this static cap remains
+    # a second independent exposure check.
+    max_open_risk_dollars: float = 800.0
     max_concurrent_trades: int = 2
     # The same drawdown ladder the forex instance runs, in dollars instead of
     # percent. `risk_dollars` stays the defensive floor; close to the realised
@@ -70,14 +83,30 @@ class Settings:
     # account draws down. The tiers below mirror the forex ratios exactly --
     # 1.00 / 0.75 / 0.50 / 0.40% of a 50,000 account -- because the technique is
     # meant to be identical at both venues and only the arithmetic differs.
-    dynamic_risk_enabled: bool = False
-    dynamic_risk_max_dollars: float = 500.0      # forex 1.00%
-    dynamic_risk_tier2_dollars: float = 375.0    # forex 0.75%
-    dynamic_risk_tier3_dollars: float = 250.0    # forex 0.50%
+    # On by default: the flat $200 default meant the account always requested the
+    # floor tier and the configured ladder never ran at all.
+    dynamic_risk_enabled: bool = True
+    # The top tier is bounded by `internal_daily_stop_dollars`, not by the forex
+    # ratio it was copied from. A $500 tier under a $400 daily stop is a size
+    # the first trade of any day can never reach -- the remaining-room fit would
+    # quietly drop it to $375 every time -- so the ladder advertised a number it
+    # never used. Sizing the top tier to the daily stop makes the configuration
+    # mean what it says.
+    dynamic_risk_max_dollars: float = 400.0
+    dynamic_risk_tier2_dollars: float = 300.0
+    dynamic_risk_tier3_dollars: float = 250.0
     dynamic_risk_dd1_dollars: float = 250.0      # forex 0.50% drawdown
     dynamic_risk_dd2_dollars: float = 500.0      # forex 1.00%
     dynamic_risk_dd3_dollars: float = 750.0      # forex 1.50%
     dynamic_risk_fit_remaining: bool = True
+    # Sizes below the floor tier, used ONLY when the room left cannot fit
+    # `risk_dollars`. Without them an account that draws down to within one
+    # daily stop of its floor can never trade again: the smallest configured
+    # size no longer fits, so it stands there until the horizon ends -- alive,
+    # not breached, and permanently unable to pass. These let it grind back.
+    # Measured: they turn 6.5% of flat-regime paths from stalled into passed,
+    # and cost nothing in failures.
+    recovery_risk_dollars: tuple[float, ...] = (100.0, 50.0)
 
     # --- TopStep account rules ---------------------------------------------
     # ESTIMATES for a 50K Combine, and the single most important thing to verify
@@ -88,7 +117,11 @@ class Settings:
     daily_loss_limit_dollars: float = 1_000.0
     max_loss_limit_dollars: float = 2_000.0
     profit_target_dollars: float = 3_000.0
-    min_trading_days: int = 2
+    # The Combine has no minimum trading day requirement -- the $150 winning-day
+    # rule belongs to the funded stage. A non-zero default invented an objective
+    # the firm does not have and would have kept the bot trading after it had
+    # already passed.
+    min_trading_days: int = 0
     # TopStep's max loss trails the highest END-OF-DAY balance, not intraday
     # equity, and on a funded account it stops trailing once it reaches the
     # starting balance. FTMO's equivalent is static -- this flag is the whole
@@ -98,6 +131,15 @@ class Settings:
     # Internal stop, hit before the firm's limit, so a bad day ends by the bot's
     # choice rather than the firm's. Same idea as the forex internal day cap.
     internal_daily_stop_dollars: float = 400.0
+    # Dollars held back above the nearest loss floor and never risked. The
+    # remaining-room guard already refuses a trade larger than the room left,
+    # but "spend the room down to the last dollar" still lands the account
+    # exactly ON the floor, which is a breach. Reserving a buffer is what turns
+    # 0.1% of simulated paths failing into 0.000% -- including when the edge is
+    # gone entirely, because the bot stands down instead of taking the trade
+    # that would end it. Measured: at $0 reserve the flat regime breached 1.08%
+    # of paths; at $200 it breached none in 20,000.
+    loss_room_reserve_dollars: float = 200.0
     max_consecutive_losses: int = 3
     stop_at_target: bool = True
     # Consistency rule: no single day may be more than this share of total
@@ -132,6 +174,14 @@ class Settings:
     # silently degrading to a different system than the lab measured.
     exit_mode: str = "contract_tier"
     split_exit_min_contracts: int = 3
+
+    # --- costs --------------------------------------------------------------
+    # Breakeven is only breakeven once the trade has paid for itself. These feed
+    # `trader.cost_points`, which is what makes the advertised cost-covered stop
+    # actually cover cost. ESTIMATES -- replace with what the account is really
+    # charged, per side, per contract.
+    commission_per_contract: float = 0.74     # round turn, per contract
+    slippage_ticks: float = 1.0               # expected, per exit
 
     # --- connection ---------------------------------------------------------
     # Credentials never live here. Set FUT_PROJECTX_USERNAME and
@@ -174,14 +224,23 @@ class Settings:
             errors.append("tick_size and tick_value must be > 0")
         if self.contract_step < 1 or self.min_contracts < 1:
             errors.append("contract_step and min_contracts must be >= 1")
+        if self.max_mini_contracts < 1 or self.max_micro_contracts < 1:
+            errors.append("contract caps must be >= 1")
         if self.max_contracts < self.min_contracts:
-            errors.append("max_contracts must be >= min_contracts")
+            errors.append("the contract cap must be >= min_contracts")
+        if self.commission_per_contract < 0 or self.slippage_ticks < 0:
+            errors.append("commission and slippage must not be negative")
         if self.risk_dollars <= 0:
             errors.append("risk_dollars must be > 0")
         peak_risk = (self.dynamic_risk_max_dollars if self.dynamic_risk_enabled
                      else self.risk_dollars)
         if self.max_open_risk_dollars < peak_risk:
             errors.append("max_open_risk_dollars must be >= the maximum per-setup risk")
+        if (self.dynamic_risk_enabled
+                and self.dynamic_risk_max_dollars > self.internal_daily_stop_dollars):
+            errors.append("dynamic_risk_max_dollars must be <= "
+                          "internal_daily_stop_dollars, or the top tier can never "
+                          "be taken on the first trade of a day")
         if self.dynamic_risk_enabled:
             tiers = (self.dynamic_risk_max_dollars, self.dynamic_risk_tier2_dollars,
                      self.dynamic_risk_tier3_dollars, self.risk_dollars)
@@ -193,19 +252,35 @@ class Settings:
                       self.dynamic_risk_dd3_dollars)
             if not (0 < ladder[0] < ladder[1] < ladder[2]):
                 errors.append("dynamic risk drawdown thresholds must increase")
+        if any(value <= 0 for value in self.recovery_risk_dollars):
+            errors.append("recovery risk tiers must be positive")
+        if (self.recovery_risk_dollars
+                and max(self.recovery_risk_dollars) >= self.risk_dollars):
+            errors.append("recovery risk tiers must be smaller than risk_dollars")
+        if self.loss_room_reserve_dollars < 0:
+            errors.append("loss_room_reserve_dollars must be >= 0")
+        smallest = min([self.risk_dollars, *self.recovery_risk_dollars])
+        if self.loss_room_reserve_dollars >= self.max_loss_limit_dollars - smallest:
+            errors.append("loss_room_reserve_dollars leaves no room for even the "
+                          "smallest risk tier")
         if not 0 < self.internal_daily_stop_dollars <= self.daily_loss_limit_dollars:
             errors.append("internal_daily_stop_dollars must be > 0 and "
                           "<= daily_loss_limit_dollars")
         if self.daily_loss_limit_dollars <= 0 or self.max_loss_limit_dollars <= 0:
             errors.append("daily and max loss limits must be > 0")
+        if self.max_open_risk_dollars >= self.daily_loss_limit_dollars:
+            errors.append("max_open_risk_dollars must be < daily_loss_limit_dollars: "
+                          "every open stop can be hit on the same day")
         if self.daily_loss_limit_dollars > self.max_loss_limit_dollars:
             errors.append("daily_loss_limit_dollars must be <= max_loss_limit_dollars")
         if self.max_concurrent_trades < 1:
             errors.append("max_concurrent_trades must be >= 1")
         if self.max_consecutive_losses < 1:
             errors.append("max_consecutive_losses must be >= 1")
-        if self.profit_target_dollars <= 0 or self.min_trading_days < 1:
-            errors.append("profit target and minimum trading days must be positive")
+        if self.profit_target_dollars <= 0:
+            errors.append("profit_target_dollars must be > 0")
+        if self.min_trading_days < 0:
+            errors.append("min_trading_days must be >= 0")
         if not 0 < self.consistency_max_day_share <= 1:
             errors.append("consistency_max_day_share must be in (0, 1]")
         if self.exit_mode not in {"fixed_tp3", "be_33_33_34", "contract_tier"}:
@@ -227,6 +302,30 @@ class Settings:
             errors.append("news windows must not be negative")
         if errors:
             raise ValueError("invalid futures settings: " + "; ".join(errors))
+
+    @property
+    def is_micro(self) -> bool:
+        """Whether the configured root is a micro contract."""
+        if self.micro_contract is not None:
+            return bool(self.micro_contract)
+        root = self.contract_symbol.strip().upper()
+        return root.startswith("M") and len(root) >= 3
+
+    @property
+    def max_contracts(self) -> int:
+        """The simultaneous cap in the unit actually traded."""
+        return self.max_micro_contracts if self.is_micro else self.max_mini_contracts
+
+    @property
+    def cost_points(self) -> float:
+        """Price distance one contract must clear to have paid for itself.
+
+        Commission is a cash amount and the stop is a price, so it is converted
+        through `value_per_point`; slippage is already in ticks.
+        """
+        commission = (self.commission_per_contract / self.value_per_point
+                      if self.value_per_point else 0.0)
+        return commission + self.slippage_ticks * self.tick_size
 
     @property
     def value_per_point(self) -> float:

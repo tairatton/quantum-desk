@@ -22,10 +22,23 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from typing import TYPE_CHECKING
+from typing import Protocol
 
-if TYPE_CHECKING:                       # a venue's Settings, never imported at runtime
-    from bot.settings import Settings
+
+class Settings(Protocol):
+    """The calendar fields a venue's settings must expose.
+
+    Structural, not imported: `engine` may not depend on `bot`, and a
+    TYPE_CHECKING import is still a dependency as far as any type checker or
+    import graph is concerned.
+    """
+
+    news_enabled: bool
+    news_require_calendar: bool
+    news_currencies: tuple[str, ...]
+    news_min_impact: str
+    news_minutes_before: int
+    news_minutes_after: int
 
 # The high-impact USD calendar is the same feed whichever venue is trading it, so
 # the cache is shared rather than duplicated per instance: one fetch, one file,

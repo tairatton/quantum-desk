@@ -579,6 +579,24 @@ class StateTests(unittest.TestCase):
             self.assertEqual(record["event"], "trade_closed")
             self.assertFalse(path.exists())
 
+    def test_journal_summary_orders_closes_by_timestamp(self):
+        import tempfile
+
+        from engine import journal
+
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "journal.jsonl"
+            path.write_text(
+                '{"at":"2026-08-03T10:00:00","event":"trade_closed","r":-9.0}\n'
+                '{"at":"2026-08-01T10:00:00","event":"trade_closed","r":5.0}\n'
+                '{"at":"2026-08-04T10:00:00","event":"trade_closed","r":-9.0}\n'
+                '{"at":"2026-08-02T10:00:00","event":"trade_closed","r":5.0}\n',
+                encoding="utf-8",
+            )
+            stats = journal.summarise(path)
+            self.assertEqual(stats["net_r"], -8.0)
+            self.assertEqual(stats["max_drawdown_r"], 18.0)
+
     def test_status_exposes_account_state_mismatch(self):
         from bot.run import account_binding_status
 

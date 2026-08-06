@@ -1,7 +1,25 @@
-MetaTrader5>=5.0.45
-pandas>=2.0
-numpy>=1.24
-# web dashboard
+# Everything both trees need, in one file.
+#
+#     python -m pip install -r requirements.txt
+#
+# This replaces the old split between requirements.txt and requirements-live.txt.
+# The split was a trap: the live bot was installed from the pinned file and
+# everything else from the loose one, so the account that trades real money and
+# the environment that measures it could drift apart without anyone noticing.
+# One file means the backtest and the bot run on the same versions.
+#
+# The four packages the live bot depends on are pinned to what the running
+# account is actually using (verified with importlib.metadata on 2026-08-06,
+# Python 3.14.1). Tooling that only draws pictures is left loose.
+
+# --- live trading and analysis (pinned: the live account runs these) ---------
+# MetaTrader5 is Windows-only and used by the forex tree alone. The futures tree
+# talks to ProjectX over HTTPS with the standard library and needs nothing here.
+MetaTrader5==5.0.5735
+pandas==2.3.3
+numpy==2.3.5
+
+# --- reporting and the web dashboard (loose: nothing trades on these) --------
 Flask>=3.0
 plotly>=5.18
 matplotlib>=3.8

@@ -3,24 +3,55 @@
   "account_server": "FTMO-Demo",
   "initial_balance": 50000.0,
   "server_utc_offset": 3.0,
+<<<<<<< HEAD:forex/bot/state.pre-fix-20260731.json
   "day_key": "2026-07-30",
   "day_start_balance": 50359.65,
   "day_start_equity": 50484.0,
   "day_realised": 124.35999999999999,
   "day_requests": 786,
+=======
+  "day_key": "2026-08-05",
+  "day_start_balance": 50458.06,
+  "day_start_equity": 50227.36,
+  "day_realised": 563.0,
+  "day_requests": 1821,
+>>>>>>> 0bf547bcf13be50b7da14abb38bf0d426d13d6f5:bot/code/state.json
   "consecutive_losses": 0,
   "halted_forever": false,
   "halted_reason": "",
   "paused_until_day": "",
   "trading_days": [
     "2026-07-29",
+<<<<<<< HEAD:forex/bot/state.pre-fix-20260731.json
     "2026-07-30"
+=======
+    "2026-07-30",
+    "2026-07-31",
+    "2026-08-04",
+    "2026-08-05"
+>>>>>>> 0bf547bcf13be50b7da14abb38bf0d426d13d6f5:bot/code/state.json
   ],
   "seen_plan_ids": [
     "M30@2026-07-28 15:00:00",
     "M15@2026-07-29 21:00:00",
     "M30@2026-07-29 22:30:00",
+<<<<<<< HEAD:forex/bot/state.pre-fix-20260731.json
     "M15@2026-07-30 16:30:00"
+=======
+    "M15@2026-07-30 16:30:00",
+    "M15@2026-07-31 11:30:00",
+    "M15@2026-07-31 16:30:00",
+    "M15@2026-08-03 13:30:00",
+    "M30@2026-07-31 13:00:00",
+    "M15@2026-08-04 15:15:00",
+    "M30@2026-08-04 16:00:00",
+    "M15@2026-08-04 21:00:00",
+    "M15@2026-08-05 04:00:00",
+    "M30@2026-08-05 08:00:00",
+    "M30@2026-08-05 08:00:00",
+    "M15@2026-08-05 14:30:00",
+    "M15@2026-08-05 17:45:00"
+>>>>>>> 0bf547bcf13be50b7da14abb38bf0d426d13d6f5:bot/code/state.json
   ],
   "trades": {
     "M30@2026-07-28 15:00:00": {
@@ -160,6 +191,270 @@
       "fill_bar_time": "2026-07-30 17:04:58",
       "breakeven_done": true,
       "closed": true,
+<<<<<<< HEAD:forex/bot/state.pre-fix-20260731.json
+=======
+      "conversion_released": false,
+      "converted_risk_pending": false,
+      "expected_market_volume": 0.0,
+      "dry_run": false,
+      "exit_mode": "be_33_33_34"
+    },
+    "M15@2026-07-31 11:30:00": {
+      "plan_id": "M15@2026-07-31 11:30:00",
+      "timeframe": "M15",
+      "direction": -1,
+      "entry": 4065.56,
+      "stop": 4080.836368031837,
+      "risk": 15.276368031836949,
+      "risk_cash": 198.59,
+      "targets": [
+        4050.283631968163,
+        4042.6454479522445,
+        4035.007263936326
+      ],
+      "legs": [
+        0.04,
+        0.04,
+        0.05
+      ],
+      "position_tickets": [],
+      "pending_tickets": [],
+      "market_order_tickets": [],
+      "tp1_market_order_ticket": null,
+      "tp1_position_ticket": null,
+      "tp1_pending_ticket": 509127297,
+      "filled_at": null,
+      "fill_bar_time": null,
+      "breakeven_done": false,
+      "closed": true,
+      "conversion_released": false,
+      "converted_risk_pending": false,
+      "expected_market_volume": 0.0,
+      "dry_run": false,
+      "exit_mode": "be_33_33_34"
+    },
+    "M15@2026-07-31 16:30:00": {
+      "plan_id": "M15@2026-07-31 16:30:00",
+      "timeframe": "M15",
+      "direction": -1,
+      "entry": 4037.545,
+      "stop": 4057.3549689844644,
+      "risk": 19.809968984464525,
+      "risk_cash": 198.1,
+      "targets": [
+        4017.7350310155357,
+        4007.8300465233033,
+        3997.925062031071
+      ],
+      "legs": [
+        0.03,
+        0.03,
+        0.04
+      ],
+      "position_tickets": [
+        509416446,
+        509416480,
+        509416503
+      ],
+      "pending_tickets": [],
+      "market_order_tickets": [],
+      "tp1_market_order_ticket": null,
+      "tp1_position_ticket": 509416446,
+      "tp1_pending_ticket": 509416446,
+      "filled_at": "2026-07-31 17:24:22",
+      "fill_bar_time": "2026-07-31 17:24:22",
+      "breakeven_done": false,
+      "closed": true,
+      "conversion_released": false,
+      "converted_risk_pending": false,
+      "expected_market_volume": 0.0,
+>>>>>>> 0bf547bcf13be50b7da14abb38bf0d426d13d6f5:bot/code/state.json
+      "dry_run": false,
+      "exit_mode": "be_33_33_34"
+    },
+    "M15@2026-08-04 21:00:00": {
+      "plan_id": "M15@2026-08-04 21:00:00",
+      "timeframe": "M15",
+      "direction": 1,
+      "entry": 4088.61,
+      "stop": 4068.031770493043,
+      "risk": 20.57822950695702,
+      "risk_cash": 416.4,
+      "targets": [
+        4109.188229506957,
+        4119.4773442604355,
+        4129.766459013914
+      ],
+      "legs": [
+        0.07,
+        0.06,
+        0.07
+      ],
+      "position_tickets": [
+        511785057,
+        511785070,
+        511785089
+      ],
+      "pending_tickets": [],
+      "market_order_tickets": [],
+      "tp1_market_order_ticket": 511785057,
+      "tp1_position_ticket": 511785057,
+      "tp1_pending_ticket": null,
+      "filled_at": "2026-08-04 21:15:22",
+      "fill_bar_time": "2026-08-04 21:00:00",
+      "breakeven_done": false,
+      "closed": true,
+      "conversion_released": false,
+      "converted_risk_pending": false,
+      "expected_market_volume": 0.2,
+      "dry_run": false,
+      "exit_mode": "be_33_33_34"
+    },
+    "M15@2026-08-05 04:00:00": {
+      "plan_id": "M15@2026-08-05 04:00:00",
+      "timeframe": "M15",
+      "direction": 1,
+      "entry": 4085.66,
+      "stop": 4070.2610347602367,
+      "risk": 15.398965239762902,
+      "risk_cash": 200.52,
+      "targets": [
+        4101.058965239763,
+        4108.758447859645,
+        4116.457930479526
+      ],
+      "legs": [
+        0.04,
+        0.04,
+        0.05
+      ],
+      "position_tickets": [
+        511951125,
+        511951134,
+        511951146
+      ],
+      "pending_tickets": [],
+      "market_order_tickets": [],
+      "tp1_market_order_ticket": 511951125,
+      "tp1_position_ticket": 511951125,
+      "tp1_pending_ticket": null,
+      "filled_at": "2026-08-05 04:15:23",
+      "fill_bar_time": "2026-08-05 04:00:00",
+      "breakeven_done": true,
+      "closed": true,
+      "conversion_released": false,
+      "converted_risk_pending": false,
+      "expected_market_volume": 0.13,
+      "dry_run": false,
+      "exit_mode": "be_33_33_34"
+    },
+    "M30@2026-08-05 08:00:00": {
+      "plan_id": "M30@2026-08-05 08:00:00",
+      "timeframe": "M30",
+      "direction": 1,
+      "entry": 4168.57,
+      "stop": 4137.546596453907,
+      "risk": 31.023403546092496,
+      "risk_cash": 397.97,
+      "targets": [
+        4199.593403546092,
+        4215.105105319139,
+        4230.616807092185
+      ],
+      "legs": [
+        0.04,
+        0.04,
+        0.05
+      ],
+      "position_tickets": [
+        512125029,
+        512125037,
+        512125042
+      ],
+      "pending_tickets": [],
+      "market_order_tickets": [],
+      "tp1_market_order_ticket": 512125029,
+      "tp1_position_ticket": 512125029,
+      "tp1_pending_ticket": null,
+      "filled_at": "2026-08-05 09:30:24",
+      "fill_bar_time": "2026-08-05 09:00:00",
+      "breakeven_done": true,
+      "closed": true,
+      "conversion_released": true,
+      "converted_risk_pending": false,
+      "expected_market_volume": 0.13,
+      "dry_run": false,
+      "exit_mode": "be_33_33_34"
+    },
+    "M15@2026-08-05 14:30:00": {
+      "plan_id": "M15@2026-08-05 14:30:00",
+      "timeframe": "M15",
+      "direction": 1,
+      "entry": 4184.52,
+      "stop": 4163.510122282466,
+      "risk": 21.009877717533996,
+      "risk_cash": 163.1,
+      "targets": [
+        4205.529877717535,
+        4216.034816576302,
+        4226.539755435068
+      ],
+      "legs": [
+        0.03,
+        0.02,
+        0.03
+      ],
+      "position_tickets": [
+        512379851,
+        512379872,
+        512379897
+      ],
+      "pending_tickets": [],
+      "market_order_tickets": [],
+      "tp1_market_order_ticket": 512379851,
+      "tp1_position_ticket": 512379851,
+      "tp1_pending_ticket": null,
+      "filled_at": "2026-08-05 14:45:23",
+      "fill_bar_time": "2026-08-05 14:30:00",
+      "breakeven_done": true,
+      "closed": true,
+      "conversion_released": false,
+      "converted_risk_pending": false,
+      "expected_market_volume": 0.08,
+      "dry_run": false,
+      "exit_mode": "be_33_33_34"
+    },
+    "M15@2026-08-05 17:45:00": {
+      "plan_id": "M15@2026-08-05 17:45:00",
+      "timeframe": "M15",
+      "direction": 1,
+      "entry": 4228.705,
+      "stop": 4196.8729666160125,
+      "risk": 31.83203338398752,
+      "risk_cash": 509.31,
+      "targets": [
+        4260.537033383987,
+        4276.453050075981,
+        4292.369066767975
+      ],
+      "legs": [
+        0.05,
+        0.05,
+        0.06
+      ],
+      "position_tickets": [],
+      "pending_tickets": [],
+      "market_order_tickets": [],
+      "tp1_market_order_ticket": null,
+      "tp1_position_ticket": null,
+      "tp1_pending_ticket": 512686470,
+      "filled_at": null,
+      "fill_bar_time": null,
+      "breakeven_done": false,
+      "closed": true,
+      "conversion_released": true,
+      "converted_risk_pending": false,
+      "expected_market_volume": 0.0,
       "dry_run": false,
       "exit_mode": "be_33_33_34"
     }

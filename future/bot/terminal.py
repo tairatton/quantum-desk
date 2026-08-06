@@ -86,6 +86,8 @@ def account_panel(settings: Settings, state: BotState,
              "trailing end-of-day" if settings.trailing_max_loss else "static"),
         _row("Room to the floor", f"${room:,.2f}",
              f"{bar(settings.max_loss_limit_dollars - room, settings.max_loss_limit_dollars)}"),
+        _row("Tradeable room", f"${max(0.0, room - settings.loss_room_reserve_dollars):,.2f}",
+             f"${settings.loss_room_reserve_dollars:,.0f} reserved, never risked"),
     ]
     if day_floor:
         spent = max(0.0, float(state.day_start_balance) - equity)

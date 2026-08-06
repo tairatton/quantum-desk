@@ -315,7 +315,7 @@ python -B -c "import bot.main; import bot.run; print('imports OK')"
 
 Execution layer ออกแบบให้ใช้กับ MT5 ได้ แต่การเปิดใช้งานจริงเป็น **conditional go**:
 
-- ต้องสร้าง virtual environment จาก `requirements-live.txt` และรัน unit tests ให้ผ่าน
+- ต้องสร้าง virtual environment จาก `requirements.txt` และรัน unit tests ให้ผ่าน
 - MT5 ต้องล็อกอินบัญชีที่ถูกต้องและเปิด Algorithmic Trading
 - บัญชี MT5 ต้องเป็น **hedging mode**; บัญชี netting รวมขา TP1/TP2/TP3 เป็น position เดียว บอทจึงตรวจและหยุดก่อนเริ่มทำงาน
 - เริ่มจาก `--status` และ `--once` (dry-run) เสมอ
@@ -338,7 +338,7 @@ Execution layer ออกแบบให้ใช้กับ MT5 ได้ แ�
 
 ```powershell
 py -3.13 -m venv .venv
-.\.venv\Scripts\python.exe -m pip install -r requirements-live.txt
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
 .\.venv\Scripts\python.exe -B -m unittest discover -s tests -q
 .\.venv\Scripts\python.exe -m bot.run --status
 .\.venv\Scripts\python.exe -m bot.run --once

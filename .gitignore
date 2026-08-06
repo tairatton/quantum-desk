@@ -21,6 +21,10 @@ future/test/outputs/backtests/**/*
 # set, which is the point of splitting them.
 forex/bot/state.json
 forex/bot/journal.jsonl
+# Journal history rescued from the pre-split bot/code/ directory. It holds 5
+# closed trades that never reached the current journal; merge it in (sorted by
+# "at") the next time the bot is stopped, then this line can go.
+forex/bot/journal.pre-split-20260806.jsonl
 forex/bot/settings.local.json
 forex/bot/STOP
 forex/bot/.live.lock

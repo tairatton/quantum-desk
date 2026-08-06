@@ -18,11 +18,13 @@ So every function here is written around three rules:
 """
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 
 from engine.signals import Intent
 
-from .broker import Broker, OrderRejected, risk_dollars_for, size_contracts
+from .broker import (Broker, OrderRejected, ProjectXError, risk_dollars_for,
+                     size_contracts)
 from .settings import Settings
 
 
@@ -115,18 +117,48 @@ def plan_contracts(settings: Settings, entry: float, stop: float,
 
 @dataclass
 class OpenResult:
+    """What the gateway has been asked to do, and what it confirmed.
+
+    `accepted_contracts` is deliberately not called "filled". A market order the
+    gateway acknowledged is an order that EXISTS; whether it filled, filled
+    partially, or is still working is a question only the order/position read
+    APIs can answer. The previous version incremented a single `sent_contracts`
+    counter straight from the request and treated acceptance as a full fill,
+    which is how a position ends up sized differently from the one being
+    managed. Until the reconciliation loop exists, callers must treat
+    `needs_reconciliation` as "a human or the run loop must look at the
+    account".
+    """
     plan: ContractPlan
     responses: list[dict] = field(default_factory=list)
-    sent_contracts: int = 0
+    order_ids: list[object] = field(default_factory=list)
+    accepted_contracts: int = 0
+    ambiguous: bool = False
+    error: str = ""
+
+    @property
+    def sent_contracts(self) -> int:
+        """Compatibility alias. Acceptance, never a fill confirmation."""
+        return self.accepted_contracts
 
     @property
     def opened(self) -> bool:
-        return self.sent_contracts > 0
+        return self.accepted_contracts > 0
 
     @property
     def partial(self) -> bool:
         """Some legs went out and some did not -- the state that needs a human."""
-        return 0 < self.sent_contracts < self.plan.contracts
+        return 0 < self.accepted_contracts < self.plan.contracts
+
+    @property
+    def needs_reconciliation(self) -> bool:
+        """True when live exposure may not match what this object records.
+
+        An ambiguous write -- a timeout, a dropped connection, an HTTP error
+        after the request left -- is NOT evidence the order was refused. It has
+        to be resolved by reading the account back.
+        """
+        return self.ambiguous or self.partial
 
 
 def targets_for(intent: Intent, exit_mode: str) -> tuple[float, ...]:
@@ -145,10 +177,16 @@ def open_trade(broker: Broker, settings: Settings, intent: Intent,
                risk_dollars: float | None = None) -> OpenResult:
     """Send the entry as one order per leg, each with its own stop and target.
 
-    Legs go out one at a time and the result records how many made it. A
-    rejection halfway through leaves a real position that the caller has to see:
-    reporting the whole trade as failed would strand contracts nobody is
-    managing, which is worse than a partial fill honestly labelled.
+    Legs go out one at a time and every accepted order id is recorded BEFORE the
+    next write, so a failure midway leaves a record of what is already live.
+
+    Every ambiguous outcome is caught, not just a clean rejection. This used to
+    catch `OrderRejected` alone while the real broker raises `ProjectXError` for
+    HTTP errors, network failures and gateway-level refusals -- so leg one being
+    accepted and leg two timing out let the exception escape with no result
+    object at all, and the caller never learned that contracts were live.
+
+    A timeout is never treated as "did not happen".
     """
     plan = plan_contracts(settings, intent.entry, intent.stop, risk_dollars)
     targets = targets_for(intent, plan.exit_mode)
@@ -157,17 +195,49 @@ def open_trade(broker: Broker, settings: Settings, intent: Intent,
         try:
             response = broker.place_market(intent.direction, contracts,
                                            intent.stop, target)
-        except OrderRejected:
-            if result.sent_contracts:
+        except OrderRejected as error:
+            # An explicit refusal: nothing was accepted for THIS leg.
+            result.error = str(error)
+            if result.opened:
                 return result           # partial: caller must reconcile
             raise
+        except ProjectXError as error:
+            # Ambiguous: the request may have reached the gateway. Whether or
+            # not earlier legs went out, the account has to be read back.
+            result.error = str(error)
+            result.ambiguous = True
+            return result
         result.responses.append(response)
-        result.sent_contracts += contracts
+        if isinstance(response, dict) and response.get("orderId") is not None:
+            result.order_ids.append(response["orderId"])
+        elif not (isinstance(response, dict) and response.get("dry_run")):
+            # Accepted, but the gateway named no order id -- there is nothing to
+            # reconcile against later, which is itself a reason to look.
+            result.ambiguous = True
+        result.accepted_contracts += contracts
     return result
 
 
+def cost_points(settings: Settings) -> float:
+    """Price distance a leg must clear before breakeven really is breakeven.
+
+    Commission and the expected exit slip, converted to price. Passing 0.0 --
+    which is what every call site did while no cost model existed -- produces a
+    stop at the raw fill, which still loses money once the account is charged.
+    """
+    return settings.cost_points
+
+
+def _validated_cost_points(value: float) -> float:
+    """Reject an omitted/invalid cost instead of silently using raw breakeven."""
+    cost = float(value)
+    if not math.isfinite(cost) or cost < 0:
+        raise ValueError("cost_points must be a finite non-negative value")
+    return cost
+
+
 def stop_after_tp1(intent: Intent, fill_price: float,
-                   cost_points: float = 0.0) -> float:
+                   cost_points: float) -> float:
     """Where the stop goes once the first leg is closed.
 
     Breakeven means the trade cannot lose, which is not the same as the entry
@@ -176,11 +246,12 @@ def stop_after_tp1(intent: Intent, fill_price: float,
     trade -- the same correction the forex trader applies for commission,
     slippage and swap.
     """
-    return (fill_price + cost_points if intent.direction > 0
-            else fill_price - cost_points)
+    cost = _validated_cost_points(cost_points)
+    return (fill_price + cost if intent.direction > 0
+            else fill_price - cost)
 
 
-def stop_after_tp2(intent: Intent, cost_points: float = 0.0) -> float:
+def stop_after_tp2(intent: Intent, cost_points: float) -> float:
     """Where the last leg's stop goes once TP2 is banked.
 
     The second step of the same three-leg technique the forex instance runs: the
@@ -194,19 +265,26 @@ def stop_after_tp2(intent: Intent, cost_points: float = 0.0) -> float:
     simulation priced, which is the exact drift both venues exist to avoid.
     """
     target = intent.targets[0]
-    return (target + cost_points if intent.direction > 0
-            else target - cost_points)
+    cost = _validated_cost_points(cost_points)
+    return (target + cost if intent.direction > 0
+            else target - cost)
 
 
-def risk_for(settings: Settings, state, equity: float) -> float:
-    """Dollars of risk for the next setup, after the drawdown ladder has spoken.
+def risk_for(settings: Settings, state, equity: float,
+             room: float | None = None) -> float:
+    """Dollars of risk for the next setup, after the ladder and the room left.
 
     Same ladder, same thresholds and the same durable high-water mark as the
-    forex instance -- only the unit differs.
+    forex instance -- only the unit differs. When `room` is given, the tier is
+    additionally fitted into the distance remaining above the nearest loss
+    floor, and 0.0 means no configured tier fits: no trade.
     """
-    from engine.dynamic_risk import decide_dollars
+    from engine.dynamic_risk import decide_dollars, fit_to_room
 
-    return decide_dollars(settings, state, equity).risk_percent
+    tier = decide_dollars(settings, state, equity).risk_percent
+    if room is None:
+        return tier
+    return fit_to_room(settings, tier, float(room))
 
 
 def open_risk_dollars(settings: Settings, positions, stop_price: float) -> float:

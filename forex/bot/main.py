@@ -64,7 +64,7 @@ def _journal() -> None:
     for key, value in stats.items():
         print(f"  {key:18s} {value}")
     print("\n  เทียบ expectancy_r กับ holdout ใน")
-    print("  test/forex/outputs/backtests/technique_lab/XAUUSD/<TF>/report.json")
+    print("  test/test/outputs/backtests/technique_lab/XAUUSD/<TF>/report.json")
     print("  ห่างกันเกิน 0.05R ต่อไม้ หลังผ่าน 50 ไม้ = ต้นทุนจริงกินมากกว่าที่ประเมิน")
 
 

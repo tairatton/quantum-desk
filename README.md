@@ -31,6 +31,19 @@ both trees, so a fix in one is not a fix in the other.
 Full system documentation — what it does, measured results, and every
 known risk — is in [DOCUMENT.md](DOCUMENT.md).
 
+## Installing
+
+One file, both trees:
+
+```bash
+python -m pip install -r requirements.txt
+```
+
+The live-trading packages are pinned to what the running account uses; the
+reporting ones are loose. `MetaTrader5` is Windows-only and needed by the forex
+tree alone — the futures tree reaches ProjectX over HTTPS with the standard
+library.
+
 ## Running
 
 ```bash
