@@ -1,4 +1,4 @@
-"""เมนูเดียวสำหรับสั่งบอท — `python -m bot.main`
+"""เมนูเดียวสำหรับสั่งบอท — `python -m entrypoints.main`
 
 ทุกอย่างที่ `bot.run` ทำได้ อยู่ในเมนูนี้ทั้งหมด ต่างกันแค่ตรงนี้ถามว่าจะทำอะไร
 แทนที่จะต้องจำ flag
@@ -14,11 +14,22 @@
 from __future__ import annotations
 
 import sys
+from pathlib import Path
+
+if __package__ and __package__ != "entrypoints":
+    raise SystemExit(
+        "Run this from inside the Forex tree:\n"
+        "    cd forex && python -m entrypoints.main"
+    )
+if not __package__:
+    PROJECT_ROOT = Path(__file__).resolve().parents[1]
+    if str(PROJECT_ROOT) not in sys.path:
+        sys.path.insert(0, str(PROJECT_ROOT))
 
 from strategy.mt5_source import MT5Error
 
-from . import run
-from .settings import JOURNAL_PATH, KILL_SWITCH, load
+from bot import run
+from bot.settings import JOURNAL_PATH, KILL_SWITCH, load
 
 LINE = "=" * 62
 

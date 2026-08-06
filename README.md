@@ -11,6 +11,7 @@ Each tree is self-contained and runs from its own directory:
 
 ```
 <tree>/
+  entrypoints/ user-facing main modules and batch launchers
   bot/        live execution: settings, broker, guardrails, run, trader, live
   engine/     sizing, state, journal, news, sessions, instance lock
   strategy/   signal generation and the backtest lab
@@ -57,10 +58,10 @@ python tools/ftmo_portfolio_sim.py  # pass rate and drawdown against FTMO rules
 
 ```bash
 cd future
-python -m bot.terminal              # menu: status, connection test, kill switch
-python -m bot.terminal --status --offline   # one status screen, no network
-python -m bot.live --check          # read-only ProjectX connection test
-python -m bot.live                  # dry run
+python -m entrypoints.main          # menu: status, connection test, kill switch
+python -m entrypoints.main --status --offline   # one status screen, no network
+python -m entrypoints.live --check  # read-only ProjectX connection test
+python -m entrypoints.live          # dry run
 python -m pytest test/unit -q
 python tools/topstep_sim.py         # pass rate against TopStep's trailing rules
 ```

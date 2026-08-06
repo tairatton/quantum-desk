@@ -9,17 +9,22 @@
 
 ```text
 bot/
-├── code/       # โค้ด, settings, state, journal และ cache
-├── main.py     # entry point แบบ Python
-├── main.bat    # ดับเบิลคลิกเพื่อเริ่ม live ทันที
+├── broker.py, guardrails.py, run.py, trader.py
+├── settings.py
+├── repair_risk_cash.py
 └── README.md   # เอกสารนี้
+
+entrypoints/
+├── main.py     # เมนู Forex
+├── main.bat    # ดับเบิลคลิกเพื่อเริ่ม live
+└── research.py # CLI วิเคราะห์/backtest
 ```
 
 ไฟล์สำคัญภายใน `forex/bot`:
 
 | ไฟล์ | หน้าที่ |
 |---|---|
-| `main.py` | launcher ที่เริ่ม live trading ทันที |
+| `entrypoints/main.py` | เมนู Forex |
 | `run.py` | ลูปเทรดและคำสั่ง CLI |
 | `settings.py` | ค่า default และตำแหน่งไฟล์ runtime |
 | `settings.local.json` | ค่าที่ใช้ทับ default ในเครื่องนี้ |
@@ -42,18 +47,18 @@ bot/
 
 ## วิธีรัน
 
-> **คำเตือน:** `bot/main.py` และ `bot/main.bat` เริ่ม **live trading ทันที** ไม่มีเมนูและไม่มีคำยืนยัน ออเดอร์สามารถถูกส่งเข้าบัญชีจริงได้
+> **คำเตือน:** `entrypoints/main.bat` เริ่ม **live trading ทันที** ส่วน `entrypoints/main.py` เป็นเมนูที่มีคำยืนยันก่อนส่งออเดอร์จริง
 
-กด **Run Python File** ที่ `bot/main.py` ใน VS Code ได้เลย หรือดับเบิลคลิก:
+กด **Run Python File** ที่ `entrypoints/main.py` ใน VS Code ได้เลย หรือดับเบิลคลิก:
 
 ```text
-bot\main.bat
+entrypoints\main.bat
 ```
 
 รันจาก PowerShell ได้เช่นกัน:
 
 ```powershell
-python bot\main.py
+python -m entrypoints.main
 ```
 
 เมื่อเริ่มแล้ว โปรแกรมจะเชื่อมต่อ MT5, แสดงสถานะบัญชี และเข้า live loop ทันที กด `Ctrl+C` เพื่อหยุดโปรแกรม Position ที่เปิดไปแล้วจะยังมี SL/TP ซึ่งฝากไว้ที่โบรกเกอร์
@@ -148,7 +153,7 @@ News, Exposure และ Journal ส่วนรายละเอียด posi
 - Exit policy: **capital tier ที่ $30,000 โดยยึด initial balance**
 - บัญชีที่ผูกอยู่: **FTMO Demo $50,000** → อยู่ tier บน
 - Exit จริงของบัญชีนี้: **แบ่ง 33/33/34 ปิดที่ TP1/TP2/TP3 + BE หลัง TP1 + เลื่อน TP3 ไป TP1 หลัง TP2**
-- `bot/main.py` เริ่ม live trading ทันที
+- `entrypoints/main.bat` เริ่ม live trading ทันที
 
 ### Exit ที่บอทรันจริงคือ BE + 33/33/34
 
@@ -298,10 +303,10 @@ python -B -m unittest discover -s tests -q
 ตรวจ syntax/import ของ launcher โดยไม่เรียก `main()`:
 
 ```powershell
-python -B -c "import bot.main; import bot.run; print('imports OK')"
+python -B -c "import entrypoints.main; import bot.run; print('imports OK')"
 ```
 
-ห้ามรัน `bot/main.py` หรือ `bot/main.bat` ระหว่างการทดสอบทั่วไป เพราะทั้งสองตัวเปิด live ทันที
+ห้ามรัน `entrypoints/main.bat` ระหว่างการทดสอบทั่วไป เพราะไฟล์นี้เปิด live ทันที
 
 ---
 

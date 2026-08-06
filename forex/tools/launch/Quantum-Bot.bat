@@ -9,8 +9,8 @@ chcp 65001 >nul
 title HTF Quantum bot
 cd /d "%~dp0..\.."
 if exist "..\.venv\Scripts\python.exe" (
-  "..\.venv\Scripts\python.exe" -m bot.main
+  "..\.venv\Scripts\python.exe" -m entrypoints.main
 ) else (
-  python -m bot.main
+  python -m entrypoints.main
 )
 pause

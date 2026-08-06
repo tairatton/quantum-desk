@@ -85,18 +85,18 @@ python -m bot.run --status            # สถานะบัญชี guard แ
 python -m bot.run --once              # เดินหนึ่งรอบ dry run
 python -m bot.run --live              # ส่งออเดอร์จริง
 python -m bot.run --flatten --live    # ฉุกเฉิน ยกเลิกและปิดทุกอย่าง
-python -m bot.main                    # เมนูภาษาไทย
+python -m entrypoints.main            # เมนูภาษาไทย
 python tools/ftmo_portfolio_sim.py    # XAUUSD M15+M30 production sim
 python tools/ftmo_portfolio_sim.py --book "+ BTC M5"  # explicit research comparison
-python main.py backtest               # วัดผลทุก symbol × timeframe
+python -m entrypoints.research backtest  # วัดผลทุก symbol × timeframe
 python -m pytest test/unit -q
 ```
 
 ```bash
 cd future
-python -m bot.terminal                     # เทอร์มินัลเมนู
-python -m bot.terminal --status --offline  # สถานะหน้าเดียว ไม่ต้องต่อเน็ต
-python -m bot.live --check                 # ทดสอบเชื่อมต่อ อ่านอย่างเดียว
+python -m entrypoints.main                  # เทอร์มินัลเมนู
+python -m entrypoints.main --status --offline  # สถานะหน้าเดียว ไม่ต้องต่อเน็ต
+python -m entrypoints.live --check         # ทดสอบเชื่อมต่อ อ่านอย่างเดียว
 python tools/topstep_sim.py                # default: MGC Yahoo + dynamic room guard
 python tools/topstep_sim.py --flat         # fixed-risk reference only
 python tools/download_mgc_yahoo.py --period 60d  # free MGC smoke-test bars
@@ -104,7 +104,7 @@ python tools/test_mgc_dry_run.py            # strategy + 1-contract sizing, no b
 python -m pytest test/unit -q
 ```
 
-รันจากในต้นไม้เท่านั้น — `python -m forex.bot.live` จาก root จะแจ้งเตือนและออก เพราะแต่ละต้นไม้
+รันจากในต้นไม้เท่านั้น — `python -m future.entrypoints.live` จาก root จะแจ้งเตือนและออก เพราะแต่ละต้นไม้
 เป็น import root ของตัวเอง
 
 ### สิ่งที่บอทดูแลอัตโนมัติ
@@ -238,14 +238,16 @@ projected daily/max-loss guard ของตัวเอง แต่ simulator �
 quantum-desk/
 ├── README.md · DOCUMENT.md
 ├── forex/                      FTMO · MT5 · XAUUSD
-│   ├── bot/       settings · broker(MT5) · guardrails(FTMO) · run · trader · main · live
+│   ├── entrypoints/ main.py · main.bat · research.py
+│   ├── bot/       settings · broker(MT5) · guardrails(FTMO) · run · trader · live
 │   ├── engine/    instrument · sizing · state · journal · news · market_hours · dynamic_risk
 │   ├── strategy/  quantum · technique_lab · backtest_reporting · webapp · mt5_source
 │   ├── tools/     ftmo_portfolio_sim · build_ftmo_report · plot · forward_check · launch
 │   ├── test/      unit(292) · docs · data · outputs · pine
-│   └── main.py
+│   └── (runtime state stays under bot/ for live compatibility)
 └── future/                     TopStep · ProjectX · MGCZ26
-    ├── bot/       settings · broker(ProjectX) · guardrails(TopStep) · trader · terminal · live
+    ├── entrypoints/ main.py · main.bat
+    ├── bot/       settings · broker(ProjectX) · guardrails(TopStep) · trader · live
     ├── engine/    สำเนา + decide_dollars · ladder_steps · fit_to_room
     ├── strategy/  สำเนา (webapp ถูกปิดไว้)
     ├── tools/     topstep_sim
@@ -302,7 +304,7 @@ Protocol) · env แยก `BOT_*` / `FUT_*` — การแก้ฝั่ง�
 | สถิติซิมนับวันหลังจบไปแล้ว | DD/best day เพี้ยน สองโหมดไม่ตรงกัน |
 | FTMO sim ไม่มี 4-day minimum และ internal stop | ผ่านตั้งแต่วันแรกได้ · นับ tail ที่บอทไม่มีวันเจอ |
 | `webapp.py` ฝั่งฟิวเจอร์สไม่มี template | TemplateNotFound ทันทีที่เรียก |
-| `python -m forex.bot.live` | ImportError ลึก ๆ ไม่บอกสาเหตุ |
+| `python -m future.entrypoints.live` | ImportError ลึก ๆ ไม่บอกสาเหตุ |
 | `engine` import `bot` ตอน TYPE_CHECKING | ผิดกฎ dependency ของโปรเจกต์ |
 
 ### 6.4 จากการปรับตั้งค่า
@@ -321,7 +323,7 @@ Protocol) · env แยก `BOT_*` / `FUT_*` — การแก้ฝั่ง�
 
 ## 7. เทอร์มินัล
 
-`python -m bot.terminal` ตอบสามคำถามในหน้าจอเดียว: เหลือระยะเท่าไรก่อนตก · ตลาดเปิดไหม ·
+`python -m entrypoints.main` ตอบสามคำถามในหน้าจอเดียว: เหลือระยะเท่าไรก่อนตก · ตลาดเปิดไหม ·
 ไม้ถัดไปกี่สัญญา
 
 ```
@@ -392,7 +394,7 @@ Protocol) · env แยก `BOT_*` / `FUT_*` — การแก้ฝั่ง�
 
 ก่อนเปิดบัญชีฟิวเจอร์สจริง
 
-- [ ] `python -m bot.live --check` ผ่านกับ demo key และชื่อบัญชี/สัญญาถูกต้อง
+- [ ] `python -m entrypoints.live --check` ผ่านกับ demo key และชื่อบัญชี/สัญญาถูกต้อง
 - [ ] เทียบ daily loss / max loss / profit target / เวลา flat-by ของโลหะ กับ rulebook ทางการ
 - [x] ดึงข้อมูล MGC Yahoo ลง `future/test/data/market/MGC/` และให้ simulator ใช้ MGC-only
 - [ ] ดึง ProjectX/TopStep MGC history เพิ่มเพื่อทำ acceptance benchmark

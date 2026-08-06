@@ -25,19 +25,27 @@ class EntryPointTests(unittest.TestCase):
             self.skipTest(f"could not spawn a subprocess: {error}")
 
     def test_root_level_module_execution_explains_itself(self):
-        # Regression: `python -m future.bot.live` died with a bare ImportError
+        # Regression: `python -m future.entrypoints.live` died with a bare ImportError
         # from deep inside the module, because each tree is its own import root
         # and `bot` bound to the wrong package.
-        result = self._run(["-m", "future.bot.live", "--help"], REPO)
+        result = self._run(["-m", "future.entrypoints.live", "--help"], REPO)
         self.assertNotEqual(result.returncode, 0)
         combined = result.stdout + result.stderr
         self.assertIn("cd future", combined)
         self.assertNotIn("ImportError", combined)
 
     def test_tree_local_execution_still_works(self):
-        result = self._run(["-m", "bot.live"], TREE)
+        result = self._run(["-m", "entrypoints.live"], TREE)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("FUTURES", result.stdout)
+
+    def test_future_entrypoint_from_root_explains_tree_boundary(self):
+        result = self._run(
+            ["-m", "future.entrypoints.main", "--status", "--offline"], REPO)
+        self.assertNotEqual(result.returncode, 0)
+        combined = result.stdout + result.stderr
+        self.assertIn("cd future", combined)
+        self.assertNotIn("ImportError", combined)
 
 
 class RemovedDashboardTests(unittest.TestCase):

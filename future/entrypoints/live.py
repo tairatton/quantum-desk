@@ -1,10 +1,10 @@
 """Entry point for the FUTURES instance: TopStep on the ProjectX Gateway.
 
-    python -m bot.live --check     read-only connection test
-    python -m bot.live             dry run, sends nothing
-    python -m bot.live --live      refuses until commissioned
+    python -m entrypoints.live --check     read-only connection test
+    python -m entrypoints.live             dry run, sends nothing
+    python -m entrypoints.live --live      refuses until commissioned
 
-The forex instance starts from `bot/live.py` and the two never start each
+The forex instance starts from `entrypoints/live.py` and the two never start each
 other. Running both at once is supported: separate settings, state, journal and
 lock file.
 """
@@ -17,17 +17,14 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 # Each tree is its own import root: `bot`, `engine`, `strategy` and `tools` are
-# top-level packages *within* it. Running `python -m future.bot.live` from the
-# repository root therefore cannot work -- Python would import
-# `future.bot`, whose own `from bot import ...` then resolves to a different,
-# unrelated package. That failure used to surface as a bare ImportError deep in
-# the module; it is caught here and explained instead.
-if __package__ and __package__ != "bot":
+# top-level packages *within* it. Running `python -m future.entrypoints.live` from
+# the repository root therefore cannot work -- Python would import `future.bot`,
+# whose own `from bot import ...` then resolves to a different package.
+if __package__ and __package__ != "entrypoints":
     raise SystemExit(
         "Run this from inside the tree, not from the repository root:\n"
-        "    cd future && python -m bot.live\n"
-        "Each tree is a separate import root, so `python -m future.bot.live` "
-        "would bind `bot` to the wrong package."
+        "    cd future && python -m entrypoints.live\n"
+        "Each tree is a separate import root."
     )
 if not __package__:
     PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -94,10 +91,10 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.live and not COMMISSIONED:
         print("[FUTURES] --live is refused: this instance is not commissioned.\n"
-              "          1. python -m bot.live --check\n"
+              "          1. python -m entrypoints.live --check\n"
               "          2. confirm the loss limits against TopStep's rulebook\n"
               "          3. re-measure the strategy on MGC data in test/data/\n"
-              "          then set COMMISSIONED = True in bot/live.py")
+              "          then set COMMISSIONED = True in entrypoints/live.py")
         return 2
 
     # UTC, not local: `session_open` converts to the exchange clock, and a naive

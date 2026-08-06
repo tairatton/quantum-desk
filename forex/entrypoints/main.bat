@@ -8,9 +8,9 @@ title Quantum Desk - Live Trading
 rem Run from the forex tree root so Python can import bot, engine and strategy.
 cd /d "%~dp0.."
 if exist "..\.venv\Scripts\python.exe" (
-  "..\.venv\Scripts\python.exe" -m bot.live %*
+  "..\.venv\Scripts\python.exe" -m entrypoints.live %*
 ) else (
-  python -m bot.live %*
+  python -m entrypoints.live %*
 )
 
 set "BOT_EXIT_CODE=%ERRORLEVEL%"

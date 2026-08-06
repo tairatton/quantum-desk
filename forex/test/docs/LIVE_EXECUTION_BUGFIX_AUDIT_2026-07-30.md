@@ -346,7 +346,7 @@ persistence edge case เพิ่มเติม:
 3. เมื่อ broker server day เปลี่ยน `roll_day()` reset request count ก่อน checkpoint
    ของ pass วันใหม่ ทำให้ request ที่เกิดใน pass ใหม่นับเข้าวันใหม่
 4. Dry-run ปิด persistence จึงไม่สามารถ replace production `state.json`
-5. LIVE instance lock ถูกทดสอบด้วยการพยายามเริ่ม `python -m bot.main` ตัวที่สอง
+5. LIVE instance lock ถูกทดสอบด้วยการพยายามเริ่ม `python -m entrypoints.main` ตัวที่สอง
    และถูกบล็อกทันทีด้วยข้อความ
    `another Quantum Desk LIVE process is already running`
 6. State และ journal ไม่มี open managed trade, connection error, rejected write
@@ -374,7 +374,7 @@ persistence edge case เพิ่มเติม:
    ปฏิเสธการแก้ไข ระบบจะ alert และ retry แต่จะไม่ปิด market เอง เพราะการปิดทันที
    เป็น exit policy ใหม่ที่ยังไม่ได้ผ่าน backtest
 5. หน้าต่าง console เก่าที่หยุดจาก controlled restart ไม่มี process ซื้อขายแล้ว
-   ปิดได้ โดยตรวจให้เหลือ `python -m bot.main` เพียง process เดียว
+ปิดได้ โดยตรวจให้เหลือ `python -m entrypoints.main` เพียง process เดียว
 
 ## เอกสารอ้างอิง MT5
 

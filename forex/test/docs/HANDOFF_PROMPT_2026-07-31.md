@@ -183,7 +183,7 @@ python -m bot.code.run --once                  # dry-run หนึ่งรอ�
 
 ### ข้อควรระวังเวลาแก้ต่อ
 
-- `bot/main.py` และ `bot/main.bat` **เริ่ม live trading ทันที** ห้ามรันตอนทดสอบ
+- `entrypoints/main.bat` **เริ่ม live trading ทันที** ห้ามรันตอนทดสอบ
 - `open_trade` แยกประเภทออเดอร์ด้วย `intent.action == "market"` — ถ้าจะเพิ่ม
   action ใหม่ต้องไล่แก้ทุกจุดที่เช็ค action ไม่งั้นจะกลายเป็นส่ง limit โดยไม่ตั้งใจ
   (เคยพลาดมาแล้ว จึงใช้ flag `Intent.converted` แทน)

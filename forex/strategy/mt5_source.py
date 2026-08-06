@@ -327,7 +327,7 @@ def load(symbol: str, timeframe: str) -> tuple[pd.DataFrame, DataMeta | None]:
     if not path.exists():
         raise FileNotFoundError(
             f"No cached data at {path}\n"
-            f"  Fetch it first:  python main.py fetch {timeframe} --symbol {symbol}"
+            f"  Fetch it first:  python -m entrypoints.research fetch {timeframe} --symbol {symbol}"
         )
 
     df = pd.read_csv(path)
@@ -340,7 +340,7 @@ def load(symbol: str, timeframe: str) -> tuple[pd.DataFrame, DataMeta | None]:
         if not meta.is_real:
             print("=" * 68)
             print(" WARNING: this dataset is MOCK data - analysis below is meaningless")
-            print(f"          regenerate with:  python main.py fetch {timeframe} "
+            print(f"          regenerate with:  python -m entrypoints.research fetch {timeframe} "
                   f"--symbol {symbol}")
             print("=" * 68)
     else:

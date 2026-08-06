@@ -1488,7 +1488,7 @@ def execute(*, live: bool = False, once: bool = False, status: bool = False,
             flatten: bool = False, reconcile_only: bool = False) -> None:
     """Open a session and do one thing with it.
 
-    Separate from `main` so `bot.main`'s menu can ask for an action directly
+    Separate from `entrypoints.main` so the menu can ask for an action directly
     rather than assembling command-line strings and re-parsing them.
     """
     instance_lock = LiveInstanceLock(LIVE_LOCK_PATH) if live else None

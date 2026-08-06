@@ -1,17 +1,28 @@
 """HTF Quantum Adaptive analysis (XAUUSD / BTCUSD) - CLI entry point.
 
-    python main.py fetch    H1 --symbol BTCUSD --bars 6000
-    python main.py analyze  H1 --symbol XAUUSD
-    python main.py plot     H4 --symbol BTCUSD
-    python main.py run      H1              # fetch + analyze + plot
-    python main.py serve                    # web dashboard on :8000
-    python main.py backtest                 # measure every symbol x timeframe
-    python main.py symbols                  # what the broker offers
+    python -m entrypoints.research fetch    H1 --symbol BTCUSD --bars 6000
+    python -m entrypoints.research analyze  H1 --symbol XAUUSD
+    python -m entrypoints.research plot     H4 --symbol BTCUSD
+    python -m entrypoints.research run      H1  # fetch + analyze + plot
+    python -m entrypoints.research serve       # web dashboard on :8000
+    python -m entrypoints.research backtest    # measure every symbol x timeframe
+    python -m entrypoints.research symbols     # what the broker offers
 """
 from __future__ import annotations
 
 import argparse
 import sys
+from pathlib import Path
+
+if __package__ and __package__ != "entrypoints":
+    raise SystemExit(
+        "Run this from inside the Forex tree:\n"
+        "    cd forex && python -m entrypoints.research"
+    )
+if not __package__:
+    PROJECT_ROOT = Path(__file__).resolve().parents[1]
+    if str(PROJECT_ROOT) not in sys.path:
+        sys.path.insert(0, str(PROJECT_ROOT))
 
 from strategy import config, mt5_source, quantum
 
@@ -228,7 +239,7 @@ def cmd_serve(args) -> int:
 
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
-        prog="main.py",
+        prog="python -m entrypoints.research",
         description="HTF Quantum Adaptive analysis (MetaTrader 5)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,

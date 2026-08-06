@@ -16,7 +16,8 @@ ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from bot import guardrails, terminal, trader            # noqa: E402
+from bot import guardrails, trader                     # noqa: E402
+from entrypoints import main as terminal               # noqa: E402
 from bot.broker import OrderRejected, ProjectXError, size_contracts    # noqa: E402
 from bot.settings import Settings                       # noqa: E402
 from engine.signals import Intent                              # noqa: E402

@@ -1,6 +1,6 @@
 """Flask web server for the Pine HTF Quantum Adaptive dashboard.
 
-Run it with:  python main.py serve
+Run it with:  python -m entrypoints.research serve
 
 Flask (sync) rather than FastAPI (async) on purpose: the MetaTrader5 API is
 blocking C-extension IPC, so an async framework would just push every call into

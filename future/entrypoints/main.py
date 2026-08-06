@@ -1,4 +1,4 @@
-"""เทอร์มินัลของบอทฟิวเจอร์ส — `python -m bot.terminal`
+"""เทอร์มินัลของบอทฟิวเจอร์ส — `python -m entrypoints.main`
 
 หน้าจอเดียวที่ตอบสามคำถามก่อนตัดสินใจอะไรก็ตาม: ตอนนี้บัญชีเหลือระยะเท่าไรก่อนตก,
 ตลาดเปิดให้เข้าไม้ไหม, และไม้ถัดไปจะสั่งกี่สัญญา
@@ -7,20 +7,31 @@
 ยอดเงินจริงจะดึงมาก็ต่อเมื่อมี key เท่านั้น เพราะหน้าจอที่ล่มตอนเน็ตหลุดคือหน้าจอที่
 ใช้ไม่ได้ตอนที่ต้องใช้ที่สุด
 
-    python -m bot.terminal            เมนู
-    python -m bot.terminal --status   พิมพ์สถานะครั้งเดียวแล้วออก (ใช้กับ cron ได้)
+    python -m entrypoints.main            เมนู
+    python -m entrypoints.main --status   พิมพ์สถานะครั้งเดียวแล้วออก (ใช้กับ cron ได้)
 """
 from __future__ import annotations
 
 import argparse
 import sys
 from datetime import datetime, timezone
+from pathlib import Path
+
+if __package__ and __package__ != "entrypoints":
+    raise SystemExit(
+        "Run this from inside the Futures tree:\n"
+        "    cd future && python -m entrypoints.main"
+    )
+if not __package__:
+    PROJECT_ROOT = Path(__file__).resolve().parents[1]
+    if str(PROJECT_ROOT) not in sys.path:
+        sys.path.insert(0, str(PROJECT_ROOT))
 
 from engine.state import BotState
 
-from . import guardrails, trader
-from .broker import Broker, ProjectXError, size_contracts
-from .settings import JOURNAL_PATH, KILL_SWITCH, STATE_PATH, Settings, load
+from bot import guardrails, trader
+from bot.broker import Broker, ProjectXError, size_contracts
+from bot.settings import JOURNAL_PATH, KILL_SWITCH, STATE_PATH, Settings, load
 
 WIDTH = 78
 LINE = "=" * WIDTH
@@ -237,7 +248,7 @@ def menu() -> int:
         elif choice == "2":
             status(settings, connect=False)
         elif choice == "3":
-            from .live import check
+            from entrypoints.live import check
             check(settings)
         elif choice == "4":
             _journal()

@@ -1,6 +1,6 @@
 """Start the FOREX instance live: FTMO rules, MT5 session, XAUUSD.
 
-The futures instance has its own entry point in ``bot/live.py``. Neither
+The futures instance has its own entry point in ``entrypoints/live.py``. Neither
 starts the other, and each holds its own single-instance lock, so running both
 at once is a supported thing to do rather than an accident waiting to happen.
 """
@@ -12,17 +12,14 @@ from datetime import datetime
 from pathlib import Path
 
 # Each tree is its own import root: `bot`, `engine`, `strategy` and `tools` are
-# top-level packages *within* it. Running `python -m forex.bot.live` from the
-# repository root therefore cannot work -- Python would import
-# `forex.bot`, whose own `from bot import ...` then resolves to a different,
-# unrelated package. That failure used to surface as a bare ImportError deep in
-# the module; it is caught here and explained instead.
-if __package__ and __package__ != "bot":
+# top-level packages *within* it. Running `python -m forex.entrypoints.live` from
+# the repository root therefore cannot work -- Python would import `forex.bot`,
+# whose own `from bot import ...` then resolves to a different package.
+if __package__ and __package__ != "entrypoints":
     raise SystemExit(
         "Run this from inside the tree, not from the repository root:\n"
-        "    cd forex && python -m bot.live\n"
-        "Each tree is a separate import root, so `python -m forex.bot.live` "
-        "would bind `bot` to the wrong package."
+        "    cd forex && python -m entrypoints.live\n"
+        "Each tree is a separate import root."
     )
 if not __package__:
     PROJECT_ROOT = Path(__file__).resolve().parents[1]
