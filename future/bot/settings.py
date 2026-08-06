@@ -1,0 +1,255 @@
+"""Every tunable the futures instance has, in one place.
+
+Deliberately a separate dataclass from `bot.settings.Settings` rather than
+a subclass of it. The two venues agree on almost nothing that matters: TopStep
+sizes in whole contracts and denominates its limits in dollars, FTMO sizes in
+lots and denominates in percent of the initial balance. Sharing one class would
+mean every field carrying "…unless futures", and one careless default would
+reach the live forex account.
+
+The environment override prefix is `FUT_`, not `BOT_`. Setting `BOT_RISK_PERCENT`
+in a shell must not silently resize futures orders.
+
+Override any field with `FUT_<FIELD>` or with `bot/settings.local.json`.
+"""
+from __future__ import annotations
+
+import json
+import math
+import os
+from dataclasses import dataclass, field, fields
+from pathlib import Path
+
+FUTURE_DIR = Path(__file__).resolve().parent
+STATE_PATH = FUTURE_DIR / "state.json"
+JOURNAL_PATH = FUTURE_DIR / "journal.jsonl"
+LOCAL_SETTINGS = FUTURE_DIR / "settings.local.json"
+LIVE_LOCK_PATH = FUTURE_DIR / ".live.lock"
+# Presence of this file blocks every new entry. Deleting it resumes trading.
+# Separate from the forex kill switch on purpose: stopping one must not stop
+# the other, and neither must be stopped by accident.
+KILL_SWITCH = FUTURE_DIR / "STOP"
+
+ENV_PREFIX = "FUT_"
+
+
+@dataclass(frozen=True)
+class Settings:
+    # --- what to trade -----------------------------------------------------
+    # ProjectX names a contract like "CON.F.US.MGC.Z26"; `contract_symbol` is the
+    # root the bot searches for and `contract_id` pins the exact expiry once
+    # resolved. Roll is manual on purpose: an automatic roll would change the
+    # instrument under a live position.
+    contract_symbol: str = "MGC"
+    contract_id: str = ""
+    timeframes: tuple[str, ...] = ("M15", "M30")
+    history_bars: int = 3000
+
+    # --- contract economics ------------------------------------------------
+    # MGC (Micro Gold, 10 troy oz): 0.10 per tick, $1.00 per tick, so $10.00 per
+    # dollar of gold. These are contract facts, not preferences -- confirm
+    # against the exchange spec before trading a different root, because sizing
+    # divides by them.
+    tick_size: float = 0.10
+    tick_value: float = 1.00
+    # Whole contracts only. There is no 0.01 of a future.
+    contract_step: int = 1
+    min_contracts: int = 1
+    max_contracts: int = 5
+
+    # --- risk ---------------------------------------------------------------
+    # Denominated in dollars, not percent: TopStep's limits are dollar amounts
+    # that do not scale with equity, so expressing risk as a percentage of a
+    # moving balance would drift against the rule that actually ends the account.
+    risk_dollars: float = 200.0
+    max_open_risk_dollars: float = 400.0
+    max_concurrent_trades: int = 2
+
+    # --- TopStep account rules ---------------------------------------------
+    # ESTIMATES for a 50K Combine, and the single most important thing to verify
+    # before going live: TopStep publishes these per account size and changes
+    # them. Wrong here means the bot thinks it is safe while the account is
+    # already gone. Confirm each against the current TopStep rulebook.
+    account_size: float = 50_000.0
+    daily_loss_limit_dollars: float = 1_000.0
+    max_loss_limit_dollars: float = 2_000.0
+    profit_target_dollars: float = 3_000.0
+    min_trading_days: int = 2
+    # TopStep's max loss trails the highest END-OF-DAY balance, not intraday
+    # equity, and on a funded account it stops trailing once it reaches the
+    # starting balance. FTMO's equivalent is static -- this flag is the whole
+    # difference and `guardrails` reads it rather than assuming.
+    trailing_max_loss: bool = True
+    trailing_stops_at_initial_balance: bool = True
+    # Internal stop, hit before the firm's limit, so a bad day ends by the bot's
+    # choice rather than the firm's. Same idea as the forex internal day cap.
+    internal_daily_stop_dollars: float = 400.0
+    max_consecutive_losses: int = 3
+    stop_at_target: bool = True
+    # Consistency rule: no single day may be more than this share of total
+    # profit when a payout is requested. Verify the current figure; it gates
+    # withdrawals rather than the account, so it warns instead of blocking.
+    consistency_max_day_share: float = 0.50
+
+    # --- sessions -----------------------------------------------------------
+    # COMEX gold trades nearly around the clock but TopStep requires flat before
+    # the daily close. Times are US/Central, the exchange's own clock, because
+    # that is the clock the rule is written in. VERIFY the deadline for metals
+    # specifically -- it is not the same hour as the equity index products, and
+    # being late is a rule breach rather than a bad fill.
+    exchange_timezone: str = "America/Chicago"
+    flat_by_hour: int = 15
+    flat_by_minute: int = 10
+    session_break_start_hour: int = 16    # 16:00-17:00 CT daily maintenance halt
+    session_break_end_hour: int = 17
+
+    # --- news ---------------------------------------------------------------
+    news_enabled: bool = True
+    news_require_calendar: bool = True
+    news_currencies: tuple[str, ...] = ("USD",)
+    news_min_impact: str = "high"
+    news_minutes_before: int = 5
+    news_minutes_after: int = 3
+
+    # --- exit ---------------------------------------------------------------
+    # `fixed_tp3` needs one contract; `be_33_33_34` needs three, and unlike lots
+    # there is no rounding that can fake a third leg. Below three contracts the
+    # split exit is not available at all, which `guardrails` refuses rather than
+    # silently degrading to a different system than the lab measured.
+    exit_mode: str = "contract_tier"
+    split_exit_min_contracts: int = 3
+
+    # --- connection ---------------------------------------------------------
+    # Credentials never live here. Set FUT_PROJECTX_USERNAME and
+    # FUT_PROJECTX_API_KEY in the environment; `broker` reads them directly.
+    projectx_base_url: str = "https://api.topstepx.com"
+    projectx_user_hub_url: str = "https://rtc.topstepx.com/hubs/user"
+    projectx_market_hub_url: str = "https://rtc.topstepx.com/hubs/market"
+    account_id: int = 0                  # 0 = resolve the single active account
+    request_timeout_seconds: float = 15.0
+    write_spacing_seconds: float = 1.0
+    reconnect_initial_seconds: float = 5.0
+    reconnect_max_seconds: float = 60.0
+    max_requests_per_day: int = 20_000
+
+    # --- bookkeeping --------------------------------------------------------
+    initial_balance: float = 0.0         # 0 = capture the balance on first run
+    tags: tuple[str, ...] = field(default_factory=lambda: ("quantum",))
+
+    def __post_init__(self) -> None:
+        errors = []
+        finite = {
+            "risk_dollars": self.risk_dollars,
+            "max_open_risk_dollars": self.max_open_risk_dollars,
+            "daily_loss_limit_dollars": self.daily_loss_limit_dollars,
+            "max_loss_limit_dollars": self.max_loss_limit_dollars,
+            "internal_daily_stop_dollars": self.internal_daily_stop_dollars,
+            "profit_target_dollars": self.profit_target_dollars,
+            "tick_size": self.tick_size,
+            "tick_value": self.tick_value,
+        }
+        non_finite = [name for name, value in finite.items()
+                      if not math.isfinite(float(value))]
+        if non_finite:
+            errors.append("risk settings must be finite: " + ", ".join(non_finite))
+        if not self.contract_symbol.strip():
+            errors.append("contract_symbol must not be empty")
+        if not self.timeframes:
+            errors.append("timeframes must not be empty")
+        if self.tick_size <= 0 or self.tick_value <= 0:
+            errors.append("tick_size and tick_value must be > 0")
+        if self.contract_step < 1 or self.min_contracts < 1:
+            errors.append("contract_step and min_contracts must be >= 1")
+        if self.max_contracts < self.min_contracts:
+            errors.append("max_contracts must be >= min_contracts")
+        if self.risk_dollars <= 0:
+            errors.append("risk_dollars must be > 0")
+        if self.max_open_risk_dollars < self.risk_dollars:
+            errors.append("max_open_risk_dollars must be >= risk_dollars")
+        if not 0 < self.internal_daily_stop_dollars <= self.daily_loss_limit_dollars:
+            errors.append("internal_daily_stop_dollars must be > 0 and "
+                          "<= daily_loss_limit_dollars")
+        if self.daily_loss_limit_dollars <= 0 or self.max_loss_limit_dollars <= 0:
+            errors.append("daily and max loss limits must be > 0")
+        if self.daily_loss_limit_dollars > self.max_loss_limit_dollars:
+            errors.append("daily_loss_limit_dollars must be <= max_loss_limit_dollars")
+        if self.max_concurrent_trades < 1:
+            errors.append("max_concurrent_trades must be >= 1")
+        if self.max_consecutive_losses < 1:
+            errors.append("max_consecutive_losses must be >= 1")
+        if self.profit_target_dollars <= 0 or self.min_trading_days < 1:
+            errors.append("profit target and minimum trading days must be positive")
+        if not 0 < self.consistency_max_day_share <= 1:
+            errors.append("consistency_max_day_share must be in (0, 1]")
+        if self.exit_mode not in {"fixed_tp3", "be_33_33_34", "contract_tier"}:
+            errors.append(f"unsupported exit_mode: {self.exit_mode}")
+        if self.split_exit_min_contracts < 3:
+            errors.append("split_exit_min_contracts must be >= 3: the split exit "
+                          "has three legs and contracts cannot be divided")
+        if not 0 <= self.flat_by_hour <= 23 or not 0 <= self.flat_by_minute <= 59:
+            errors.append("flat_by_hour/flat_by_minute must be a valid time of day")
+        if self.request_timeout_seconds <= 0:
+            errors.append("request_timeout_seconds must be > 0")
+        if self.write_spacing_seconds < 0:
+            errors.append("write_spacing_seconds must be >= 0")
+        if self.reconnect_initial_seconds <= 0:
+            errors.append("reconnect_initial_seconds must be > 0")
+        if self.reconnect_max_seconds < self.reconnect_initial_seconds:
+            errors.append("reconnect_max_seconds must be >= reconnect_initial_seconds")
+        if self.news_minutes_before < 0 or self.news_minutes_after < 0:
+            errors.append("news windows must not be negative")
+        if errors:
+            raise ValueError("invalid futures settings: " + "; ".join(errors))
+
+    @property
+    def value_per_point(self) -> float:
+        """Account currency per 1.0 of price, per single contract."""
+        return self.tick_value / self.tick_size
+
+    def resolved_exit_mode(self, contracts: int) -> str:
+        """Concrete exit policy for a position of this many contracts.
+
+        The forex twin tiers on anchored capital because a lot can be split
+        three ways at any balance that sizes 0.03. Contracts cannot: three legs
+        need three contracts, full stop, so the tier is on contract count.
+        """
+        if self.exit_mode != "contract_tier":
+            return self.exit_mode
+        return ("be_33_33_34" if contracts >= self.split_exit_min_contracts
+                else "fixed_tp3")
+
+    def leg_weights_for(self, contracts: int) -> tuple[float, ...]:
+        if self.resolved_exit_mode(contracts) == "fixed_tp3":
+            return (1.0,)
+        return (0.33, 0.33, 0.34)
+
+
+def _coerce(raw: str, current):
+    if isinstance(current, bool):
+        return raw.strip().lower() in {"1", "true", "yes", "on"}
+    if isinstance(current, tuple):
+        return tuple(part.strip() for part in raw.split(",") if part.strip())
+    return type(current)(raw)
+
+
+def load() -> Settings:
+    """Defaults, then settings.local.json, then FUT_* environment variables.
+
+    A key beginning with `_` is a comment and is ignored, so the reason behind a
+    number can sit next to it. Any other unknown key still raises: a typo in a
+    loss limit must not pass silently.
+    """
+    values: dict[str, object] = {}
+    if LOCAL_SETTINGS.exists():
+        values.update({key: value for key, value
+                       in json.loads(LOCAL_SETTINGS.read_text(encoding="utf-8")).items()
+                       if not key.startswith("_")})
+    defaults = Settings()
+    for spec in fields(Settings):
+        env = os.getenv(f"{ENV_PREFIX}{spec.name.upper()}")
+        if env is not None:
+            values[spec.name] = _coerce(env, getattr(defaults, spec.name))
+    for key in ("timeframes", "tags", "news_currencies"):
+        if isinstance(values.get(key), list):
+            values[key] = tuple(values[key])
+    return Settings(**values)

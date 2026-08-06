@@ -3,25 +3,35 @@ __pycache__/
 .venv/
 venv/
 .pytest_cache/
-.codex/
 
-# Market data and rendered output are reproducible from MT5.
-data/market/**/*.csv
-data/market/**/*.meta.json
-data/ai_decisions/*.jsonl
-outputs/charts/**/*
-outputs/backtests/**/*
+# Market data and rendered output are reproducible from the venue's own feed.
+# Listed per tree rather than globbed: `forex/` and `future/` are independent,
+# and a new tree should have to say what it stores instead of inheriting it.
+forex/test/data/market/**/*.csv
+forex/test/data/market/**/*.meta.json
+forex/test/data/ai_decisions/*.jsonl
+forex/test/outputs/charts/**/*
+forex/test/outputs/backtests/**/*
+future/test/data/market/**/*.csv
+future/test/data/market/**/*.meta.json
+future/test/outputs/charts/**/*
+future/test/outputs/backtests/**/*
 
-# Live bot runtime state: account specific, never shared.
-bot/state.json
-bot/news_cache.json
-bot/journal.jsonl
-bot/settings.local.json
-bot/STOP
-bot/code/state*.json*
-bot/code/state*.json.tmp
-bot/code/news_cache.json
-bot/code/journal.jsonl
-bot/code/settings.local.json
-bot/code/STOP
-bot/code/.live.lock
+# Live runtime state: account specific, never shared. Each tree keeps its own
+# set, which is the point of splitting them.
+forex/bot/state.json
+forex/bot/journal.jsonl
+forex/bot/settings.local.json
+forex/bot/STOP
+forex/bot/.live.lock
+forex/engine/news_cache.json
+future/bot/state.json
+future/bot/journal.jsonl
+future/bot/settings.local.json
+future/bot/STOP
+future/bot/.live.lock
+future/engine/news_cache.json
+
+# Credentials never belong in the repo: MT5 logins and ProjectX API keys are
+# read from the environment.
+.env
