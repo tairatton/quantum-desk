@@ -3,20 +3,26 @@
 Two prop-firm trading systems, kept completely apart.
 
 ```
-forex/     FTMO · MetaTrader 5 · XAUUSD spot, sized in lots
-future/    TopStep · ProjectX Gateway · MGCZ26 micro gold, sized in contracts
+bot/forex/     FTMO · MetaTrader 5 · XAUUSD spot, sized in lots
+bot/future/    TopStep · ProjectX Gateway · MGCZ26 micro gold, sized in contracts
 ```
 
-Each tree is self-contained and runs from its own directory:
+Each tree is self-contained and runs from its own directory. The tree root
+holds only what a person needs to start the bot; everything else is under
+`core/`:
 
 ```
-<tree>/
-  entrypoints/ user-facing main modules and batch launchers
-  bot/        live execution: settings, broker, guardrails, run, trader, live
-  engine/     sizing, state, journal, news, sessions, instance lock
-  strategy/   signal generation and the backtest lab
-  tools/      simulators, reports, launchers
-  test/       unit/  ·  docs  ·  data  ·  outputs
+bot/<tree>/
+  main.py     double-click-friendly menu (delegates into core/entrypoints)
+  main.bat    double-click launcher — forex starts the live loop directly,
+              future opens the terminal menu
+  core/
+    entrypoints/ the real main/live/research modules main.py and main.bat call
+    bot/        live execution: settings, broker, guardrails, run, trader, live
+    engine/     sizing, state, journal, news, sessions, instance lock
+    strategy/   signal generation and the backtest lab
+    tools/      simulators, reports, launchers
+    test/       unit/  ·  docs  ·  data  ·  outputs
 ```
 
 There is no shared code at the root and no import crosses between the trees.
@@ -47,8 +53,12 @@ library.
 
 ## Running
 
+Double-click `bot/forex/main.bat` or `bot/future/main.bat`, or from a shell:
+
 ```bash
-cd forex
+cd bot/forex
+python main.py                      # menu: status, dry run, live, stop, journal
+cd core
 python -m bot.run --status          # account, guards, live R stats
 python -m bot.run --once            # one pass, dry run
 python -m bot.run --live            # sends real orders
@@ -57,9 +67,10 @@ python tools/ftmo_portfolio_sim.py  # pass rate and drawdown against FTMO rules
 ```
 
 ```bash
-cd future
-python -m entrypoints.main          # menu: status, connection test, kill switch
-python -m entrypoints.main --status --offline   # one status screen, no network
+cd bot/future
+python main.py                      # menu: status, connection test, kill switch
+python main.py --status --offline   # one status screen, no network
+cd core
 python -m entrypoints.live --check  # read-only ProjectX connection test
 python -m entrypoints.live          # dry run
 python -m pytest test/unit -q
@@ -70,7 +81,7 @@ The futures tree is **not commissioned**: `--live` refuses until the ProjectX
 endpoints have been exercised against a demo key, TopStep's limits have been
 confirmed against the current rulebook, and the strategy has been re-measured on
 MGC data rather than borrowed from XAUUSD spot. See
-`future/test/docs/TOPSTEP_RULES_AND_SIM.md`.
+`bot/future/core/test/docs/TOPSTEP_RULES_AND_SIM.md`.
 
 ## Credentials
 

@@ -71,7 +71,7 @@ tier บนสุดถูกผูกกับ `internal_daily_stop_dollars` �
   คือโดนล็อกวันเดียว ไม่ใช่สอบตก
 - `fit_to_room()` — ถ้า tier ที่ต้องการไม่พอดีห้อง ให้ลดลงมาเป็น tier ที่พอดี ถ้าไม่มีเลย = ไม่เทรด
 
-ฝั่ง FTMO มี projected daily/max-loss guard ใน `forex/bot/guardrails.py` และเรียกก่อนเข้าไม้
+ฝั่ง FTMO มี projected daily/max-loss guard ใน `bot/forex/core/bot/guardrails.py` และเรียกก่อนเข้าไม้
 แล้ว แต่ยังไม่ได้ใช้ fixed-reserve room model แบบ TopStep ใน simulator ดังนั้นผล decay ของสอง
 ต้นไม้เทียบกันตรง ๆ ไม่ได้จนกว่าจะรันด้วย harness และ seed เดียวกัน
 
@@ -79,8 +79,11 @@ tier บนสุดถูกผูกกับ `internal_daily_stop_dollars` �
 
 ## 2. ทำอะไรได้บ้าง
 
+ดับเบิลคลิก `bot/forex/main.bat` (เข้า live ทันที) หรือ `python bot/forex/main.py` (เมนู) — คำสั่ง
+ย่อยรันจากใน `core/` ของต้นไม้นั้น:
+
 ```bash
-cd forex
+cd bot/forex/core
 python -m bot.run --status            # สถานะบัญชี guard และสถิติ R จริง
 python -m bot.run --once              # เดินหนึ่งรอบ dry run
 python -m bot.run --live              # ส่งออเดอร์จริง
@@ -93,7 +96,7 @@ python -m pytest test/unit -q
 ```
 
 ```bash
-cd future
+cd bot/future/core
 python -m entrypoints.main                  # เทอร์มินัลเมนู
 python -m entrypoints.main --status --offline  # สถานะหน้าเดียว ไม่ต้องต่อเน็ต
 python -m entrypoints.live --check         # ทดสอบเชื่อมต่อ อ่านอย่างเดียว
@@ -104,8 +107,8 @@ python tools/test_mgc_dry_run.py            # strategy + 1-contract sizing, no b
 python -m pytest test/unit -q
 ```
 
-รันจากในต้นไม้เท่านั้น — `python -m future.entrypoints.live` จาก root จะแจ้งเตือนและออก เพราะแต่ละต้นไม้
-เป็น import root ของตัวเอง
+รันจากใน `core/` ของต้นไม้เท่านั้น — `python -m future.entrypoints.live` จาก root จะแจ้งเตือนและออก
+เพราะแต่ละต้นไม้เป็น import root ของตัวเอง
 
 ### สิ่งที่บอทดูแลอัตโนมัติ
 
@@ -146,7 +149,7 @@ python -m pytest test/unit -q
 
 ### 3.3 TopStep — 20,000 paths, ladder + room guard
 
-คำสั่งนี้ใช้เฉพาะข้อมูล Yahoo `MGC=F` ใน `future/test/data/market/MGC/`
+คำสั่งนี้ใช้เฉพาะข้อมูล Yahoo `MGC=F` ใน `bot/future/core/test/data/market/MGC/`
 เท่านั้น ไม่อ่านรายงาน XAUUSD ของ Forex
 (`python tools/topstep_sim.py` จะปฏิเสธ scenario ของ Forex)
 
@@ -237,22 +240,33 @@ projected daily/max-loss guard ของตัวเอง แต่ simulator �
 ```
 quantum-desk/
 ├── README.md · DOCUMENT.md
-├── forex/                      FTMO · MT5 · XAUUSD
-│   ├── entrypoints/ main.py · main.bat · research.py
-│   ├── bot/       settings · broker(MT5) · guardrails(FTMO) · run · trader · live
-│   ├── engine/    instrument · sizing · state · journal · news · market_hours · dynamic_risk
-│   ├── strategy/  quantum · technique_lab · backtest_reporting · webapp · mt5_source
-│   ├── tools/     ftmo_portfolio_sim · build_ftmo_report · plot · forward_check · launch
-│   ├── test/      unit(292) · docs · data · outputs · pine
-│   └── (runtime state stays under bot/ for live compatibility)
-└── future/                     TopStep · ProjectX · MGCZ26
-    ├── entrypoints/ main.py · main.bat
-    ├── bot/       settings · broker(ProjectX) · guardrails(TopStep) · trader · live
-    ├── engine/    สำเนา + decide_dollars · ladder_steps · fit_to_room
-    ├── strategy/  สำเนา (webapp ถูกปิดไว้)
-    ├── tools/     topstep_sim
-    └── test/      unit(107) · docs · data · outputs
+└── bot/
+    ├── forex/                  FTMO · MT5 · XAUUSD
+    │   ├── main.py             เมนู (ดับเบิลคลิกไม่ได้ตรง ๆ — รัน main.bat หรือ python main.py)
+    │   ├── main.bat            ดับเบิลคลิกเข้า live loop ทันที
+    │   └── core/
+    │       ├── entrypoints/    main.py(จริง) · live.py · research.py
+    │       ├── bot/            settings · broker(MT5) · guardrails(FTMO) · run · trader · live
+    │       ├── engine/         instrument · sizing · state · journal · news · market_hours · dynamic_risk
+    │       ├── strategy/       quantum · technique_lab · backtest_reporting · webapp · mt5_source
+    │       ├── tools/          ftmo_portfolio_sim · build_ftmo_report · plot · forward_check · launch
+    │       ├── test/           unit(292) · docs · data · outputs · pine
+    │       └── (runtime state stays under core/bot/ for live compatibility)
+    └── future/                 TopStep · ProjectX · MGCZ26
+        ├── main.py             เมนู
+        ├── main.bat            ดับเบิลคลิกเปิดเมนู
+        └── core/
+            ├── entrypoints/    main.py(จริง) · live.py
+            ├── bot/            settings · broker(ProjectX) · guardrails(TopStep) · trader · live
+            ├── engine/         สำเนา + decide_dollars · ladder_steps · fit_to_room
+            ├── strategy/       สำเนา (webapp ถูกปิดไว้)
+            ├── tools/          topstep_sim
+            └── test/           unit(107) · docs · data · outputs
 ```
+
+`main.py`/`main.bat` ที่ root ของแต่ละต้นไม้เป็นจุดเดียวที่ผู้ใช้ต้องเห็น — ที่เหลือทั้งหมดถูกเก็บไว้ใต้
+`core/` ให้โฟลเดอร์ไม่รก ตัว `main.py` แค่เติม `core/` เข้า `sys.path` แล้วเรียก
+`core/entrypoints/main.py:main()` ของจริง ไม่มีตรรกะซ้ำ
 
 **กฎเหล็ก:** ไม่มี import ข้ามต้นไม้ · `engine` ไม่ import `bot` แม้แต่ตอน TYPE_CHECKING (ใช้
 Protocol) · env แยก `BOT_*` / `FUT_*` — การแก้ฝั่งฟิวเจอร์สจึงแตะบัญชี FTMO ที่รันเงินจริงไม่ได้
@@ -371,7 +385,7 @@ Protocol) · env แยก `BOT_*` / `FUT_*` — การแก้ฝั่ง�
 
 ## 9. สิ่งที่ยังไม่เสร็จ
 
-1. **`future/bot/run.py` ยังไม่มี** — มีตั้งแต่ signal → sizing → ส่งออเดอร์ และเทอร์มินัล แต่ยังไม่มี
+1. **`bot/future/core/bot/run.py` ยังไม่มี** — มีตั้งแต่ signal → sizing → ส่งออเดอร์ และเทอร์มินัล แต่ยังไม่มี
    loop ที่ consume fill, amend bracket ของขาที่เหลือ, บังคับ flatten 15:10, save state และ
    reconcile หลัง restart · `stop_after_tp1`/`stop_after_tp2` ยังไม่มีที่เรียกใน production
 2. **`eod_balance_high_water` เขียนแล้วใน `roll_day()`** แต่ต้องมี run loop มาเรียกทุกสิ้นวัน
@@ -385,7 +399,7 @@ Protocol) · env แยก `BOT_*` / `FUT_*` — การแก้ฝั่ง�
    คำสั่ง simulator ปกติใช้ dynamic ladder + room guard เหมือน production
 8. **merge `forex/bot/journal.pre-split-20260806.jsonl`** เข้าสมุดหลัก เรียงตาม `at` ตอนหยุดบอท
    ครั้งถัดไป (ตอนนี้ `--status` ยังขาด 5 closed trades)
-9. `forex/bot/state.pre-fix-20260731.json` ยังมี conflict marker ค้างจาก merge เดิม
+9. `bot/forex/core/bot/state.pre-fix-20260731.json` ยังมี conflict marker ค้างจาก merge เดิม
 10. ยังไม่ commit — ทุกอย่างอยู่ใน working tree
 
 ---
@@ -396,7 +410,7 @@ Protocol) · env แยก `BOT_*` / `FUT_*` — การแก้ฝั่ง�
 
 - [ ] `python -m entrypoints.live --check` ผ่านกับ demo key และชื่อบัญชี/สัญญาถูกต้อง
 - [ ] เทียบ daily loss / max loss / profit target / เวลา flat-by ของโลหะ กับ rulebook ทางการ
-- [x] ดึงข้อมูล MGC Yahoo ลง `future/test/data/market/MGC/` และให้ simulator ใช้ MGC-only
+- [x] ดึงข้อมูล MGC Yahoo ลง `bot/future/core/test/data/market/MGC/` และให้ simulator ใช้ MGC-only
 - [ ] ดึง ProjectX/TopStep MGC history เพิ่มเพื่อทำ acceptance benchmark
 - [ ] ตรวจว่า stop ตาม ATR จริงกว้างพอให้ได้ 3 สัญญา ไม่งั้นการแตกสามขาจะไม่เคยทำงาน
 - [ ] เขียน `run.py` และทดสอบ dry run เต็มวันเทรด

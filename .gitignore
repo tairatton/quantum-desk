@@ -7,34 +7,30 @@ venv/
 # Market data and rendered output are reproducible from the venue's own feed.
 # Listed per tree rather than globbed: `forex/` and `future/` are independent,
 # and a new tree should have to say what it stores instead of inheriting it.
-forex/test/data/market/**/*.csv
-forex/test/data/market/**/*.meta.json
-forex/test/data/ai_decisions/*.jsonl
-forex/test/outputs/charts/**/*
-forex/test/outputs/backtests/**/*
-future/test/data/market/**/*.csv
-future/test/data/market/**/*.meta.json
-future/test/outputs/charts/**/*
-future/test/outputs/backtests/**/*
+bot/forex/core/test/data/market/**/*.csv
+bot/forex/core/test/data/market/**/*.meta.json
+bot/forex/core/test/data/ai_decisions/*.jsonl
+bot/forex/core/test/outputs/charts/**/*
+bot/forex/core/test/outputs/backtests/**/*
+bot/future/core/test/data/market/**/*.csv
+bot/future/core/test/data/market/**/*.meta.json
+bot/future/core/test/outputs/charts/**/*
+bot/future/core/test/outputs/backtests/**/*
 
 # Live runtime state: account specific, never shared. Each tree keeps its own
 # set, which is the point of splitting them.
-forex/bot/state.json
-forex/bot/journal.jsonl
-# Journal history rescued from the pre-split bot/code/ directory. It holds 5
-# closed trades that never reached the current journal; merge it in (sorted by
-# "at") the next time the bot is stopped, then this line can go.
-forex/bot/journal.pre-split-20260806.jsonl
-forex/bot/settings.local.json
-forex/bot/STOP
-forex/bot/.live.lock
-forex/engine/news_cache.json
-future/bot/state.json
-future/bot/journal.jsonl
-future/bot/settings.local.json
-future/bot/STOP
-future/bot/.live.lock
-future/engine/news_cache.json
+bot/forex/core/bot/state.json
+bot/forex/core/bot/journal.jsonl
+bot/forex/core/bot/settings.local.json
+bot/forex/core/bot/STOP
+bot/forex/core/bot/.live.lock
+bot/forex/core/engine/news_cache.json
+bot/future/core/bot/state.json
+bot/future/core/bot/journal.jsonl
+bot/future/core/bot/settings.local.json
+bot/future/core/bot/STOP
+bot/future/core/bot/.live.lock
+bot/future/core/engine/news_cache.json
 
 # Credentials never belong in the repo: MT5 logins and ProjectX API keys are
 # read from the environment.
