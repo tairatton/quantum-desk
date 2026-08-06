@@ -36,6 +36,8 @@ if not __package__:
 
 from bot import guardrails, settings as settings_module
 from bot.broker import Broker, ProjectXError
+from engine.dynamic_risk import decide_dollars
+from engine.state import BotState
 
 # Flipped to True only after `--check` has run clean against the gateway, the
 # loss limits in settings.local.json have been confirmed against TopStep's
@@ -43,6 +45,28 @@ from bot.broker import Broker, ProjectXError
 # `--live` refuses: an untested order path on a funded account is not a risk
 # worth taking to save one commit.
 COMMISSIONED = False
+
+
+def risk_preview(settings) -> str:
+    """Describe the next tier without connecting or placing an order.
+
+    A dry-run has no authoritative live equity, so the preview uses the durable
+    high-water mark (or the configured account size on first run). It must not
+    print the static floor as if that were the production risk: the live bot is
+    dynamic by default.
+    """
+    initial = float(settings.initial_balance or settings.account_size)
+    state_path = settings_module.STATE_PATH
+    state = (BotState.load(state_path) if state_path.exists() else BotState())
+    if state.initial_balance <= 0:
+        state.initial_balance = initial
+    if state.balance_high_water <= 0:
+        state.balance_high_water = max(initial, state.initial_balance)
+    decision = decide_dollars(settings, state, state.balance_high_water)
+    if settings.dynamic_risk_enabled:
+        return (f"${decision.risk_percent:,.0f} dynamic @ high-water "
+                f"(floor ${settings.risk_dollars:,.0f})")
+    return f"${decision.risk_percent:,.0f} fixed"
 
 
 def check(settings) -> int:
@@ -82,7 +106,7 @@ def main(argv: list[str] | None = None) -> int:
     # about the wrong half of the day.
     verdict = guardrails.session_open(settings, datetime.now(timezone.utc))
     print(f"[FUTURES] dry run | {settings.contract_symbol} | "
-          f"risk ${settings.risk_dollars:,.0f} | session: {verdict.reason}")
+          f"risk {risk_preview(settings)} | session: {verdict.reason}")
     return 0
 
 

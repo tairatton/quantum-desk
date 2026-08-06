@@ -86,7 +86,8 @@ python -m bot.run --once              # เดินหนึ่งรอบ dry
 python -m bot.run --live              # ส่งออเดอร์จริง
 python -m bot.run --flatten --live    # ฉุกเฉิน ยกเลิกและปิดทุกอย่าง
 python -m bot.main                    # เมนูภาษาไทย
-python tools/ftmo_portfolio_sim.py    # ซิมอัตราสอบผ่านและ DD
+python tools/ftmo_portfolio_sim.py    # XAUUSD M15+M30 production sim
+python tools/ftmo_portfolio_sim.py --book "+ BTC M5"  # explicit research comparison
 python main.py backtest               # วัดผลทุก symbol × timeframe
 python -m pytest test/unit -q
 ```
@@ -96,7 +97,10 @@ cd future
 python -m bot.terminal                     # เทอร์มินัลเมนู
 python -m bot.terminal --status --offline  # สถานะหน้าเดียว ไม่ต้องต่อเน็ต
 python -m bot.live --check                 # ทดสอบเชื่อมต่อ อ่านอย่างเดียว
-python tools/topstep_sim.py --room-aware   # ซิมตามกฎ TopStep พร้อม guard จริง
+python tools/topstep_sim.py                # default: MGC Yahoo + dynamic room guard
+python tools/topstep_sim.py --flat         # fixed-risk reference only
+python tools/download_mgc_yahoo.py --period 60d  # free MGC smoke-test bars
+python tools/test_mgc_dry_run.py            # strategy + 1-contract sizing, no broker
 python -m pytest test/unit -q
 ```
 
@@ -124,25 +128,34 @@ python -m pytest test/unit -q
 
 รวม book: **+0.236R ต่อไม้ · 3.1 ไม้/วัน · +0.721R/วัน**
 
-### 3.2 FTMO — 20,000 paths, risk 0.40%
+### 3.2 FTMO — 20,000 paths, production settings
+
+คำสั่งหลักใช้ `python tools/ftmo_portfolio_sim.py --production`; ถ้าส่ง `--risk`
+จะเป็น fixed-risk experiment ไม่ใช่ risk path ของ live bot
 
 | Regime | ผ่าน Step 1 | breach | ผ่านสองด่าน | Step 1 | **รวม** | DD med | DD p99 |
 |---|---|---|---|---|---|---|---|
-| holdout | 100.0% | **0.0%** | **100.0%** | 34/52 | **53/75 วัน** | 2.63% | 5.09% |
-| validation | 100.0% | 0.0% | 100.0% | 28/42 | 44/60 | 2.23% | 4.22% |
-| train (แบน) | 100.0% | 0.0% | 100.0% | 58/101 | 91/143 | 4.10% | 8.37% |
+| holdout | 100.0% | **0.0%** | **100.0%** | 19/37 | **31/52 วัน** | 1.59% | 4.25% |
+| validation | 100.0% | 0.0% | 100.0% | 16/28 | 25/40 | 1.41% | 3.56% |
+| train (แบน) | 100.0% | 0.0% | 100.0% | 35/79 | 57/111 | 2.54% | 7.08% |
+
+`breach` รวมการตกทั้ง Step 1 และ Step 2; DD/worst day หยุดนับทันทีที่ Step 1
+ผ่านหรือตก ไม่รวม generated tail หลัง evaluation จบ
 
 **≈ 2.5 เดือน** · เคสช้า 3.5 เดือน · regime แบน 4.5–7 เดือน
 
 ### 3.3 TopStep — 20,000 paths, ladder + room guard
 
+คำสั่งนี้ใช้เฉพาะข้อมูล Yahoo `MGC=F` ใน `future/test/data/market/MGC/`
+เท่านั้น ไม่อ่านรายงาน XAUUSD ของ Forex
+(`python tools/topstep_sim.py` จะปฏิเสธ scenario ของ Forex)
+
 | Regime | ผ่าน | ตก | ยังไม่จบ | **วัน med/p90** | DD med | DD p95 |
 |---|---|---|---|---|---|---|
-| holdout | **100.0%** | **0.0%** | 0.0% | **10 / 22** | $400 | $1,160 |
-| validation | 100.0% | 0.0% | 0.0% | 9 / 17 | $400 | $964 |
-| train (แบน) | 99.2% | **0.0%** | 0.9% | 16 / 51 | $708 | $1,547 |
+| MGC Yahoo 60 วัน | **100.0%** | **0.0%** | 0.0% | **13 / 28** | $454 | $960 |
 
-**≈ 2 สัปดาห์** · 0.9% ที่เหลือไม่ใช่การตก แต่คือบัญชีที่ถอยจนไต่กลับไม่ไหว = จอดถาวร
+เป็น smoke/short-sample result ไม่ใช่ long-run pass probability; Yahoo เป็น delayed/rolled
+feed และ daily-net model ยัง optimistic ต่อ intraday loss path
 
 ### 3.4 DD ต่อวันและ Max DD
 
@@ -151,10 +164,10 @@ python -m pytest test/unit -q
 | DD/วัน บอทหยุดเอง | 1.50% ($750) | $400 (0.80%) |
 | DD/วัน เพดาน firm | 5.00% ($2,500) | $1,000 (2.00%) |
 | exposure รวมสูงสุด | — | $800 (< DLL) |
-| Max DD median | 2.63% | $400 |
-| Max DD p95–p99 | 5.09% (p99) | $1,160 (p95) |
+| Max DD median | 1.59% | $400 |
+| Max DD p95–p99 | 4.25% (p99) | $1,160 (p95) |
 | เพดานที่ทำให้ตก | 10.00% | $2,000 |
-| ใช้ไปกี่ % ของระยะที่ตาย | ~51% | ~58% |
+| ใช้ไปกี่ % ของระยะที่ตาย | ~43% | ~58% |
 
 ### 3.5 ทำไม TopStep เร็วกว่า 5 เท่า
 
@@ -198,7 +211,7 @@ projected daily/max-loss guard ของตัวเอง แต่ simulator �
 
 | ความเสี่ยง | ผลถ้าเกิด | สถานะ |
 |---|---|---|
-| edge ของ future ยังไม่ได้วัดบน MGC จริง | ตัวเลข 100% อาจไม่จริงเลย | ยังไม่แก้ · `--live` ถูกล็อก |
+| edge ของ future วัดบน MGC ได้เพียง Yahoo 60 วัน | ตัวเลข 100% ยังสรุประยะยาวไม่ได้ | ต้องเพิ่ม ProjectX/TopStep history · `--live` ถูกล็อก |
 | endpoint ProjectX ยังไม่เคยยิงจริง | ออเดอร์อาจไม่ออกหรือออกผิด | `COMMISSIONED = False` |
 | กฎ TopStep มาจากแหล่งรอง | บอทคิดว่าปลอดภัยทั้งที่ตายแล้ว | มีคอมเมนต์เตือนทุกจุด |
 | MLL เช็ค real-time รวมกำไรลอยตัว | ซิมเห็นแค่ยอดรายวัน = มองโลกสวย | ยังไม่จำลอง |
@@ -229,14 +242,14 @@ quantum-desk/
 │   ├── engine/    instrument · sizing · state · journal · news · market_hours · dynamic_risk
 │   ├── strategy/  quantum · technique_lab · backtest_reporting · webapp · mt5_source
 │   ├── tools/     ftmo_portfolio_sim · build_ftmo_report · plot · forward_check · launch
-│   ├── test/      unit(285) · docs · data · outputs · pine
+│   ├── test/      unit(292) · docs · data · outputs · pine
 │   └── main.py
 └── future/                     TopStep · ProjectX · MGCZ26
     ├── bot/       settings · broker(ProjectX) · guardrails(TopStep) · trader · terminal · live
     ├── engine/    สำเนา + decide_dollars · ladder_steps · fit_to_room
     ├── strategy/  สำเนา (webapp ถูกปิดไว้)
     ├── tools/     topstep_sim
-    └── test/      unit(100) · docs · data · outputs
+    └── test/      unit(107) · docs · data · outputs
 ```
 
 **กฎเหล็ก:** ไม่มี import ข้ามต้นไม้ · `engine` ไม่ import `bot` แม้แต่ตอน TYPE_CHECKING (ใช้
@@ -256,7 +269,7 @@ Protocol) · env แยก `BOT_*` / `FUT_*` — การแก้ฝั่ง�
 | `main.bat` cd ผิดระดับ + `.venv` path ผิด | ดับเบิลคลิกแล้วบอทไม่ขึ้น |
 | เทสต์ hardcode `ROOT/"data"/"market"` | เทสต์แดงหลังย้ายโฟลเดอร์ |
 | `webapp.py` ชี้ `templates/` เดิม | หน้าเว็บ 500 |
-| `future/test/` ไม่มีข้อมูล backtest | `topstep_sim` รันไม่ได้ |
+| ไม่มีไฟล์ MGC Yahoo cache | `topstep_sim` แจ้งให้ download ก่อน และไม่อ่านข้อมูล Forex |
 | `__pycache__` 71 ไฟล์ + `.pytest_cache` ถูก commit | repo สกปรก |
 | `bot/code/journal.jsonl` มี 142 บรรทัดที่ไม่มีในไฟล์ใหม่ (6 trade_opened · 5 trade_closed) | ประวัติเทรดจริงหาย |
 
@@ -345,8 +358,8 @@ Protocol) · env แยก `BOT_*` / `FUT_*` — การแก้ฝั่ง�
 
 | ต้นไม้ | เทสต์ | ผล |
 |---|---|---|
-| forex | 285 + 19 subtests | ผ่านทั้งหมด |
-| future | 100 | ผ่านทั้งหมด |
+| forex | 292 + 19 subtests | ผ่านทั้งหมด |
+| future | 107 | ผ่านทั้งหมด |
 
 ตรวจเพิ่ม: import ทุกโมดูลสองต้นไม้ผ่าน · path ที่ resolve จริงมีไฟล์อยู่ทุกจุด · entry point ทุกตัว
 รันได้ · `bot.run --status` อ่าน state เดิมครบ · ไม่มี import ข้ามต้นไม้ · ไม่มี `engine` ที่ import
@@ -360,12 +373,14 @@ Protocol) · env แยก `BOT_*` / `FUT_*` — การแก้ฝั่ง�
    loop ที่ consume fill, amend bracket ของขาที่เหลือ, บังคับ flatten 15:10, save state และ
    reconcile หลัง restart · `stop_after_tp1`/`stop_after_tp2` ยังไม่มีที่เรียกใน production
 2. **`eod_balance_high_water` เขียนแล้วใน `roll_day()`** แต่ต้องมี run loop มาเรียกทุกสิ้นวัน
-3. **backtest บน MGC จริง** — ยังใช้ผล XAUUSD spot
+3. **ยืดประวัติ MGC ให้ยาวขึ้น** — simulator ใช้ MGC Yahoo 60 วันแล้ว แต่ยังไม่ใช่
+   ProjectX/TopStep execution feed และยังไม่มี long-history acceptance benchmark
 4. **ยืนยันกฎ TopStep กับ rulebook ทางการ**
 5. **ทดสอบ ProjectX endpoint กับ demo key**
-6. **ทำ deterministic decay harness และทดสอบ room/reserve model ให้เทียบข้าม venue ได้** —
-   live FTMO guard มีอยู่แล้ว แต่ simulator ยังต้องแยกให้ชัดว่าเป็น model ใด
-7. **โหมด `--ladder` ในซิม FTMO** — ตอนนี้ให้ได้แค่กรอบ flat 0.40%
+6. **ทำ deterministic decay harness และทดสอบ room/reserve model แยกตาม venue** —
+   Forex ใช้ XAUUSD เท่านั้น และ Futures ใช้ MGC เท่านั้น; ห้ามใช้ชุดข้อมูลร่วมกัน
+7. **fixed-risk เป็นโหมดทดลองเท่านั้น** — `--risk`/`--flat` ไม่ใช่ risk path ของ live bot;
+   คำสั่ง simulator ปกติใช้ dynamic ladder + room guard เหมือน production
 8. **merge `forex/bot/journal.pre-split-20260806.jsonl`** เข้าสมุดหลัก เรียงตาม `at` ตอนหยุดบอท
    ครั้งถัดไป (ตอนนี้ `--status` ยังขาด 5 closed trades)
 9. `forex/bot/state.pre-fix-20260731.json` ยังมี conflict marker ค้างจาก merge เดิม
@@ -379,7 +394,8 @@ Protocol) · env แยก `BOT_*` / `FUT_*` — การแก้ฝั่ง�
 
 - [ ] `python -m bot.live --check` ผ่านกับ demo key และชื่อบัญชี/สัญญาถูกต้อง
 - [ ] เทียบ daily loss / max loss / profit target / เวลา flat-by ของโลหะ กับ rulebook ทางการ
-- [ ] ดึงข้อมูล MGC ลง `future/test/data/market/` แล้ววัดผลใหม่ด้วย technique lab
+- [x] ดึงข้อมูล MGC Yahoo ลง `future/test/data/market/MGC/` และให้ simulator ใช้ MGC-only
+- [ ] ดึง ProjectX/TopStep MGC history เพิ่มเพื่อทำ acceptance benchmark
 - [ ] ตรวจว่า stop ตาม ATR จริงกว้างพอให้ได้ 3 สัญญา ไม่งั้นการแตกสามขาจะไม่เคยทำงาน
 - [ ] เขียน `run.py` และทดสอบ dry run เต็มวันเทรด
 - [ ] ตั้ง `COMMISSIONED = True` เป็นขั้นตอนสุดท้าย

@@ -200,7 +200,7 @@ class GuardrailTests(unittest.TestCase):
         self.assertEqual(self.state.day_start_balance, 100_000)
 
     def test_open_risk_cap_blocks_a_third_trade(self):
-        verdict = guardrails.can_open(self.settings, self.state, open_risk=0.60,
+        verdict = guardrails.can_open(self.settings, self.state, open_risk=1.20,
                                       open_count=1, pending_count=0)
         self.assertFalse(verdict)
         self.assertIn("open risk", verdict.reason)
@@ -252,13 +252,13 @@ class GuardrailTests(unittest.TestCase):
     def test_risk_per_idea_lets_both_timeframes_in_at_the_default_cap(self):
         one_leg = [FakePosition(1, 0.10, 4000.0, 3960.0)]      # 0.40% of 100k
         self.assertTrue(guardrails.risk_per_idea(
-            self.settings, GOLD, one_leg, 1, 100_000))         # 0.40 + 0.40 <= 0.80
+            self.settings, GOLD, one_leg, 1, 100_000))         # 0.40 + 0.40 <= 1.50
 
     def test_risk_per_idea_blocks_a_third_same_direction_entry(self):
         from dataclasses import replace as dc_replace
 
-        two_legs = [FakePosition(1, 0.10, 4000.0, 3960.0),
-                    FakePosition(1, 0.10, 4000.0, 3960.0)]     # 0.80% already used
+        two_legs = [FakePosition(1, 0.10, 4000.0, 3940.0),
+                    FakePosition(1, 0.10, 4000.0, 3940.0)]     # 1.20% already used
         self.assertFalse(guardrails.risk_per_idea(
             self.settings, GOLD, two_legs, 1, 100_000))
         # The opposite direction is a different idea, so this guard ignores it —
@@ -266,7 +266,8 @@ class GuardrailTests(unittest.TestCase):
         self.assertTrue(guardrails.risk_per_idea(
             self.settings, GOLD, two_legs, -1, 100_000))
         # Tightening the cap to one position at a time works as documented.
-        strict = dc_replace(self.settings, max_risk_per_idea_percent=0.40)
+        strict = dc_replace(self.settings, dynamic_risk_enabled=False,
+                            max_risk_per_idea_percent=0.40)
         self.assertFalse(guardrails.risk_per_idea(
             strict, GOLD, [FakePosition(1, 0.10, 4000.0, 3960.0)], 1, 100_000))
 

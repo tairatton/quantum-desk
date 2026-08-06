@@ -76,7 +76,7 @@ class DynamicRiskDecisionTests(unittest.TestCase):
         )
 
     def test_disabled_dynamic_risk_keeps_the_static_setting(self):
-        settings = Settings(risk_percent=0.40)
+        settings = Settings(risk_percent=0.40, dynamic_risk_enabled=False)
         self.state.balance_high_water = 60_000.0
         self.assertEqual(
             dynamic_risk.decide(settings, self.state, 45_000.0).risk_percent,

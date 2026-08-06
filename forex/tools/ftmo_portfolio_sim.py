@@ -10,7 +10,9 @@ Three calibrations are reported. Each keeps the holdout day-to-day *shape* and
 re-bases the per-trade mean to the expectancy measured on that split, so the
 pessimistic case answers "what if the recent regime disappears".
 
-    python tools/ftmo_portfolio_sim.py
+    python tools/ftmo_portfolio_sim.py                       # XAUUSD M15+M30 production book
+    python tools/ftmo_portfolio_sim.py --risk 0.40           # fixed-risk experiment
+    python tools/ftmo_portfolio_sim.py --production --book "XAU M15 + M30"
     python tools/ftmo_portfolio_sim.py --by-year
     python tools/ftmo_portfolio_sim.py --plot
 
@@ -21,6 +23,7 @@ from __future__ import annotations
 
 import argparse
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 
 import matplotlib.pyplot as plt
@@ -31,6 +34,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from engine import dynamic_risk as forex_dynamic  # noqa: E402
 from strategy import backtest_reporting, config  # noqa: E402
 
 
@@ -53,14 +57,18 @@ def _load_bot_settings_module():
 
 
 bot_settings = _load_bot_settings_module()
+PRODUCTION_SETTINGS = bot_settings.load()
 
 NSIM, MAXDAYS = 20_000, 400
 TECHNIQUE_OVERRIDE: str | None = None
 # "production" resolves the exit from the bot's own settings; "selected" falls
 # back to the validation pick in each report.
 TECHNIQUE_SOURCE: str = "production"
-DAILY_LIMIT, MAX_LIMIT = 5.0, 10.0          # FTMO 2-Step, percent of initial balance
+DAILY_LIMIT = PRODUCTION_SETTINGS.daily_loss_percent
+MAX_LIMIT = PRODUCTION_SETTINGS.max_loss_percent
 STEP_TARGETS = (10.0, 5.0)
+INTERNAL_DAILY_STOP = PRODUCTION_SETTINGS.internal_daily_stop_percent
+MIN_TRADING_DAYS = PRODUCTION_SETTINGS.min_trading_days
 
 # stream -> (symbol, timeframe, extra cost R/trade on top of the lab's own model).
 #
@@ -90,6 +98,10 @@ BOOKS: dict[str, list[str]] = {
     "XAU M15+M30+H1 + EUR": ["XAU M15", "XAU M30", "XAU H1", "EUR M30"],
     "+ BTC M5": ["XAU M15", "XAU M30", "XAU H1", "EUR M30", "BTC M5"],
 }
+# The live Forex bot is the XAUUSD M15+M30 book.  Other books remain useful
+# research comparisons, but must be requested explicitly so an unqualified
+# production simulation can never quietly mix another symbol into the result.
+DEFAULT_PRODUCTION_BOOK = "XAU M15 + M30"
 
 SCENARIOS = (("holdout", "HOLDOUT mean (current regime)"),
              ("validation", "VALIDATION mean (base case)"),
@@ -110,7 +122,14 @@ SCENARIO_COLOR = {"holdout": AQUA, "validation": BLUE, "train": ORANGE}
 SCENARIO_SHORT = {"holdout": "Current regime", "validation": "Base", "train": "Older / flat regime"}
 PLOT_BOOKS = ["XAU M30 only", "XAU M15 only", "XAU M15 + M30",
               "XAU M15+M30 + EUR M30", "+ BTC M5"]
-PLOT_RISK = 0.40
+# Charts follow the same production path as the command-line report by default.
+# An explicit ``--risk`` turns them into a fixed-risk reference chart.
+PLOT_RISK: float | None = None
+
+
+def plot_risk_label() -> str:
+    return ("production dynamic ladder" if PLOT_RISK is None
+            else f"fixed {PLOT_RISK:.2f}%/trade")
 
 
 # The lab name for each exit the bot can resolve to. `be_33_33_34` is the same
@@ -130,7 +149,7 @@ def production_technique() -> str:
     three-leg BE exit on every timeframe. Simulating the report pick priced a
     book nobody trades.
     """
-    settings = bot_settings.load()
+    settings = PRODUCTION_SETTINGS
     capital = settings.initial_balance or 0.0
     mode = settings.resolved_exit_mode(capital)
     if mode == "auto":                      # sizing decides per trade; the lab cannot
@@ -159,7 +178,9 @@ def load_stream(key: str, scenario: str) -> tuple[np.ndarray, np.ndarray, float,
     equity = np.asarray(curve["equity"][technique], dtype=float)
     trade_r = np.diff(np.concatenate([[0.0], equity]))
     metrics = report["techniques"][technique]
-    if scenario != "holdout":
+    if scenario == "decay_zero":
+        trade_r = trade_r - trade_r.mean()
+    elif scenario != "holdout":
         trade_r = trade_r - trade_r.mean() + metrics[scenario]["expectancy_r"]
     trade_r = trade_r - cost
 
@@ -174,8 +195,10 @@ def load_stream(key: str, scenario: str) -> tuple[np.ndarray, np.ndarray, float,
     days.loc[list(by_day.index)] = by_day.values
     traded_mask = pd.Series(False, index=span.date)
     traded_mask.loc[list(by_day.index)] = True
+    expectancy = (0.0 if scenario == "decay_zero"
+                  else metrics[scenario]["expectancy_r"] - cost)
     return (days.to_numpy(), traded_mask.to_numpy(), len(series) / len(days),
-            metrics[scenario]["expectancy_r"] - cost)
+            expectancy)
 
 
 def _sample_pool(pool, shape: tuple[int, int], rng,
@@ -197,22 +220,91 @@ def _sample_pool(pool, shape: tuple[int, int], rng,
             independent_traded | correlated_traded)
 
 
+def _sampled_pools(pools, corr: float, rng):
+    """Sample each stream once so fixed and production risk use identical paths."""
+    shape = (NSIM, MAXDAYS)
+    if corr <= 0:
+        return [_sample_pool(pool, shape, rng) for pool in pools]
+    quantile = rng.random(shape)
+    return [_sample_pool(pool, shape, rng, quantile, corr) for pool in pools]
+
+
 def portfolio_days(pools, risk_pct: float, corr: float, rng,
                    return_traded: bool = False):
     """(NSIM, MAXDAYS) returns, optionally with explicit traded-day mask."""
-    shape = (NSIM, MAXDAYS)
-    if corr <= 0:
-        samples = [_sample_pool(pool, shape, rng) for pool in pools]
-    else:
-        # Blend an independent draw with a shared-quantile draw so every stream
-        # has its good and bad days at the same time in the correlated part.
-        quantile = rng.random(shape)
-        samples = [_sample_pool(pool, shape, rng, quantile, corr)
-                   for pool in pools]
+    samples = _sampled_pools(pools, corr, rng)
     total = sum(values for values, _traded in samples)
     traded = np.logical_or.reduce([mask for _values, mask in samples])
     result = total * risk_pct
     return (result, traded) if return_traded else result
+
+
+def _production_desired_risk(equity: np.ndarray, high_water: np.ndarray,
+                             settings=PRODUCTION_SETTINGS) -> np.ndarray:
+    """Vector form of `engine.dynamic_risk.decide` for a 100% equity base."""
+    drawdown = np.maximum(0.0, high_water - equity)
+    if not settings.dynamic_risk_enabled:
+        return np.full(equity.shape, settings.risk_percent, dtype=float)
+    return np.select(
+        [drawdown < settings.dynamic_risk_dd1_percent,
+         drawdown < settings.dynamic_risk_dd2_percent,
+         drawdown < settings.dynamic_risk_dd3_percent],
+        [settings.dynamic_risk_max_percent,
+         settings.dynamic_risk_tier2_percent,
+         settings.dynamic_risk_tier3_percent],
+        default=settings.risk_percent,
+    ).astype(float)
+
+
+def production_portfolio_days(pools, corr: float, rng,
+                              settings=PRODUCTION_SETTINGS):
+    """Daily P&L using the live bot's dynamic tiers and exposure cap.
+
+    The source data is still daily, so this cannot reproduce intraday order
+    sequencing. It does, however, use the same settings and tier-selection
+    rules as production instead of silently pricing every day at 0.40%.
+    """
+    samples = _sampled_pools(pools, corr, rng)
+    streams = [values for values, _traded in samples]
+    masks = [traded for _values, traded in samples]
+    paths = streams[0].shape[0]
+    balance = np.full(paths, 100.0)
+    high_water = balance.copy()
+    result = np.zeros((paths, MAXDAYS))
+    traded_result = np.zeros((paths, MAXDAYS), dtype=bool)
+    tiers = np.asarray(forex_dynamic.fitting_tiers(
+        settings, settings.dynamic_risk_max_percent), dtype=float)
+
+    for day in range(MAXDAYS):
+        active = np.sum([mask[:, day] for mask in masks], axis=0)
+        desired = _production_desired_risk(balance, high_water, settings)
+        # Mirror the live projected guards: the aggregate setup risk must fit
+        # the open-risk cap and the remaining static max-loss room. The daily
+        # internal room is the tighter configured stop at the start of each
+        # synthetic day; intraday sequencing remains an explicit approximation.
+        account_room = np.maximum(0.0, balance + MAX_LIMIT)
+        total_room = np.minimum(settings.max_open_risk_percent, account_room)
+        total_room = np.minimum(total_room, settings.internal_daily_stop_percent)
+        ceiling = np.divide(total_room,
+                            np.maximum(active, 1), dtype=float)
+        chosen = np.zeros(paths, dtype=float)
+        if settings.dynamic_risk_enabled and settings.dynamic_risk_fit_remaining:
+            for tier in tiers:
+                fits = ((chosen == 0.0) & (active > 0)
+                        & (tier <= desired + 1e-12)
+                        & (tier <= ceiling + 1e-12))
+                chosen = np.where(fits, tier, chosen)
+        else:
+            chosen = np.where((active > 0) & (desired <= ceiling + 1e-12),
+                              desired, 0.0)
+        daily = sum(values[:, day] * chosen for values in streams)
+        daily = np.maximum(daily, -min(settings.internal_daily_stop_percent,
+                                       settings.daily_loss_percent))
+        result[:, day] = daily
+        traded_result[:, day] = (active > 0) & (chosen > 0)
+        balance += daily
+        high_water = np.maximum(high_water, balance)
+    return result, traded_result
 
 
 def path_drawdown(days_pct: np.ndarray) -> np.ndarray:
@@ -252,10 +344,20 @@ def apply_internal_stop(days_pct: np.ndarray,
     return np.maximum(days_pct, -abs(internal_stop))
 
 
-def resolve_phase(days_pct: np.ndarray, target: float,
+@dataclass(frozen=True)
+class PhaseOutcome:
+    """Vectorised verdict plus the final day that existed for each path."""
+
+    passed: np.ndarray
+    day: np.ndarray
+    breached: np.ndarray
+    resolution_index: np.ndarray
+
+
+def phase_outcome(days_pct: np.ndarray, target: float,
                   min_days: int = MIN_TRADING_DAYS,
-                  traded_mask: np.ndarray | None = None):
-    """-> (passed mask, trading day the target was hit, breached mask).
+                  traded_mask: np.ndarray | None = None) -> PhaseOutcome:
+    """Resolve a phase and retain its inclusive zero-based stopping index.
 
     `min_days` is FTMO's minimum trading day count and applies to EACH phase
     independently. Without it a path that reached +10% on day one passed on day
@@ -280,42 +382,96 @@ def resolve_phase(days_pct: np.ndarray, target: float,
     blown = first(cum <= -MAX_LIMIT)
     daily = first(days_pct <= -DAILY_LIMIT)
     breach = np.minimum(blown, daily)
-    return hit < breach, hit + 1, breach < np.minimum(hit, never)
+    passed = hit < breach
+    breached = breach < np.minimum(hit, never)
+    # Unresolved paths exist through the full generated horizon. Resolved paths
+    # stop on the first pass/breach day; generated tail rows never happened.
+    resolution = np.minimum(np.minimum(hit, breach), days_pct.shape[1] - 1)
+    return PhaseOutcome(passed, hit + 1, breached, resolution)
 
 
-def simulate(keys: list[str], scenario: str, risk_pct: float, corr: float, seed: int = 41) -> dict:
+def resolve_phase(days_pct: np.ndarray, target: float,
+                  min_days: int = MIN_TRADING_DAYS,
+                  traded_mask: np.ndarray | None = None):
+    """Compatibility tuple: (passed, pass day, breached)."""
+    outcome = phase_outcome(days_pct, target, min_days, traded_mask)
+    return outcome.passed, outcome.day, outcome.breached
+
+
+def freeze_after_resolution(days_pct: np.ndarray,
+                            resolution_index: np.ndarray) -> np.ndarray:
+    """Replace generated post-resolution tail days with zero P&L."""
+    resolution = np.asarray(resolution_index, dtype=int)
+    if resolution.shape != (days_pct.shape[0],):
+        raise ValueError("resolution_index must contain one index per path")
+    mask = np.arange(days_pct.shape[1])[None, :] <= resolution[:, None]
+    return np.where(mask, days_pct, 0.0)
+
+
+def worst_day_before_resolution(days_pct: np.ndarray,
+                                resolution_index: np.ndarray) -> np.ndarray:
+    """Worst day that actually occurred, excluding generated tail rows."""
+    resolution = np.asarray(resolution_index, dtype=int)
+    if resolution.shape != (days_pct.shape[0],):
+        raise ValueError("resolution_index must contain one index per path")
+    mask = np.arange(days_pct.shape[1])[None, :] <= resolution[:, None]
+    return np.where(mask, days_pct, np.inf).min(axis=1)
+
+
+def two_step_breach_mask(step1: PhaseOutcome,
+                         step2: PhaseOutcome) -> np.ndarray:
+    """Breach either Step 1 or Step 2, counting Step 2 only if it was reached."""
+    return step1.breached | (step1.passed & step2.breached)
+
+
+def simulate(keys: list[str], scenario: str, risk_pct: float | None,
+             corr: float, seed: int = 41) -> dict:
     rng = np.random.default_rng(seed)
     pools = [load_stream(key, scenario) for key in keys]
-    step1_raw, traded1 = portfolio_days(pools, risk_pct, corr, rng,
-                                        return_traded=True)
+    if risk_pct is None:
+        step1_raw, traded1 = production_portfolio_days(pools, corr, rng)
+    else:
+        step1_raw, traded1 = portfolio_days(pools, risk_pct, corr, rng,
+                                            return_traded=True)
     step1 = apply_internal_stop(step1_raw)
-    dd = path_drawdown(step1)
-    passed1, day1, failed1 = resolve_phase(step1, STEP_TARGETS[0],
-                                           traded_mask=traded1)
+    outcome1 = phase_outcome(step1, STEP_TARGETS[0], traded_mask=traded1)
+    resolved_step1 = freeze_after_resolution(step1, outcome1.resolution_index)
+    dd = path_drawdown(resolved_step1)
     # Verification is a fresh account, so draw an independent set of paths.
-    step2_raw, traded2 = portfolio_days(pools, risk_pct, corr, rng,
-                                        return_traded=True)
-    passed2, day2, _ = resolve_phase(
-        apply_internal_stop(step2_raw), STEP_TARGETS[1], traded_mask=traded2)
-    both = passed1 & passed2
-    total = np.where(both, day1 + day2, 0)
+    if risk_pct is None:
+        step2_raw, traded2 = production_portfolio_days(pools, corr, rng)
+    else:
+        step2_raw, traded2 = portfolio_days(pools, risk_pct, corr, rng,
+                                            return_traded=True)
+    outcome2 = phase_outcome(apply_internal_stop(step2_raw), STEP_TARGETS[1],
+                             traded_mask=traded2)
+    both = outcome1.passed & outcome2.passed
+    breached = two_step_breach_mask(outcome1, outcome2)
+    total = np.where(both, outcome1.day + outcome2.day, 0)
     weights = [pool[2] for pool in pools]
     pick = lambda values, q: int(np.quantile(values, q)) if len(values) else -1
     return {
         "trades_per_day": sum(weights),
+        "risk_mode": "production" if risk_pct is None else f"fixed {risk_pct:.2f}%",
         "expectancy_r": float(np.average([pool[3] for pool in pools], weights=weights)),
         "r_per_day": sum(pool[0].mean() for pool in pools),
-        "step1": passed1.mean(), "breach": failed1.mean(), "two_step": both.mean(),
-        "d1_med": pick(day1[passed1], .5), "d1_p90": pick(day1[passed1], .9),
+        "step1": outcome1.passed.mean(), "breach": breached.mean(),
+        "step1_breach": outcome1.breached.mean(),
+        "step2_breach": (outcome1.passed & outcome2.breached).mean(),
+        "two_step": both.mean(),
+        "d1_med": pick(outcome1.day[outcome1.passed], .5),
+        "d1_p90": pick(outcome1.day[outcome1.passed], .9),
         "total_med": pick(total[both], .5), "total_p90": pick(total[both], .9),
-        "worst_day": float(np.quantile(step1.min(1), .05)),
+        "worst_day": float(np.quantile(
+            worst_day_before_resolution(step1, outcome1.resolution_index), .05)),
         "dd_med": float(np.median(dd)), "dd_p99": float(np.quantile(dd, .99)),
         "dd_over_limit": float((dd > MAX_LIMIT).mean()),
     }
 
 
 def report_books(risks=(0.25, 0.40, 0.50), corr: float = 0.3,
-                 book_names: list[str] | None = None) -> None:
+                 book_names: list[str] | None = None,
+                 production: bool = False) -> None:
     selected_books = book_names or list(BOOKS)
     for scenario, label in SCENARIOS:
         print(f"\n{'=' * 118}\n{label}   [FTMO 2-Step: {STEP_TARGETS[0]:.0f}% then "
@@ -325,15 +481,18 @@ def report_books(risks=(0.25, 0.40, 0.50), corr: float = 0.3,
         print("  daily-net approximation: the internal stop clips a day\'s NET "
               "result, not its trade sequence, and the 3-loss stand-down is not "
               "modelled, so results are optimistic.")
+        print("  breach = account failure in either Step 1 or Step 2; drawdown and "
+              "worst-day statistics stop when Step 1 resolves.")
         print(f"{'book':24s} {'risk':>5s} {'trd/d':>6s} {'expR':>7s} {'R/day':>7s} "
               f"{'step1':>7s} {'breach':>7s} {'2-step':>7s} {'days step1':>12s} "
               f"{'days total':>12s} {'worst day':>10s} {'dd med':>7s} {'dd p99':>7s} "
               f"{f'dd>{MAX_LIMIT:.0f}%':>7s}")
         for name in selected_books:
             keys = BOOKS[name]
-            for risk in risks:
+            for risk in (None,) if production else risks:
                 m = simulate(keys, scenario, risk, corr)
-                print(f"{name:24s} {risk:5.2f} {m['trades_per_day']:6.1f} "
+                risk_label = "prod" if risk is None else f"{risk:.2f}"
+                print(f"{name:24s} {risk_label:>5s} {m['trades_per_day']:6.1f} "
                       f"{m['expectancy_r']:+7.3f} {m['r_per_day']:+7.3f} {m['step1']:7.1%} "
                       f"{m['breach']:7.1%} {m['two_step']:7.1%} "
                       f"{f'{m['d1_med']}/{m['d1_p90']}':>12s} "
@@ -438,7 +597,7 @@ def plot_days_to_pass(results: dict, corr: float) -> None:
     axes[0].set_ylabel("")
     fig.suptitle("Trading days to clear both FTMO steps  ·  bar = median, faded = 90th percentile",
                  color=TEXT, fontsize=15, x=.007, ha="left")
-    fig.text(.5, -.03, f"risk {PLOT_RISK:.2f}%/trade  ·  corr {corr}  ·  "
+    fig.text(.5, -.03, f"{plot_risk_label()}  ·  corr {corr}  ·  "
                        f"21 trading days ≈ 1 month  ·  commission and slippage deducted",
              color=MUTED, fontsize=11, ha="center")
     save_figure(fig, "days_to_pass.png")
@@ -463,7 +622,7 @@ def plot_pass_rate(results: dict, corr: float) -> None:
     axis.set_title("Step 1 (+10%) pass rate — the older-regime bars are the honest downside",
                    loc="left", fontsize=15)
     axis.legend(frameon=False, ncol=3, labelcolor=MUTED)
-    axis.text(0, -14, f"risk {PLOT_RISK:.2f}%/trade · corr {corr} · commission and slippage "
+    axis.text(0, -14, f"{plot_risk_label()} · corr {corr} · commission and slippage "
                       f"deducted · 20,000 simulated paths per bar",
               color=MUTED, fontsize=10, transform=axis.get_yaxis_transform())
     save_figure(fig, "pass_rate.png")
@@ -512,7 +671,11 @@ def plot_equity_fan(book: str = "XAU M15 + M30", corr: float = 0.3, horizon: int
     rng = np.random.default_rng(97)
     for axis, (scenario, _) in zip(axes, SCENARIOS):
         pools = [load_stream(key, scenario) for key in BOOKS[book]]
-        paths = np.cumsum(portfolio_days(pools, PLOT_RISK, corr, rng)[:, :horizon], axis=1)
+        if PLOT_RISK is None:
+            daily, _traded = production_portfolio_days(pools, corr, rng)
+        else:
+            daily = portfolio_days(pools, PLOT_RISK, corr, rng)
+        paths = np.cumsum(daily[:, :horizon], axis=1)
         days = np.arange(1, horizon + 1)
         color = SCENARIO_COLOR[scenario]
         style_axis(axis)
@@ -536,7 +699,7 @@ def plot_equity_fan(book: str = "XAU M15 + M30", corr: float = 0.3, horizon: int
     axes[0].set_ylabel("Account return (%)")
     axes[0].text(2, 10.6, "FTMO Step 1 target +10%", color=TEXT, fontsize=10)
     axes[0].text(2, -9.4, "FTMO max loss −10%", color=NEG, fontsize=10)
-    fig.suptitle(f"Simulated equity paths · {book} at {PLOT_RISK:.2f}% risk/trade  "
+    fig.suptitle(f"Simulated equity paths · {book} · {plot_risk_label()}  "
                  f"(median line, 25–75 and 5–95 percentile bands, no early stop)",
                  color=TEXT, fontsize=14, x=.007, ha="left")
     save_figure(fig, "equity_fan.png")
@@ -585,11 +748,11 @@ def plot_all(corr: float) -> None:
     plot_equity_fan(corr=corr)
     plot_cost_sensitivity()
     plot_expectancy_by_year()
-    print(f"plot_set_complete dir={PLOT_DIR} risk={PLOT_RISK:.2f}%")
+    print(f"plot_set_complete dir={PLOT_DIR} risk={plot_risk_label()}")
 
 
 def main() -> None:
-    global NSIM, TECHNIQUE_OVERRIDE, TECHNIQUE_SOURCE
+    global NSIM, TECHNIQUE_OVERRIDE, TECHNIQUE_SOURCE, PLOT_RISK
 
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--by-year", action="store_true",
@@ -601,9 +764,11 @@ def main() -> None:
     parser.add_argument("--book", choices=tuple(BOOKS),
                         help="simulate one book instead of every comparison")
     parser.add_argument("--risk", type=float,
-                        help="simulate one risk percentage instead of 0.25/0.40/0.50")
+                        help="fixed-risk experiment; default is the production dynamic ladder")
     parser.add_argument("--nsim", type=int, default=NSIM,
                         help=f"Monte Carlo paths (default {NSIM:,})")
+    parser.add_argument("--production", action="store_true",
+                        help="use the live bot's dynamic risk tiers and exposure cap")
     parser.add_argument(
         "--technique",
         choices=("production", "selected", "fixed_tp3", "be_after_tp1_33_33_34"),
@@ -615,7 +780,13 @@ def main() -> None:
         parser.error("--nsim must be at least 100")
     if args.risk is not None and args.risk <= 0:
         parser.error("--risk must be positive")
+    if args.production and args.risk is not None:
+        parser.error("--production and --risk are mutually exclusive")
+    # The command-line report is a production forecast by default. Passing
+    # `--risk` explicitly remains the fixed-risk experiment mode.
+    production_mode = args.production or args.risk is None
     NSIM = args.nsim
+    PLOT_RISK = args.risk
     TECHNIQUE_SOURCE = args.technique
     TECHNIQUE_OVERRIDE = (None if args.technique in ("production", "selected")
                           else args.technique)
@@ -629,7 +800,8 @@ def main() -> None:
         report_books(
             risks=(args.risk,) if args.risk is not None else (0.25, 0.40, 0.50),
             corr=args.corr,
-            book_names=[args.book] if args.book else None,
+            book_names=[args.book] if args.book else [DEFAULT_PRODUCTION_BOOK],
+            production=production_mode,
         )
 
 

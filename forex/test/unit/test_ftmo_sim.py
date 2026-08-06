@@ -70,6 +70,77 @@ class InternalStopTests(unittest.TestCase):
         self.assertIn("APPROXIMATION", sim.apply_internal_stop.__doc__)
 
 
+class ResolutionStatisticsTests(unittest.TestCase):
+    """Generated days after pass/breach must not alter reported risk."""
+
+    def test_drawdown_and_worst_day_stop_when_the_phase_passes(self):
+        days = np.array([[5.0, 5.0, -20.0]])
+        outcome = sim.phase_outcome(days, 10.0, min_days=0)
+        self.assertTrue(bool(outcome.passed[0]))
+        self.assertEqual(int(outcome.resolution_index[0]), 1)
+
+        frozen = sim.freeze_after_resolution(days, outcome.resolution_index)
+        self.assertEqual(float(sim.path_drawdown(frozen)[0]), 0.0)
+        self.assertEqual(float(sim.worst_day_before_resolution(
+            days, outcome.resolution_index)[0]), 5.0)
+
+    def test_step_two_breach_is_counted_only_after_step_one_passes(self):
+        step1 = sim.PhaseOutcome(
+            passed=np.array([True, False, False]),
+            day=np.array([4, 99, 99]),
+            breached=np.array([False, True, False]),
+            resolution_index=np.array([3, 2, 9]),
+        )
+        step2 = sim.PhaseOutcome(
+            passed=np.array([False, False, False]),
+            day=np.array([99, 99, 99]),
+            breached=np.array([True, True, True]),
+            resolution_index=np.array([1, 1, 1]),
+        )
+        np.testing.assert_array_equal(
+            sim.two_step_breach_mask(step1, step2),
+            np.array([True, True, False]),
+        )
+
+
+class ProductionRiskParityTests(unittest.TestCase):
+    def test_default_production_book_is_xau_only(self):
+        self.assertEqual(sim.DEFAULT_PRODUCTION_BOOK, "XAU M15 + M30")
+        self.assertEqual(
+            {sim.STREAMS[key][0] for key in sim.BOOKS[sim.DEFAULT_PRODUCTION_BOOK]},
+            {"XAUUSD"},
+        )
+
+    def test_production_profile_enables_the_dynamic_ladder(self):
+        settings = sim.PRODUCTION_SETTINGS
+        self.assertTrue(settings.dynamic_risk_enabled)
+        self.assertTrue(settings.dynamic_risk_fit_remaining)
+        self.assertEqual(
+            (settings.dynamic_risk_max_percent,
+             settings.dynamic_risk_tier2_percent,
+             settings.dynamic_risk_tier3_percent,
+             settings.risk_percent),
+            (1.00, 0.75, 0.50, 0.40),
+        )
+
+    def test_vectorised_production_tiers_match_engine_decide(self):
+        from engine import dynamic_risk
+        from types import SimpleNamespace
+
+        equity = np.array([100.0, 99.4, 98.9, 98.4])
+        high_water = np.full(4, 100.0)
+        actual = sim._production_desired_risk(equity, high_water)
+        expected = np.array([
+            dynamic_risk.decide(
+                sim.PRODUCTION_SETTINGS,
+                SimpleNamespace(initial_balance=100.0, balance_high_water=100.0),
+                float(value),
+            ).risk_percent
+            for value in equity
+        ])
+        np.testing.assert_allclose(actual, expected)
+
+
 class EngineDependencyTests(unittest.TestCase):
     def test_no_engine_module_imports_bot(self):
         offenders = []

@@ -40,7 +40,7 @@ class MT5Error(RuntimeError):
 class DataMeta:
     """Provenance record written next to every CSV."""
 
-    source: str  # "mt5" | "mock"
+    source: str  # "mt5" | "yahoo" | "mock"
     symbol: str  # broker name, e.g. "XAUUSDm"
     timeframe: str
     bars: int
@@ -53,7 +53,7 @@ class DataMeta:
 
     @property
     def is_real(self) -> bool:
-        return self.source == "mt5"
+        return self.source in {"mt5", "yahoo"}
 
 
 # ---------------------------------------------------------------------------

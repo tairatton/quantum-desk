@@ -1,9 +1,10 @@
 """Every tunable the bot has, in one place.
 
-Code defaults stay on the defensive static 0.40% plan. The checked-in local
-production profile enables the tested drawdown ladder for gold M15 + M30 and a
-capital-tier exit at 30,000. Override any field with an environment variable
-named `BOT_<FIELD>` or with `bot/settings.local.json`.
+The production default is the tested drawdown ladder for gold M15 + M30:
+1.00% -> 0.75% -> 0.50% -> 0.40% as drawdown grows. Set
+``dynamic_risk_enabled=False`` explicitly when a fixed-risk experiment is
+needed. Override any field with an environment variable named
+``BOT_<FIELD>`` or with ``bot/settings.local.json``.
 """
 from __future__ import annotations
 
@@ -31,13 +32,13 @@ class Settings:
     history_bars: int = 3000
 
     # --- risk --------------------------------------------------------------
-    risk_percent: float = 0.40           # per trade, of the initial balance
-    max_open_risk_percent: float = 0.80  # sum of live risk across all positions
+    risk_percent: float = 0.40           # defensive floor, per trade
+    max_open_risk_percent: float = 1.50  # sum of live risk across all positions
     max_concurrent_trades: int = 2
-    # Optional drawdown ladder. ``risk_percent`` remains the defensive floor;
-    # close to the realised balance high-water mark the bot may start faster,
-    # then automatically steps down as current equity draws down.
-    dynamic_risk_enabled: bool = False
+    # Production drawdown ladder. ``risk_percent`` remains the defensive floor;
+    # close to the realised balance high-water mark the bot starts faster, then
+    # automatically steps down as current equity draws down.
+    dynamic_risk_enabled: bool = True
     dynamic_risk_max_percent: float = 1.00
     dynamic_risk_dd1_percent: float = 0.50
     dynamic_risk_tier2_percent: float = 0.75
@@ -46,7 +47,7 @@ class Settings:
     dynamic_risk_dd3_percent: float = 1.50
     # When a higher tier does not fit the remaining exposure/day room, try the
     # next configured tier instead of wasting safe capacity or sizing arbitrarily.
-    dynamic_risk_fit_remaining: bool = False
+    dynamic_risk_fit_remaining: bool = True
 
     # --- FTMO objectives, 2-Step, as published on 2026-07-26 ---------------
     # 2-Step: max loss is STATIC from initial capital. The 1-Step product uses an
@@ -116,10 +117,11 @@ class Settings:
     fallback_server_utc_offset: float = 3.0
     news_times: tuple[str, ...] = ()      # extra ISO "2026-08-01 14:30", server time
     # FTMO reviews "risk per trade idea". Two timeframes agreeing is arguably one
-    # idea taken twice, so same-direction exposure is capped separately. At 0.80
-    # both M15 and M30 may hold a position; setting it to 0.40 enforces one gold
-    # position at a time, which is stricter but roughly doubles time-to-target.
-    max_risk_per_idea_percent: float = 0.80
+    # idea taken twice, so same-direction exposure is capped separately. At 1.50
+    # both M15 and M30 may hold a top-tier position; setting it to 0.40 enforces
+    # one gold position at a time, which is stricter but roughly doubles
+    # time-to-target.
+    max_risk_per_idea_percent: float = 1.50
 
     # --- execution ---------------------------------------------------------
     magic: int = 20260726                # the bot only ever touches its own orders

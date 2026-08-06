@@ -30,26 +30,47 @@ breaking consistency raises the bar instead of ending the attempt.
 
 ## Simulation
 
-`python tools/topstep_sim.py` — 20,000 paths, 400 trading days, the production
-three-leg exit, the two gold streams resampled from the technique lab, with the
-bot's own $400 internal daily stop applied on top of the firm's $1,000.
+`python tools/topstep_sim.py` — 20,000 paths, 400 simulated trading days, the
+production dynamic ladder plus remaining-room/reserve guard, whole-contract MGC
+sizing, the production fixed-TP3/split exit switch, and the bot's own $400
+internal daily stop applied on top of the firm's $1,000. By default it samples
+the two strategy streams from locally cached Yahoo `MGC=F` bars. `--risk` and
+`--flat` are fixed-risk reference experiments; they are not the live bot's risk
+path. The simulator is MGC-only; it never reads the Forex/XAUUSD reports.
 
-Pass probability, by risk per trade and by which regime the edge is in:
+Latest MGC Yahoo 60-day smoke result (run date 2026-08-06):
 
-| Regime | $100 | $150 | $200 | $300 |
-|---|---|---|---|---|
-| holdout (current) | 100.0% | 100.0% | **99.9%** | 99.7% |
-| validation | 100.0% | 100.0% | 100.0% | 99.9% |
-| train (flat 2023) | 99.8% | 98.6% | **97.2%** | 96.6% |
+| Regime | PASS | FAIL | open | days med/p90 | DD med | DD p95 |
+|---|---:|---:|---:|---:|---:|---:|
+| MGC Yahoo `yahoo_60d` | **100.0%** | 0.0% | 0.0% | **13 / 28** | $454 | $960 |
 
-At $200 risk in the current regime the Combine passes in **20 trading days**
-(median), 33 at p90; in the flat regime, 32 and 59.
+This is a short, rolled Yahoo sample, so the percentages are not a reliable
+long-run pass probability. It is useful for checking that the futures signal,
+sizing and risk-guard path behave on MGC-shaped bars. Forex/XAUUSD reports are
+kept in the separate `forex/` tree and are not mixed into this result.
 
-### Historical decay comparison (not an acceptance benchmark)
+For the historical fixed-risk table, run `python tools/topstep_sim.py --flat`.
 
-The table below is retained as a historical, pre-room-aware snapshot. It does
-not define the current simulator's result: rerun `tools/topstep_sim.py` with a
-fixed seed and the documented parameters before quoting decay percentages.
+### Free bot smoke test (not a Topstep feed)
+
+When API Access is not enabled, the bot path can still be exercised with
+Yahoo's delayed `MGC=F` bars:
+
+```bash
+python tools/download_mgc_yahoo.py --period 60d
+python tools/test_mgc_dry_run.py
+```
+
+This evaluates the same signal state machine, dynamic dollar tier, stop
+distance, and whole-contract minimum without credentials or order endpoints.
+The Yahoo series is rolled/delayed and does not validate ProjectX execution,
+slippage, or the actual Topstep historical feed.
+
+### Historical decay comparison (Forex/XAUUSD reference only)
+
+The table below is retained only as an old Forex/XAUUSD stress reference. It is
+not an input to the MGC simulator and must not be combined with the MGC result.
+It does not define the current simulator's result.
 
 | Expectancy/trade | Pass | Fail |
 |---|---|---|
@@ -67,10 +88,10 @@ the reason. The system's margin of safety is much thinner here than the headline
 
 ## What this simulation is not
 
-1. **The edge is XAUUSD spot, not MGC.** The reports under
-   `test/outputs/backtests/technique_lab/XAUUSD/` were copied from the forex
-   tree as a starting point. Same metal, different contract, different session,
-   different cost model. Re-measure on MGC data before this means anything.
+1. **It is not a long-history acceptance benchmark.** Yahoo's `MGC=F` is a
+   delayed, rolled series and the current cache covers only about 60 days. It
+   has no Topstep/ProjectX spread or fill stream; costs are the configured
+   commission/slippage estimates.
 2. **Daily series, no intraday path.** The MLL is monitored continuously on
    realised *and* unrealised P&L, so a floor breach can happen inside a day
    that closes fine. This simulation only sees daily totals and is therefore
@@ -78,10 +99,7 @@ the reason. The system's margin of safety is much thinner here than the headline
 3. **The $400 internal stop is doing real work.** Removing it (firm rules only)
    drops the flat-regime pass rate at $200 risk from 97.2% to 94.4%, and at $300
    from 96.6% to 85.8%.
-4. **Contract granularity is not modelled.** Risk is treated as a continuous
-   $200; in reality MGC sizes in whole contracts at $10 per point, so the real
-   risk per trade steps between values and is usually *below* the request.
-5. It quantifies path risk given the edge is real. It cannot validate the edge.
+4. It quantifies path risk given the edge is real. It cannot validate the edge.
 
 ## Sources
 

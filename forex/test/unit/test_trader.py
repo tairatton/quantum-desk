@@ -1615,7 +1615,12 @@ class TerminalNotificationTests(unittest.TestCase):
         self.assertIn("BE_STOP_BELOW_NET", stale_after_swap)
 
     def test_entry_capacity_reports_risk_room_and_allowed_side(self):
-        settings = replace(Settings(), exit_mode="fixed_tp3")
+        # This regression exercises the old 0.80% capacity message explicitly;
+        # production now uses the dynamic 1.50% exposure cap.
+        settings = replace(Settings(), dynamic_risk_enabled=False,
+                           max_open_risk_percent=0.80,
+                           max_risk_per_idea_percent=0.80,
+                           exit_mode="fixed_tp3")
         state = BotState(initial_balance=10_000.0)
         trade = ManagedTrade(
             plan_id="M15@capacity", timeframe="M15", direction=-1,
