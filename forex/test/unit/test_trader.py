@@ -1645,6 +1645,19 @@ class TerminalNotificationTests(unittest.TestCase):
 
 
 class ReconnectTests(unittest.TestCase):
+    def test_only_timeframes_whose_bars_close_are_scanned(self):
+        configured = ("M15", "M30")
+        self.assertEqual(
+            run._timeframes_closing_at(
+                datetime(2026, 8, 6, 18, 15), configured),
+            ("M15",),
+        )
+        self.assertEqual(
+            run._timeframes_closing_at(
+                datetime(2026, 8, 6, 18, 30), configured),
+            ("M15", "M30"),
+        )
+
     def test_reconnect_shuts_down_old_session_and_rebuilds_connection(self):
         from bot.broker import Broker
 
@@ -1690,7 +1703,7 @@ class ReconnectTests(unittest.TestCase):
             def pending_orders(self):
                 return []
 
-            def feed_stale_minutes(self):
+            def feed_stale_minutes(self, quote=None):
                 return None
 
             def reconnect(self):
@@ -1739,7 +1752,7 @@ class ReconnectTests(unittest.TestCase):
             def pending_orders(self):
                 return []
 
-            def feed_stale_minutes(self):
+            def feed_stale_minutes(self, quote=None):
                 return next(self.stale)
 
             def take_requests(self):
@@ -1763,7 +1776,64 @@ class ReconnectTests(unittest.TestCase):
 
         sleep.assert_called_once_with(run.STALE_FEED_RECHECK_SECONDS)
         managed_sleep.assert_not_called()
-        scan.assert_called_once_with(broker, state, config_)
+        scan.assert_called_once_with(
+            broker, state, config_, measure_offset=True,
+            manage_exposure=False)
+
+    def test_confirmed_stale_feed_rechecks_only_the_tick(self):
+        class LoopBroker:
+            dry_run = True
+            requests = 0
+            spec = GOLD
+
+            def __init__(self):
+                self.tick_calls = 0
+                self.account_calls = 0
+                self.position_calls = 0
+                self.order_calls = 0
+
+            def account(self):
+                self.account_calls += 1
+                return {"login": 1, "server": "test"}
+
+            def tick(self):
+                self.tick_calls += 1
+                if self.tick_calls > 2:
+                    raise KeyboardInterrupt()
+                return {"server_time": datetime(2026, 8, 3, 0, 0)}
+
+            def positions(self):
+                self.position_calls += 1
+                return []
+
+            def pending_orders(self):
+                self.order_calls += 1
+                return []
+
+            def feed_stale_minutes(self, quote=None):
+                return 25.0
+
+            def take_requests(self):
+                return 0
+
+        broker = LoopBroker()
+        config_ = SimpleNamespace(
+            symbol="XAUUSDm", timeframes=("M15", "M30"),
+            entry_grace_seconds=20, initial_balance=0.0,
+        )
+        with tempfile.TemporaryDirectory() as directory, \
+                mock.patch.object(run, "JOURNAL_PATH", Path(directory) / "journal.jsonl"), \
+                mock.patch.object(run, "STATE_PATH", Path(directory) / "state.json"), \
+                mock.patch.object(run.time, "sleep"), \
+                mock.patch.object(run, "pass_once") as scan:
+            with redirect_stdout(io.StringIO()):
+                run.loop(broker, BotState(), config_)
+
+        self.assertEqual(broker.tick_calls, 3)
+        self.assertEqual(broker.position_calls, 1)
+        self.assertEqual(broker.order_calls, 1)
+        self.assertEqual(broker.account_calls, 2)  # startup plus first stale notice
+        scan.assert_not_called()
 
     def test_missed_entry_is_recorded_once_without_becoming_a_trade(self):
         state = BotState()
@@ -1812,6 +1882,9 @@ class ReconnectTests(unittest.TestCase):
 
             def pending_orders(self):
                 return []
+
+            def feed_stale_minutes(self, quote=None):
+                return None
 
             def reconnect(self):
                 self.reconnects += 1
@@ -2055,6 +2128,17 @@ class OrphanTimeoutTests(unittest.TestCase):
         self.assertEqual(trader._orphan_timeframe("", self.frames), "M30")
         self.assertEqual(trader._orphan_timeframe("hand edited", self.frames), "M30")
         self.assertEqual(trader._orphan_timeframe("M15 TP1 quantum", self.frames), "M15")
+
+    def test_unconfigured_timeframe_comment_falls_back_to_slowest_frame(self):
+        self.assertEqual(
+            trader._orphan_timeframe("M5 TP1 quantum", self.frames), "M30")
+
+    def test_configured_but_not_due_timeframe_is_deferred(self):
+        self.assertEqual(
+            trader._orphan_timeframe(
+                "M30 TP1 quantum", {"M15": self.frames["M15"]},
+                ("M15", "M30")),
+            "M30")
 
     def test_bars_are_counted_not_hours_so_a_weekend_does_not_expire_a_trade(self):
         """120 M30 bars is 60 *trading* hours. Counting wall clock instead would
@@ -2504,6 +2588,34 @@ class DailyRulesTests(unittest.TestCase):
         self.assertFalse(verdict)
         self.assertIn("server requests", verdict.reason)
 
+    def test_request_budget_can_be_checked_before_expensive_entry_guards(self):
+        self.assertTrue(guardrails.request_budget(self.settings, 100))
+        verdict = guardrails.request_budget(
+            self.settings, int(self.settings.max_requests_per_day * 0.9),
+        )
+        self.assertFalse(verdict)
+        self.assertIn("server requests", verdict.reason)
+
+    def test_blocked_request_budget_retires_the_plan(self):
+        state = BotState(initial_balance=100_000.0)
+        candidate = intent()
+        blocked = guardrails.request_budget(self.settings, 1_900)
+        with tempfile.TemporaryDirectory() as directory, \
+                mock.patch.object(run, "JOURNAL_PATH",
+                                  Path(directory) / "journal.jsonl"):
+            run._record_entry_block(state, candidate, blocked,
+                                    remember_plan=True)
+        self.assertIn(candidate.plan_id, state.seen_plan_ids)
+
+    def test_guard_chain_does_not_evaluate_later_broker_checks_after_a_block(self):
+        later_checks = []
+        blocked = run._first_blocked(
+            lambda: guardrails.Verdict(False, "request budget"),
+            lambda: later_checks.append("evaluated") or guardrails.ALLOWED,
+        )
+        self.assertFalse(blocked)
+        self.assertEqual(later_checks, [])
+
     def test_a_plan_the_account_cannot_margin_is_refused_before_any_order(self):
         account = {"margin_free": 1_000.0}
         self.assertTrue(guardrails.margin_available(account, 200.0, 3))
@@ -2785,6 +2897,27 @@ class StaleFeedTests(unittest.TestCase):
         b = self._broker([base, base + timedelta(minutes=15)])
         self.assertIsNone(b.feed_stale_minutes())
         self.assertIsNone(b.feed_stale_minutes())
+
+    def test_current_quote_is_reused_for_the_stale_check(self):
+        base = datetime(2026, 7, 27, 23, 45)
+        b = self._broker([])
+        self.assertIsNone(
+            b.feed_stale_minutes(quote={"server_time": base}))
+
+    def test_offset_measurement_reads_only_one_tick(self):
+        now = datetime.now(timezone.utc).replace(tzinfo=None)
+        b = self._broker([now + timedelta(hours=3)])
+        calls = 0
+        original_tick = b.tick
+
+        def counted_tick():
+            nonlocal calls
+            calls += 1
+            return original_tick()
+
+        b.tick = counted_tick
+        self.assertEqual(b.server_utc_offset(), 3.0)
+        self.assertEqual(calls, 1)
 
     def test_a_frozen_tick_is_reported_once_past_the_threshold(self):
         frozen = datetime(2026, 7, 27, 23, 49, 57)

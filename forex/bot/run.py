@@ -90,9 +90,20 @@ def status_line(tag: str, message: str, level: str = "info") -> str:
     return f"{paint(f'[{tag}]', _Ansi.BOLD, colours.get(level, _Ansi.CYAN))} {message}"
 
 
-def resolve_offset(broker: Broker, state: BotState, config_) -> tuple[float, str]:
-    """Server-to-UTC offset: measured if quotes are live, else last known, else config."""
-    measured = broker.server_utc_offset()
+def resolve_offset(broker: Broker, state: BotState, config_, *,
+                   quote: dict | None = None,
+                   measure: bool = True) -> tuple[float, str]:
+    """Server-to-UTC offset, optionally reusing the current tick.
+
+    The offset is stable within a trading day. Signal passes therefore use the
+    last measured value instead of spending two tick requests every 15 minutes;
+    startup/status/reconnect still measure it from a live quote.
+    """
+    if not measure:
+        if state.server_utc_offset is not None:
+            return state.server_utc_offset, "remembered"
+        return config_.fallback_server_utc_offset, "fallback"
+    measured = broker.server_utc_offset(quote=quote)
     if measured is not None:
         if measured != state.server_utc_offset:
             print(f"[CLOCK] broker server runs UTC{measured:+g}")
@@ -881,7 +892,8 @@ def print_status(broker: Broker, state: BotState, config_) -> None:
     print(f"[ENTRY_CAPACITY] {capacity}")
     print()
 
-def _bind_and_anchor(broker: Broker, state: BotState, config_):
+def _bind_and_anchor(broker: Broker, state: BotState, config_, *,
+                     measure_offset: bool = True):
     """Bind state and establish its risk basis without evaluating a signal."""
     quote = broker.tick()
     account = broker.account()
@@ -922,7 +934,8 @@ def _bind_and_anchor(broker: Broker, state: BotState, config_):
         journal.write(JOURNAL_PATH, "account_bound",
                       login=state.account_login, server=state.account_server,
                       initial_balance=state.initial_balance)
-    offset, _ = resolve_offset(broker, state, config_)
+    offset, _ = resolve_offset(
+        broker, state, config_, quote=quote, measure=measure_offset)
     evaluation_day = ftmo_day(quote["server_time"], offset)
     day_balance = account["balance"]
     if state.day_key != evaluation_day.isoformat():
@@ -1009,35 +1022,79 @@ def _record_missed_entry(state: BotState, intent: signals.Intent,
     state.remember_plan(intent.plan_id)
 
 
-def pass_once(broker: Broker, state: BotState, config_) -> None:
-    quote, account = _bind_and_anchor(broker, state, config_)
+def _first_blocked(*checks):
+    """Evaluate guard checks in order and stop before unnecessary broker reads."""
+    for check in checks:
+        verdict = check()
+        if not verdict:
+            return verdict
+    return None
+
+
+def _record_entry_block(state: BotState, intent: signals.Intent,
+                        blocked, *, remember_plan: bool = False) -> None:
+    """Persist and display a blocked plan, optionally retiring it for the day."""
+    journal.write(JOURNAL_PATH, "entry_blocked", plan_id=intent.plan_id,
+                  reason=blocked.reason, after_conversion=intent.converted)
+    if remember_plan:
+        state.remember_plan(intent.plan_id)
+    note = " scope='limit already cancelled'" if intent.converted else ""
+    print(f"[GUARD] {intent.plan_id}: {blocked.reason}{note}")
+
+
+def pass_once(broker: Broker, state: BotState, config_, *,
+              scan_timeframes: tuple[str, ...] | None = None,
+              measure_offset: bool = False,
+              manage_exposure: bool | None = None) -> None:
+    quote, account = _bind_and_anchor(
+        broker, state, config_, measure_offset=measure_offset)
 
     # Housekeeping first: an open trade must be managed even when new entries are off.
-    # Known split positions can be protected without bar data. Do this before
-    # loading history so a restored MT5 position channel is useful even if the
-    # chart/feed channel is still recovering.
-    trader.apply_breakeven(broker, state)
-    unresolved_tickets = any(
+    # Reuse one positions/orders snapshot across the lifecycle checks. The old
+    # path queried both repeatedly even when state had no live trade at all.
+    managed_before = bool(state.open_trades()) or bool(manage_exposure)
+    positions_snapshot = broker.positions() if managed_before else []
+    orders_snapshot = broker.pending_orders() if managed_before else []
+    unresolved_tickets = managed_before and any(
         trade.market_order_tickets or trade.pending_tickets
         for trade in state.open_trades()
     )
-    if unresolved_tickets:
-        trader.sync_fills(broker, state)
-        trader.apply_breakeven(broker, state)
-    frames = {timeframe: broker.bars(timeframe, config_.history_bars)
-              for timeframe in config_.timeframes}
-    trader.sync_fills(broker, state, frames)
-    # Newly mapped pending fills need the same check after sync.
-    trader.apply_breakeven(broker, state)
-    trader.enforce_timeout(broker, state, frames)
-    trader.enforce_orphan_timeout(broker, state, frames)
-    trader.reconcile_closed(broker, state)
+    if managed_before:
+        # Protect already-mapped positions before loading chart history.
+        trader.apply_breakeven(
+            broker, state, positions=positions_snapshot)
+
+    selected_timeframes = tuple(scan_timeframes or config_.timeframes)
+    frames = {
+        timeframe: broker.bars(timeframe, config_.history_bars)
+        for timeframe in selected_timeframes
+    }
+
+    if managed_before:
+        trader.sync_fills(
+            broker, state, frames, orders=orders_snapshot)
+        if unresolved_tickets:
+            # A pending/market order may have become a position while history
+            # was loading. Refresh once only for that transition path.
+            positions_snapshot = broker.positions()
+            orders_snapshot = broker.pending_orders()
+            trader.apply_breakeven(
+                broker, state, positions=positions_snapshot)
+        trader.enforce_timeout(
+            broker, state, frames, positions=positions_snapshot)
+        trader.enforce_orphan_timeout(
+            broker, state, frames, positions=positions_snapshot,
+            configured_timeframes=config_.timeframes)
+        trader.reconcile_closed(
+            broker, state, positions=positions_snapshot,
+            orders=orders_snapshot)
 
     # Reconciliation may have closed a winning or losing setup. Refresh before
     # sizing: using the pre-reconciliation equity could select a risk tier that
     # is too high after a loss. Persist a new closed-balance high-water before
     # any new entry is considered.
-    account = broker.account()
+    if managed_before:
+        account = broker.account()
     if state.observe_balance(account["balance"]):
         state.save(STATE_PATH)
 
@@ -1070,13 +1127,13 @@ def pass_once(broker: Broker, state: BotState, config_) -> None:
 
     # Loaded once per pass: the calendar is cached on disk and the feed is only
     # re-fetched when the cache goes stale.
-    offset, _ = resolve_offset(broker, state, config_)
+    offset, _ = resolve_offset(broker, state, config_, measure=False)
     calendar = news.load(config_)
     news_windows = news.windows(config_, offset, calendar)
     if calendar.error:
         print(f"[NEWS] {calendar.error}")
 
-    for timeframe in config_.timeframes:
+    for timeframe in selected_timeframes:
         frame = frames[timeframe]
         intent = signals.read(frame, timeframe)
         if intent is None:
@@ -1108,6 +1165,16 @@ def pass_once(broker: Broker, state: BotState, config_) -> None:
                 _record_missed_entry(state, intent, dry_run=broker.dry_run)
             continue
         elif known:
+            continue
+
+        request_block = guardrails.request_budget(
+            config_, state.day_requests + broker.requests)
+        if not request_block:
+            # This plan's entry bar will be stale before the next server day.
+            # Retiring it prevents repeated account/exposure/sizing reads from
+            # burning the remaining allowance while the guard is already no.
+            _record_entry_block(state, intent, request_block,
+                                remember_plan=True)
             continue
 
         # A previous timeframe in this same pass may just have opened at market.
@@ -1152,32 +1219,32 @@ def pass_once(broker: Broker, state: BotState, config_) -> None:
                   f"requested={setup_risk:.2f}% selected={selected_risk:.2f}% "
                   f"actual={proposed:.2f}% live={live_risk:.2f}%")
         setup_risk = selected_risk
-        checks = (
-            guardrails.entry_window_open(config_, quote["server_time"],
-                                         news_windows, calendar.usable),
-            guardrails.can_open(
+        blocked = _first_blocked(
+            lambda: guardrails.entry_window_open(
+                config_, quote["server_time"], news_windows, calendar.usable),
+            lambda: guardrails.can_open(
                 config_, state,
                 live_risk,
                 len(positions), len(orders),
                 state.day_requests + broker.requests,
                 proposed_risk=proposed,
                 active_setups=active_setup_count(state, positions, orders)),
-            guardrails.projected_internal_daily_risk(
+            lambda: guardrails.projected_internal_daily_risk(
                 config_, state, account["equity"], risk_basis,
                 live_risk, proposed, balance=account["balance"]),
-            guardrails.projected_max_loss_risk(
+            lambda: guardrails.projected_max_loss_risk(
                 config_, state, risk_basis, live_risk, proposed,
                 account["balance"]),
-            guardrails.no_opposing_position(config_, positions, intent.direction),
-            guardrails.risk_per_idea(config_, broker.spec, positions, intent.direction,
-                                     risk_basis, proposed_risk=proposed,
-                                     orders=orders),
-            guardrails.margin_available(
+            lambda: guardrails.no_opposing_position(
+                config_, positions, intent.direction),
+            lambda: guardrails.risk_per_idea(
+                config_, broker.spec, positions, intent.direction,
+                risk_basis, proposed_risk=proposed, orders=orders),
+            lambda: guardrails.margin_available(
                 account, broker.margin_for(intent.direction, _largest_leg(
                     broker, config_, intent, risk_basis, setup_risk)),
                 len(config_.leg_weights_for(risk_basis))),
         )
-        blocked = next((check for check in checks if not check), None)
         if blocked is not None:
             # Say when the block lands after a conversion. The limit is already
             # cancelled at this point, so the outcome is not "trade skipped" but
@@ -1185,10 +1252,7 @@ def pass_once(broker: Broker, state: BotState, config_) -> None:
             # Reordering the guards ahead of the cancel would trade this away for
             # a worse bug: they would then count the very order being replaced as
             # live exposure and refuse the conversion on the account's own limits.
-            journal.write(JOURNAL_PATH, "entry_blocked", plan_id=intent.plan_id,
-                          reason=blocked.reason, after_conversion=intent.converted)
-            note = " scope='limit already cancelled'" if intent.converted else ""
-            print(f"[GUARD] {intent.plan_id}: {blocked.reason}{note}")
+            _record_entry_block(state, intent, blocked)
             continue
         if intent.action == "market":
             price = quote["ask"] if intent.direction == 1 else quote["bid"]
@@ -1218,6 +1282,21 @@ def _seconds_to_next_close(server_time, timeframes) -> float:
     return min(waits)
 
 
+def _timeframes_closing_at(server_time, timeframes) -> tuple[str, ...]:
+    """Return only the configured bars that close at ``server_time``.
+
+    The loop still wakes every 15 minutes for M15+M30, but an M30 history
+    request is made only on :00/:30. This preserves signal cadence without
+    spending a request on an unchanged M30 candle at :15/:45.
+    """
+    midnight = server_time.replace(hour=0, minute=0, second=0, microsecond=0)
+    elapsed = round((server_time - midnight).total_seconds())
+    return tuple(
+        timeframe for timeframe in timeframes
+        if elapsed % config.TIMEFRAME_SECONDS[timeframe.upper()] == 0
+    )
+
+
 def loop(broker: Broker, state: BotState, config_) -> None:
     mode = "LIVE" if not broker.dry_run else "DRY-RUN"
     account = broker.account()
@@ -1238,8 +1317,31 @@ def loop(broker: Broker, state: BotState, config_) -> None:
             quote = broker.tick()
             server_time = quote["server_time"]
             wait = _seconds_to_next_close(server_time, config_.timeframes)
+            close_time = server_time + timedelta(seconds=wait)
+            scan_timeframes = _timeframes_closing_at(
+                close_time, config_.timeframes)
             sleep_seconds = wait + config_.entry_grace_seconds
             next_check = server_time + timedelta(seconds=sleep_seconds)
+            # Once a frozen feed is confirmed, only one tick is needed to see
+            # whether it recovered. Re-reading account/exposure every five
+            # minutes while the market is closed used 1,152 requests per day.
+            stale = broker.feed_stale_minutes(quote=quote)
+            if stale is not None and feed_was_stale:
+                print(status_line(
+                    "HEARTBEAT",
+                    f"{server_time:%Y-%m-%d %H:%M:%S} SERVER | "
+                    f"FEED STALE {stale:.0f}m | quote-only recheck in "
+                    f"{_countdown(STALE_FEED_RECHECK_SECONDS)}",
+                    "warn",
+                ), flush=True)
+                journal.write(
+                    JOURNAL_PATH, "heartbeat", mode=mode,
+                    server_time=server_time, feed_stale_minutes=round(stale, 1),
+                    entry_capacity="NO | feed stale; quote-only recheck",
+                )
+                checkpoint_state(broker, state)
+                time.sleep(STALE_FEED_RECHECK_SECONDS)
+                continue
             positions = broker.positions()
             orders = broker.pending_orders()
             account = broker.account()
@@ -1247,7 +1349,6 @@ def loop(broker: Broker, state: BotState, config_) -> None:
             exposure_level = "ok" if not positions and not orders else "live"
             # A frozen feed produced heartbeats that looked entirely normal while
             # the bot could not see a bar close at all. Say so instead.
-            stale = broker.feed_stale_minutes()
             heartbeat = (
                 f"{server_time:%Y-%m-%d %H:%M:%S} SERVER | "
                 f"{'LIVE' if not broker.dry_run else 'DRY RUN'} | "
@@ -1317,12 +1418,16 @@ def loop(broker: Broker, state: BotState, config_) -> None:
                     "ok"))
                 journal.write(JOURNAL_PATH, "feed_restored",
                               server_time=server_time)
-                pass_once(broker, state, config_)
+                pass_once(
+                    broker, state, config_, measure_offset=True,
+                    manage_exposure=bool(positions or orders))
                 reconnect_failures = 0
                 continue
 
             sleep_and_manage_split(broker, state, config_, sleep_seconds)
-            pass_once(broker, state, config_)
+            pass_once(
+                broker, state, config_, scan_timeframes=scan_timeframes,
+                manage_exposure=bool(positions or orders))
             reconnect_failures = 0
         except OrderRejected as error:
             # A broker refusal used to be called a lost connection, which spent
@@ -1364,7 +1469,7 @@ def loop(broker: Broker, state: BotState, config_) -> None:
                 "ok"))
             journal.write(JOURNAL_PATH, "connection_restored")
             try:
-                pass_once(broker, state, config_)
+                pass_once(broker, state, config_, measure_offset=True)
             except MT5Error as sync_error:
                 checkpoint_state(broker, state)
                 print(status_line(

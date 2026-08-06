@@ -790,13 +790,17 @@ def open_trade(broker: Broker, settings: Settings, state: BotState, intent: Inte
 
 
 def sync_fills(broker: Broker, state: BotState,
-               frames: dict[str, pd.DataFrame] | None = None) -> None:
+               frames: dict[str, pd.DataFrame] | None = None,
+               orders: list[dict] | None = None) -> None:
     """Reconcile pending orders with their resulting MT5 position identifiers.
 
     MT5 order/deal tickets and position tickets are different identifiers on
     many brokers. Deal history provides the authoritative mapping.
     """
-    live_orders = {order["ticket"] for order in broker.pending_orders()}
+    live_orders = {
+        order["ticket"]
+        for order in (broker.pending_orders() if orders is None else orders)
+    }
     pending_tickets = [
         ticket
         for trade in state.open_trades()
@@ -924,7 +928,8 @@ def sync_fills(broker: Broker, state: BotState,
     if changed:
         state.save(STATE_PATH)
 
-def apply_breakeven(broker: Broker, state: BotState) -> set[int]:
+def apply_breakeven(broker: Broker, state: BotState,
+                    positions: list | None = None) -> set[int]:
     """Apply the split exit ladder and return live position tickets.
 
     All legs start with one stop. Once TP1 is gone while later legs remain, TP1
@@ -937,7 +942,10 @@ def apply_breakeven(broker: Broker, state: BotState) -> set[int]:
     protect, and moving that single stop to entry would exit at break-even a
     trade the measured policy carries all the way to TP3.
     """
-    open_positions = {position.ticket: position for position in broker.positions()}
+    open_positions = {
+        position.ticket: position
+        for position in (broker.positions() if positions is None else positions)
+    }
     # A dry-run Broker reports the account's real positions but simulates every
     # write. Marking those positions protected would corrupt durable live state
     # even though no modification reached MT5. Still return their tickets: the
@@ -1113,7 +1121,9 @@ def apply_breakeven(broker: Broker, state: BotState) -> set[int]:
     return set(open_positions)
 
 
-def _orphan_timeframe(comment: str, frames: dict[str, pd.DataFrame]) -> str | None:
+def _orphan_timeframe(
+        comment: str, frames: dict[str, pd.DataFrame],
+        configured_timeframes: tuple[str, ...] | None = None) -> str | None:
     """The timeframe an unmanaged position belongs to, read off its comment.
 
     `open_trade` writes "M15 TP3 quantum|be33", so the timeframe survives in MT5
@@ -1128,11 +1138,19 @@ def _orphan_timeframe(comment: str, frames: dict[str, pd.DataFrame]) -> str | No
     head = comment.split()[0].upper() if comment.split() else ""
     if head in frames:
         return head
+    configured = {timeframe.upper() for timeframe in (configured_timeframes or ())}
+    if head in configured:
+        # The position belongs to a configured timeframe whose bar is not due
+        # in this pass. Returning it makes the caller defer instead of treating
+        # an M30 orphan as M15 and timing it out twice as early.
+        return head
     return max(frames, key=lambda tf: config.TIMEFRAME_SECONDS[tf.upper()])
 
 
 def enforce_orphan_timeout(broker: Broker, state: BotState,
-                           frames: dict[str, pd.DataFrame]) -> None:
+                           frames: dict[str, pd.DataFrame],
+                           positions: list | None = None,
+                           configured_timeframes: tuple[str, ...] | None = None) -> None:
     """Time out the bot's own positions that no managed trade owns.
 
     `enforce_timeout` walks `state.open_trades()`, so a position whose record was
@@ -1148,10 +1166,11 @@ def enforce_orphan_timeout(broker: Broker, state: BotState,
     """
     managed = {ticket for trade in state.open_trades()
                for ticket in trade.position_tickets}
-    for position in broker.positions():
+    for position in (broker.positions() if positions is None else positions):
         if position.ticket in managed:
             continue
-        timeframe = _orphan_timeframe(position.comment, frames)
+        timeframe = _orphan_timeframe(
+            position.comment, frames, configured_timeframes)
         frame = frames.get(timeframe) if timeframe else None
         if frame is None or not len(frame):
             continue
@@ -1180,9 +1199,14 @@ def enforce_orphan_timeout(broker: Broker, state: BotState,
               f"opened={position.opened_at:%Y-%m-%d %H:%M:%S}")
 
 
-def enforce_timeout(broker: Broker, state: BotState, frames: dict[str, pd.DataFrame]) -> None:
+def enforce_timeout(broker: Broker, state: BotState,
+                    frames: dict[str, pd.DataFrame],
+                    positions: list | None = None) -> None:
     """Close what the backtest would have timed out at 120 bars."""
-    open_positions = {position.ticket: position for position in broker.positions()}
+    open_positions = {
+        position.ticket: position
+        for position in (broker.positions() if positions is None else positions)
+    }
     for trade in state.open_trades():
         frame = frames.get(trade.timeframe)
         if frame is None or not trade.fill_bar_time:
@@ -1391,10 +1415,18 @@ def release_for_conversion(broker: Broker, state: BotState, intent: Intent) -> b
     return True
 
 
-def reconcile_closed(broker: Broker, state: BotState) -> list[dict]:
+def reconcile_closed(broker: Broker, state: BotState, *,
+                     positions: list | None = None,
+                     orders: list[dict] | None = None) -> list[dict]:
     """Score finished trades in R and update the loss streak."""
-    open_tickets = {position.ticket for position in broker.positions()}
-    pending_tickets = {order["ticket"] for order in broker.pending_orders()}
+    open_tickets = {
+        position.ticket
+        for position in (broker.positions() if positions is None else positions)
+    }
+    pending_tickets = {
+        order["ticket"]
+        for order in (broker.pending_orders() if orders is None else orders)
+    }
     finished = []
     current_day_outcomes = []
     for sequence, trade in enumerate(state.open_trades()):

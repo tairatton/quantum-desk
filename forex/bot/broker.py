@@ -212,7 +212,8 @@ class Broker:
                 "server_time": datetime.fromtimestamp(quote.time, tz=timezone.utc)
                 .replace(tzinfo=None)}
 
-    def server_utc_offset(self, max_staleness_minutes: int = 10) -> float | None:
+    def server_utc_offset(self, max_staleness_minutes: int = 10,
+                          quote: dict | None = None) -> float | None:
         """Hours the broker clock runs ahead of UTC, or None if unmeasurable.
 
         The economic calendar publishes in UTC while every timestamp the terminal
@@ -223,9 +224,9 @@ class Broker:
         (a closed market measured -43.5h here), so a stale tick returns None and
         the caller falls back to the last known good value.
         """
-        if self.feed_stale_minutes(max_staleness_minutes) is not None:
+        quote = quote or self.tick()
+        if self.feed_stale_minutes(max_staleness_minutes, quote=quote) is not None:
             return None
-        quote = self.tick()
         delta = quote["server_time"] - datetime.now(timezone.utc).replace(tzinfo=None)
         hours = delta.total_seconds() / 3600
         if not -12.5 <= hours <= 14.5:
@@ -236,7 +237,8 @@ class Broker:
             return None
         return rounded
 
-    def feed_stale_minutes(self, threshold_minutes: int = 10) -> float | None:
+    def feed_stale_minutes(self, threshold_minutes: int = 10,
+                           quote: dict | None = None) -> float | None:
         """Minutes the tick has been frozen, or None while quotes are flowing.
 
         The rounding test above cannot see staleness on its own. A tick lagging
@@ -250,7 +252,7 @@ class Broker:
         Staleness is therefore measured the only way it can be: by whether the
         tick's own timestamp advances while the local clock does.
         """
-        stamp = self.tick()["server_time"]
+        stamp = (quote or self.tick())["server_time"]
         now = datetime.now(timezone.utc).replace(tzinfo=None)
         if stamp != self._tick_stamp:
             self._tick_stamp, self._tick_first_seen = stamp, now

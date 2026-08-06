@@ -628,7 +628,7 @@ class ClockTests(unittest.TestCase):
         def __init__(self, measured):
             self.measured = measured
 
-        def server_utc_offset(self):
+        def server_utc_offset(self, quote=None):
             return self.measured
 
     def setUp(self):

@@ -29,6 +29,14 @@ class Verdict:
 ALLOWED = Verdict(True, "ok")
 
 
+def request_budget(settings: Settings, requests_today: int) -> Verdict:
+    """Refuse a new entry before checks that consume more broker requests."""
+    if requests_today >= settings.max_requests_per_day * 0.9:
+        return Verdict(False, f"{requests_today} server requests today, near the "
+                              f"{settings.max_requests_per_day} allowance")
+    return ALLOWED
+
+
 def daily_loss_floor(settings: Settings, state: BotState,
                      fallback_balance: float = 0.0) -> float:
     """FTMO 2-Step floor: midnight balance minus a fixed initial-capital amount."""
@@ -131,10 +139,7 @@ def can_open(settings: Settings, state: BotState, open_risk: float,
     # budget was previously only assumed to be safe rather than counted. Reads
     # still continue past this point — an open trade must be managed — but nothing
     # new is started on the last of the day's allowance.
-    if requests_today >= settings.max_requests_per_day * 0.9:
-        return Verdict(False, f"{requests_today} server requests today, near the "
-                              f"{settings.max_requests_per_day} allowance")
-    return ALLOWED
+    return request_budget(settings, requests_today)
 
 
 def projected_internal_daily_risk(settings: Settings, state: BotState,
